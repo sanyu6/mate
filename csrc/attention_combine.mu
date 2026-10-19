@@ -31,15 +31,13 @@ template <typename T, bool VarlenQ>
 void run_mla_combine_kernel(const mate::flash_mla::MlaCombineParams& params, musaStream_t stream) {
   static constexpr int HEAD_DIM_V = 512;  // Since only this head dimension is supported by Flash MLA
   MLA_NUM_SPLITS_SWITCH(params.num_mp_parts, NUM_SPLITS, [&] {
-    if constexpr (!VarlenQ) {
-      if (params.batch_size <= 5 && params.h_k == 1 && params.max_q_seq_per_hk <= 32) {
-        constexpr int BlockD   = 128;
-        constexpr int NumWarps = 8;
-        dim3          grid(params.batch_size, params.max_q_seq_per_hk, HEAD_DIM_V / BlockD);
-        mate::flash_mla::mpxx_mla_combine_parallel_kernel<T, HEAD_DIM_V, BlockD, NUM_SPLITS, NumWarps>
-            <<<grid, NumWarps * 32, 0, stream>>>(params);
-        return;
-      }
+    if (params.max_q_seq_per_hk <= 32) {
+      constexpr int BlockD   = 128;
+      constexpr int NumWarps = 8;
+      dim3          grid(params.batch_size, params.max_q_seq_per_hk, HEAD_DIM_V / BlockD);
+      mate::flash_mla::mpxx_mla_combine_parallel_kernel<T, HEAD_DIM_V, BlockD, NUM_SPLITS, NumWarps, VarlenQ>
+          <<<grid, NumWarps * 32, 0, stream>>>(params);
+      return;
     }
     constexpr int    BLOCK_SIZE_M = 8;
     constexpr int    NUM_THREADS  = BLOCK_SIZE_M * 32;

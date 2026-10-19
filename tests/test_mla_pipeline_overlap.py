@@ -16,6 +16,7 @@ from mate.testing import supported_musa_compute_capability
         (1, 129, 16, True),
         (1, 10000, 16, False),
         (5, 10000, 16, False),
+        (6, 10000, 16, False),
         (1, 6000, 32, False),
     ],
 )

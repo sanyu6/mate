@@ -1,3 +1,4 @@
+from itertools import accumulate
 from pathlib import Path
 
 import pytest
@@ -37,7 +38,7 @@ def combine():
         (32, [120]),
         (32, [1, 3, 17, 31, 45]),
         (16, [1, 1, 1, 1, 1]),
-        (16, [7] * 6),  # Batch fallback.
+        (16, [7] * 6),  # Batch size does not limit the parallel path.
         (64, [53]),  # Query/head row fallback.
     ],
 )
@@ -90,38 +91,50 @@ def test_mla_combine(combine, dtype, masked, heads, counts):
 
 @supported_musa_compute_capability([31])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_mla_combine_varlen_fallback(dtype):
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "lengths,heads,kv_length",
+    [([1], 16, 1), ([1, 2, 1], 8, 97), ([1] * 6, 16, 10000), ([1, 2, 1], 32, 129)],
+)
+def test_mla_combine_varlen(dtype, causal, lengths, heads, kv_length):
     import mate
 
     torch.manual_seed(42)
-    lengths = [1, 2, 1]
-    batch, heads, kv_length, page = len(lengths), 8, 97, 64
+    batch, page = len(lengths), 64
     pages = (kv_length + page - 1) // page
     total_q = sum(lengths)
     q = torch.randn(total_q, heads, 576, dtype=dtype, device="musa")
     kv = torch.randn(batch * pages, page, 1, 576, dtype=dtype, device="musa")
-    cu_q = torch.tensor([0, 1, 3, 4], dtype=torch.int32, device="musa")
+    cu_q = torch.tensor(
+        [0, *accumulate(lengths)],
+        dtype=torch.int32,
+        device="musa",
+    )
     lens = torch.full((batch,), kv_length, dtype=torch.int32, device="musa")
     table = torch.arange(batch * pages, dtype=torch.int32, device="musa").view(
         batch, pages
     )
     workspace = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="musa")
     scale = 576**-0.5
+
     # Explicit tuple metadata selects MLA rather than the default FMHA backend.
-    out, lse = mate.flash_attn_with_kvcache(
-        q=q[..., 512:],
-        k_cache=kv[..., 512:],
-        v_cache=kv[..., :512],
-        qv=q[..., :512],
-        cache_seqlens=lens,
-        page_table=table,
-        cu_seqlens_q=cu_q,
-        max_seqlen_q=max(lengths),
-        softmax_scale=scale,
-        causal=False,
-        scheduler_metadata=(workspace, False),
-        return_softmax_lse=True,
-    )[:2]
+    def run(initialized):
+        return mate.flash_attn_with_kvcache(
+            q=q[..., 512:],
+            k_cache=kv[..., 512:],
+            v_cache=kv[..., :512],
+            qv=q[..., :512],
+            cache_seqlens=lens,
+            page_table=table,
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=max(lengths),
+            softmax_scale=scale,
+            causal=causal,
+            scheduler_metadata=(workspace, initialized),
+            return_softmax_lse=True,
+        )[:2]
+
+    out, lse = run(False)
     q_cpu = q.cpu().float()
     kv_cpu = kv.cpu().float().view(batch, pages * page, 576)[:, :kv_length]
     expected, expected_lse = [], []
@@ -131,6 +144,11 @@ def test_mla_combine_varlen_fallback(dtype):
             torch.einsum("qhd,kd->hqk", q_cpu[start : start + length], kv_cpu[b])
             * scale
         )
+        if causal:
+            mask = torch.arange(kv_length)[None, :] > (
+                kv_length - length + torch.arange(length)[:, None]
+            )
+            logits.masked_fill_(mask[None, :, :], -torch.inf)
         expected.append(
             torch.einsum("hqk,kd->qhd", logits.softmax(-1), kv_cpu[b, :, :512])
         )
@@ -142,3 +160,12 @@ def test_mla_combine_varlen_fallback(dtype):
     torch.testing.assert_close(
         lse.cpu(), torch.cat(expected_lse, dim=1), atol=1.5e-2, rtol=1e-2
     )
+
+    graph = torch.musa.MUSAGraph()
+    with torch.musa.graph(graph):
+        captured = run(True)
+    for _ in range(3):
+        graph.replay()
+        torch.musa.synchronize()
+        torch.testing.assert_close(captured[0].cpu(), out.cpu(), atol=0, rtol=0)
+        torch.testing.assert_close(captured[1].cpu(), lse.cpu(), atol=0, rtol=0)

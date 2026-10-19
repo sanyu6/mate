@@ -9,7 +9,7 @@ namespace mate::flash_mla {
 
 // Each CTA owns one query/head row and a slice of D. Warps accumulate
 // disjoint splits, then reduce their partial outputs in shared memory.
-template <typename ElementT, int HEAD_DIM_V, int BLOCK_D, int MAX_SPLITS, int NUM_WARPS>
+template <typename ElementT, int HEAD_DIM_V, int BLOCK_D, int MAX_SPLITS, int NUM_WARPS, bool VarlenQ>
 __global__ void __launch_bounds__(NUM_WARPS * 32, 1) mpxx_mla_combine_parallel_kernel(const MlaCombineParams params) {
   static_assert(BLOCK_D % 32 == 0 && HEAD_DIM_V % BLOCK_D == 0);
   static_assert(MAX_SPLITS <= NUM_WARPS * 32);
@@ -23,7 +23,13 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, 1) mpxx_mla_combine_parallel_k
   const int     num_splits      = __ldg(params.num_splits_ptr + batch_idx + 1) - start_split;
   if (num_splits == 1) return;  // The main kernel already wrote the final result.
 
-  const int        rows      = params.max_q_seq_per_hk * params.h_k;
+  const int rows    = params.max_q_seq_per_hk;
+  int       q_start = 0;
+  if constexpr (VarlenQ) {
+    q_start         = __ldg(params.seqlens_q_ptr + batch_idx);
+    const int q_end = __ldg(params.seqlens_q_ptr + batch_idx + 1);
+    if (row_idx >= (q_end - q_start) * params.h_r) return;
+  }
   const auto*      lse_accum = static_cast<const float*>(params.softmax_lseaccum_ptr);
   const auto*      o_accum   = static_cast<const float*>(params.oaccum_ptr);
   __shared__ float warp_max[NUM_WARPS];
@@ -62,7 +68,9 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, 1) mpxx_mla_combine_parallel_k
   const float global_lse = sum_lse == 0.f || sum_lse != sum_lse ? INFINITY : logf(sum_lse) + max_lse;
   if (threadIdx.x < num_splits) weights[threadIdx.x] = expf(local_lse - global_lse);
   if (blockIdx.z == 0 && threadIdx.x == 0) {
-    static_cast<float*>(params.softmax_lse_ptr)[batch_idx * rows + row_idx] = global_lse;
+    const int lse_offset =
+        VarlenQ ? (row_idx % params.h_r) * params.total_q + q_start + row_idx / params.h_r : batch_idx * rows + row_idx;
+    static_cast<float*>(params.softmax_lse_ptr)[lse_offset] = global_lse;
   }
   __syncthreads();
 
@@ -86,7 +94,8 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, 1) mpxx_mla_combine_parallel_k
     float result = 0.f;
 #pragma unroll
     for (int warp = 0; warp < NUM_WARPS; ++warp) result += partial[warp][threadIdx.x];
-    const int64_t offset = batch_idx * params.o_batch_stride + row_idx * params.o_row_stride + d_start;
+    const int64_t offset = (VarlenQ ? q_start * params.h_r * params.o_row_stride : batch_idx * params.o_batch_stride) +
+                           row_idx * params.o_row_stride + d_start;
     static_cast<ElementT*>(params.o_ptr)[offset + threadIdx.x] = static_cast<ElementT>(result);
   }
 }

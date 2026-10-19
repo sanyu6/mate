@@ -715,7 +715,6 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
       auto& row_max  = get<1>(softmax_state);
       static_assert(decltype(size(row_sum))::value <= 4);
       if (consumer_idx == 0) {
-        auto previous_write = p_write;
         for (int tile = start_block_idx; tile < tile_end; ++tile) {
           auto acc_qk = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQKLatent{}));
           clear(acc_qk);
@@ -734,15 +733,6 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
           mate::warpsquad_wait();
           pipeline_qk_rope.consumer_release(smem_pipe_k_rope_read);
           ++smem_pipe_k_rope_read;
-#if defined(MATE_MLA_DISABLE_PV_SOFTMAX_OVERLAP)
-          // Benchmark control: keep tiling and both squads identical, but wait
-          // for the preceding PV before computing this tile's softmax.
-          if (tile != start_block_idx) {
-            auto consumed = previous_write;
-            consumed.advance(2);
-            pipeline_p.producer_acquire(consumed);
-          }
-#endif
           auto correction = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePVLatent{}));
           // Extract the existing softmax implementation's rescale factor.
           // Only the PV squad touches the actual output accumulator.
@@ -768,7 +758,6 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
           }
           convert_and_sts(acc_qk);
           pipeline_p.producer_commit(p_write);
-          previous_write = p_write;
           ++p_write;
           tPcP.data() = tPcP.data() + E<1>{} * get<1>(TileShape{});
         }

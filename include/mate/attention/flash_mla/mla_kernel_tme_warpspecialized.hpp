@@ -123,7 +123,7 @@ struct MlaKernelTmeWarpSpecialized {
 
     PipelineQKLatentParams pipeline_params_qk_latent;
     pipeline_params_qk_latent.transaction_bytes = CollectiveMainloop::TmeTransactionBytesC;
-    pipeline_params_qk_latent.num_consumers     = SeparatePV ? 4 : NumMmaWarps;
+    pipeline_params_qk_latent.num_consumers     = CollectiveMainloop::NumQKMmaWarpSquads * NumWarpsPerWarpSquad;
     pipeline_params_qk_latent.num_producers     = 1;
 
     MainloopPipelineQKLatent pipeline_qk_latent(pipeline_params_qk_latent,
@@ -134,7 +134,7 @@ struct MlaKernelTmeWarpSpecialized {
 
     PipelineQKRopeParams pipeline_params_qk_rope;
     pipeline_params_qk_rope.transaction_bytes = CollectiveMainloop::TmeTransactionBytesKRope;
-    pipeline_params_qk_rope.num_consumers     = SeparatePV ? 4 : NumMmaWarps;
+    pipeline_params_qk_rope.num_consumers     = CollectiveMainloop::NumQKMmaWarpSquads * NumWarpsPerWarpSquad;
     pipeline_params_qk_rope.num_producers     = 1;
 
     MainloopPipelineQKRope pipeline_qk_rope(pipeline_params_qk_rope,
@@ -147,7 +147,7 @@ struct MlaKernelTmeWarpSpecialized {
       if constexpr (SeparatePV) {
         PipelinePVParams pv_params;
         pv_params.transaction_bytes = CollectiveMainloop::TmeTransactionBytesC;
-        pv_params.num_consumers     = SeparatePV ? 4 : NumMmaWarps;
+        pv_params.num_consumers     = CollectiveMainloop::NumPVMmaWarpSquads * NumWarpsPerWarpSquad;
         pv_params.num_producers     = 1;
         return MainloopPipelinePV(pv_params, reinterpret_cast<uint64_t>(&barrier_storage->PipelinePV));
       } else {
@@ -174,8 +174,8 @@ struct MlaKernelTmeWarpSpecialized {
     auto pipeline_p = [&]() {
       if constexpr (SeparatePV) {
         typename mutlass::Mp31PipelineAsync<2>::Params p_params;
-        p_params.producer_arv_count = 4;
-        p_params.consumer_arv_count = 4;
+        p_params.producer_arv_count = CollectiveMainloop::NumQKMmaWarpSquads * NumWarpsPerWarpSquad;
+        p_params.consumer_arv_count = CollectiveMainloop::NumPVMmaWarpSquads * NumWarpsPerWarpSquad;
         return mutlass::Mp31PipelineAsync<2>(p_params, reinterpret_cast<uint64_t>(&barrier_storage->PipelineP));
       } else {
         return pipeline_qk_latent;
@@ -186,7 +186,7 @@ struct MlaKernelTmeWarpSpecialized {
 
     NamedBarrier reuse_p(reinterpret_cast<uint64_t>(&barrier_storage->ReuseP));
     if (warp_idx == 0) {
-      reuse_p.init(SeparatePV ? 4 : NumMmaWarps);
+      reuse_p.init(CollectiveMainloop::NumQKMmaWarpSquads * NumWarpsPerWarpSquad);
     }
 
     __syncthreads();
