@@ -32,13 +32,15 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
   using StrideQ   = StrideQ_;
   using StrideC   = StrideC_;
 
-  using Fusion                                 = Fusion_;
-  static constexpr bool VarlenQ                = VarlenQ_;
-  static constexpr int  NumLoadWarpSquads      = 1;
-  static constexpr int  NumQKMmaWarpSquads     = 4;
-  static constexpr int  NumPVMmaWarpSquads     = 4;
-  static constexpr int  NumMmaWarpSquads       = std::max(NumQKMmaWarpSquads, NumPVMmaWarpSquads);
-  static constexpr int  NumTransposeWarpSquads = 0;
+  using Fusion                             = Fusion_;
+  static constexpr bool VarlenQ            = VarlenQ_;
+  static constexpr bool SeparatePV         = get<0>(TileShape{}) == 32;
+  static constexpr int  NumLoadWarpSquads  = 1;
+  static constexpr int  NumQKMmaWarpSquads = SeparatePV ? 1 : 4;
+  static constexpr int  NumPVMmaWarpSquads = SeparatePV ? 1 : 4;
+  // Small tiles assign QK/softmax and PV to different warp squads.
+  static constexpr int NumMmaWarpSquads       = SeparatePV ? 2 : 4;
+  static constexpr int NumTransposeWarpSquads = 0;
 
   static constexpr int Alignment = 32 / sizeof_bits_v<Element>;
 
@@ -130,16 +132,18 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
                                                Tile<Layout<Shape<TileQPerConsumer, Int<NumQKMmaWarpSquads>>>, X, X>{}));
 
   using SmemLayoutKC = decltype(unstageSmemLayout(typename CollectiveMmaQKLatent::SmemLayoutB{}, Int<KCStages>{}));
-  using SmemLayoutVC = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutB{}, Int<KCStages>{}));
+  using SmemLayoutVC =
+      decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutB{}, Int<SeparatePV ? IterationsPV : KCStages>{}));
 
   using SmemLayoutKRope = decltype(unstageSmemLayout(typename CollectiveMmaQKRope::SmemLayoutB{}, Int<1>{}));
 
-  using SmemLayoutP = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutA{}, Int<NumPVMmaWarpSquads>{}));
+  using SmemLayoutP =
+      decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutA{}, Int<SeparatePV ? 2 : NumPVMmaWarpSquads>{}));
   using SmemLayoutS =
       decltype(composition(tile_to_shape(typename CollectiveMmaPV::SmemLayoutAtomA{}, take<0, 2>(TileShape{})),
                            Tile<Layout<Shape<TileQPerConsumer, Int<NumQKMmaWarpSquads>>>, X>{}));
 
-  struct SharedStorage {
+  struct SharedStorageSerial {
     mute::array_aligned<Element, cosize_v<SmemLayoutQLatentFull>, 256> smem_q_latent;
     mute::array_aligned<Element, cosize_v<SmemLayoutQRopeFull>, 256>   smem_q_rope;
     union {
@@ -152,6 +156,23 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
       mute::array_aligned<Element, cosize_v<SmemLayoutVC>, 256> smem_vc;
     };
   };
+  struct SharedStorageSeparate {
+    mute::array_aligned<Element, cosize_v<SmemLayoutQLatentFull>, 256> smem_q_latent;
+    mute::array_aligned<Element, cosize_v<SmemLayoutQRopeFull>, 256>   smem_q_rope;
+    union {
+      mute::array_aligned<Element, cosize_v<SmemLayoutP>, 256> smem_p;
+      mute::array_aligned<Element, cosize_v<SmemLayoutS>, 256> smem_s;
+    };
+    mute::array_aligned<Element, cosize_v<SmemLayoutKRope>, 256> smem_k_rope;
+    mute::array_aligned<Element, cosize_v<SmemLayoutKC>, 256>    smem_kc;
+    mute::array_aligned<Element, cosize_v<SmemLayoutVC>, 256>    smem_vc;
+    // P and its online-softmax correction share the same two-stage lifetime.
+    // Statistics retain the per-thread layout until PV performs softmax.tail.
+    float alpha[2][4][128];
+    float final_sum[4][128];
+    float final_max[4][128];
+  };
+  using SharedStorage = conditional_t<SeparatePV, SharedStorageSeparate, SharedStorageSerial>;
 
   // static constexpr TME::CacheHint QCacheHint = TME::CacheHint::CACHE_ONCE;
   // static constexpr TME::CacheHint RopeCacheHint = TME::CacheHint::CACHE_ONCE;
@@ -191,7 +212,8 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
 
   using MainloopPipelineQKLatent = mutlass::Mp31PipelineTmeAsync<KCStages>;
   using MainloopPipelineQKRope   = mutlass::Mp31PipelineTmeAsync<1>;
-  using MainloopPipelinePV       = MainloopPipelineQKLatent;
+  using MainloopPipelinePV =
+      conditional_t<SeparatePV, mutlass::Mp31PipelineTmeAsync<IterationsPV>, MainloopPipelineQKLatent>;
 
   using PipelineQKLatentParams = typename MainloopPipelineQKLatent::Params;
   using PipelineQKLatentState  = typename MainloopPipelineQKLatent::PipelineState;
@@ -563,21 +585,25 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
     }
   }
 
-  template <class BlkCoord, class ProblemSize, class NamedBarrier, class Workload>
-  MUTLASS_DEVICE auto compute(BlkCoord const&           blk_coord,
-                              Params const&             params,
-                              ProblemSize const&        problem_size,
-                              MainloopPipelineQKLatent& pipeline_qk_latent,
-                              PipelineQKLatentState&    smem_pipe_k_latent_read,
-                              MainloopPipelineQKRope&   pipeline_qk_rope,
-                              PipelineQKRopeState&      smem_pipe_k_rope_read,
-                              MainloopPipelinePV&       pipeline_pv,
-                              PipelinePVState&          smem_pipe_v_read,
-                              NamedBarrier&             reuse_p,
-                              SharedStorage&            storage,
-                              int const                 thread_idx,
-                              int const                 consumer_idx,
-                              Workload const&           workload) {
+  template <class BlkCoord, class ProblemSize, class NamedBarrier, class Workload, class PPipeline>
+  MUTLASS_DEVICE auto compute(BlkCoord const&                                        blk_coord,
+                              Params const&                                          params,
+                              ProblemSize const&                                     problem_size,
+                              MainloopPipelineQKLatent&                              pipeline_qk_latent,
+                              PipelineQKLatentState&                                 smem_pipe_k_latent_read,
+                              MainloopPipelineQKRope&                                pipeline_qk_rope,
+                              PipelineQKRopeState&                                   smem_pipe_k_rope_read,
+                              MainloopPipelinePV&                                    pipeline_pv,
+                              PipelinePVState&                                       smem_pipe_v_read,
+                              PPipeline&                                             pipeline_p,
+                              typename mutlass::Mp31PipelineAsync<2>::PipelineState& p_write,
+                              typename mutlass::Mp31PipelineAsync<2>::PipelineState& p_read,
+                              NamedBarrier&                                          reuse_p,
+                              SharedStorage&                                         storage,
+                              int const                                              thread_idx,
+                              int const                                              consumer_idx,
+                              Workload const&                                        workload) {
+    int logical_consumer_idx = SeparatePV ? 0 : consumer_idx;
     // Prepare QK MMA
     TiledMmaQK tiled_mma_qk;
     auto       thr_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
@@ -585,7 +611,7 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
     Tensor sQL = make_tensor(make_smem_ptr(storage.smem_q_latent.data()), SmemLayoutQLatent{});
     Tensor sKL = make_tensor(make_smem_ptr(storage.smem_kc.data()), SmemLayoutKC{});
 
-    Tensor tSsQL = thr_mma_qk.partition_A(sQL(make_coord(_, consumer_idx), _, _));
+    Tensor tSsQL = thr_mma_qk.partition_A(sQL(make_coord(_, logical_consumer_idx), _, _));
     Tensor tSrQL = thr_mma_qk.make_fragment_A(tSsQL);
 
     Tensor tSsKL = thr_mma_qk.partition_B(sKL);
@@ -594,7 +620,7 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
     Tensor sQR = make_tensor(make_smem_ptr(storage.smem_q_rope.data()), SmemLayoutQRope{});
     Tensor sKR = make_tensor(make_smem_ptr(storage.smem_k_rope.data()), SmemLayoutKRope{});
 
-    Tensor tSsQR = thr_mma_qk.partition_A(sQR(make_coord(_, consumer_idx), _, _));
+    Tensor tSsQR = thr_mma_qk.partition_A(sQR(make_coord(_, logical_consumer_idx), _, _));
     Tensor tSrQR = thr_mma_qk.make_fragment_A(tSsQR);
 
     Tensor tSsKR = thr_mma_qk.partition_B(sKR);
@@ -607,7 +633,7 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
     Tensor sP = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{});
     Tensor sV = make_tensor(make_smem_ptr(storage.smem_vc.data()), SmemLayoutVC{});
 
-    Tensor tOsP = thr_mma_pv.partition_A(sP(_, _, consumer_idx));
+    Tensor tOsP = thr_mma_pv.partition_A(sP(_, _, logical_consumer_idx));
     Tensor tOrP = thr_mma_pv.make_fragment_A(tOsP);
 
     Tensor tOsV = thr_mma_pv.partition_B(sV);
@@ -616,11 +642,11 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
     // Prepare R2S
     R2STiledCopy tiled_copy_r2s;
     ThrCopy      thr_copy_r2s = tiled_copy_r2s.get_thread_slice(thread_idx);
-    Tensor       tPsP         = thr_copy_r2s.partition_D(sP(_, _, consumer_idx));
+    Tensor       tPsP         = thr_copy_r2s.partition_D(sP(_, _, logical_consumer_idx));
 
     // AccQK index
     Tensor cP_full = make_identity_tensor(take<0, 2>(TileShape{}));
-    Tensor cP      = local_tile(cP_full, make_shape(get<0>(TileShapeQKLatent{})), make_coord(consumer_idx));
+    Tensor cP      = local_tile(cP_full, make_shape(get<0>(TileShapeQKLatent{})), make_coord(logical_consumer_idx));
     Tensor tPcP = convert_to_permuted_sqmma(tiled_mma_qk, PermuteTile{}).get_thread_slice(thread_idx).partition_C(cP);
     int    m_coord = get<0>(blk_coord);
 
@@ -648,8 +674,16 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
       // TODO: sync before sts
       reuse_p.sync();
 
-      copy(tiled_copy_r2s, tPrP, tPsP);
-      __syncwarp();
+      if constexpr (SeparatePV) {
+        auto dst = thr_copy_r2s.partition_D(sP(_, _, p_write.index()));
+        copy(tiled_copy_r2s, tPrP, dst);
+      } else {
+        copy(tiled_copy_r2s, tPrP, tPsP);
+      }
+      if constexpr (SeparatePV)
+        reuse_p.sync();
+      else
+        __syncwarp();
     };
 
     Fusion fusion{params.fusion};
@@ -675,83 +709,181 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
     CollectiveSoftmax<Fusion, decltype(params), false> softmax(params, fusion);
     auto                                               softmax_state = softmax.init(acc_pv_final, tiled_mma_pv);
 
-    auto mla_fwd_step = [&](auto first_round, auto enable_fusion) {
-      static constexpr bool FirstRound   = decltype(first_round)::value;
-      static constexpr bool EnableFusion = decltype(enable_fusion)::value;
-
-      Tensor acc_qk = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQKLatent{}));
-
-      // trigger zero init sqmma
-      clear(acc_qk);
-
-      // MMA QK
-      MUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < IterationsQKLatent; ++i) {
-        pipeline_qk_latent.consumer_wait(smem_pipe_k_latent_read);
-        int k_read_stage = smem_pipe_k_latent_read.index();
-        mute::gemm(tiled_mma_qk, tSrQL(_, _, _, i), tSrKL(_, _, _, k_read_stage), acc_qk);
-
-        mate::warpsquad_commit_batch();
-        mate::warpsquad_wait();
-        pipeline_qk_latent.consumer_release(smem_pipe_k_latent_read);
-        ++smem_pipe_k_latent_read;
-        if (i == 3) {
-          reuse_p.sync();
+    if constexpr (SeparatePV) {
+      int   tile_end = max(end_block_idx, start_block_idx + 1);
+      auto& row_sum  = get<0>(softmax_state);
+      auto& row_max  = get<1>(softmax_state);
+      static_assert(decltype(size(row_sum))::value <= 4);
+      if (consumer_idx == 0) {
+        for (int tile = start_block_idx; tile < tile_end; ++tile) {
+          auto acc_qk = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQKLatent{}));
+          clear(acc_qk);
+          MUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < IterationsQKLatent; ++i) {
+            pipeline_qk_latent.consumer_wait(smem_pipe_k_latent_read);
+            mute::gemm(tiled_mma_qk, tSrQL(_, _, _, i), tSrKL(_, _, _, smem_pipe_k_latent_read.index()), acc_qk);
+            mate::warpsquad_commit_batch();
+            mate::warpsquad_wait();
+            pipeline_qk_latent.consumer_release(smem_pipe_k_latent_read);
+            ++smem_pipe_k_latent_read;
+          }
+          pipeline_qk_rope.consumer_wait(smem_pipe_k_rope_read);
+          mute::gemm(tiled_mma_qk, tSrQR(_, _, _, 0), tSrKR(_, _, _, smem_pipe_k_rope_read.index()), acc_qk);
+          mate::warpsquad_commit_batch();
+          mate::warpsquad_wait();
+          pipeline_qk_rope.consumer_release(smem_pipe_k_rope_read);
+          ++smem_pipe_k_rope_read;
+          auto correction = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePVLatent{}));
+          // Extract the existing softmax implementation's rescale factor.
+          // Only the PV squad touches the actual output accumulator.
+          fill(correction, ElementAccumulator{1.f});
+          if (tile == start_block_idx) {
+            softmax.step(acc_qk, tiled_mma_qk, softmax_state, tPcP, problem_size);
+          } else if (tile < unmasked_tile_count) {
+            softmax.template step<false>(
+                acc_qk, tiled_mma_qk, softmax_state, correction, tiled_mma_pv, tPcP, problem_size);
+          } else {
+            softmax.template step<true>(
+                acc_qk, tiled_mma_qk, softmax_state, correction, tiled_mma_pv, tPcP, problem_size);
+          }
+          pipeline_p.producer_acquire(p_write);
+          auto scales = make_tensor(correction.data(), layout_acc_mn(tiled_mma_pv, correction.layout()));
+          MUTLASS_PRAGMA_UNROLL
+          for (int row = 0; row < size(row_sum); ++row) {
+            storage.alpha[p_write.index()][row][thread_idx] = scales(row, 0);
+            if (tile + 1 == tile_end) {
+              storage.final_sum[row][thread_idx] = row_sum(row);
+              storage.final_max[row][thread_idx] = row_max(row);
+            }
+          }
+          convert_and_sts(acc_qk);
+          pipeline_p.producer_commit(p_write);
+          ++p_write;
+          tPcP.data() = tPcP.data() + E<1>{} * get<1>(TileShape{});
         }
-      }
-
-      MUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < IterationsQKRope; ++i) {
-        pipeline_qk_rope.consumer_wait(smem_pipe_k_rope_read);
-        int k_read_stage = smem_pipe_k_rope_read.index();
-        mute::gemm(tiled_mma_qk, tSrQR(_, _, _, i), tSrKR(_, _, _, k_read_stage), acc_qk);
-
-        mate::warpsquad_commit_batch();
-        mate::warpsquad_wait();
-        pipeline_qk_rope.consumer_release(smem_pipe_k_rope_read);
-        ++smem_pipe_k_rope_read;
-      }
-
-      // Softmax
-      if constexpr (FirstRound) {
-        softmax.step(acc_qk, tiled_mma_qk, softmax_state, tPcP, problem_size);
       } else {
-        softmax.template step<EnableFusion>(
-            acc_qk, tiled_mma_qk, softmax_state, acc_pv_final, tiled_mma_pv, tPcP, problem_size);
-      }
-
-      // Sts
-      convert_and_sts(acc_qk);
-
-      MUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < IterationsPV; ++i) {
-        pipeline_pv.consumer_wait(smem_pipe_v_read);
-        int pv_read_stage = smem_pipe_v_read.index();
-
-        mute::gemm(tiled_mma_pv, tOrP, tOrV(_, _, _, pv_read_stage), acc_pv(_, _, _, i));
-
-        mate::warpsquad_commit_batch();
-        mate::warpsquad_wait();
-        pipeline_pv.consumer_release(smem_pipe_v_read);
-
-        ++smem_pipe_v_read;
-        if (i == 3) {
-          reuse_p.sync();
+        auto o_mn = make_tensor(acc_pv_final.data(), layout_acc_mn(tiled_mma_pv, acc_pv_final.layout()));
+        for (int tile = start_block_idx; tile < tile_end; ++tile) {
+          pipeline_p.consumer_wait(p_read);
+          if (tile != start_block_idx) {
+            MUTLASS_PRAGMA_UNROLL
+            for (int row = 0; row < size<0>(o_mn); ++row) {
+              float scale = storage.alpha[p_read.index()][row][thread_idx];
+              MUTLASS_PRAGMA_UNROLL
+              for (int col = 0; col < size<1>(o_mn); ++col) o_mn(row, col) *= scale;
+            }
+          }
+          auto release = smem_pipe_v_read;
+          MUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < IterationsPV; ++i) {
+            pipeline_pv.consumer_wait(smem_pipe_v_read);
+            ++smem_pipe_v_read;
+          }
+          auto p_slice    = thr_mma_pv.partition_A(sP(_, _, p_read.index()));
+          auto p_fragment = thr_mma_pv.make_fragment_A(p_slice);
+          auto issue      = release;
+          MUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < IterationsPV; ++i) {
+            mute::gemm(tiled_mma_pv, p_fragment, tOrV(_, _, _, issue.index()), acc_pv(_, _, _, i));
+            ++issue;
+          }
+          mate::warpsquad_commit_batch();
+          mate::warpsquad_wait();
+          MUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < IterationsPV; ++i) {
+            pipeline_pv.consumer_release(release);
+            ++release;
+          }
+          if (tile + 1 == tile_end) {
+            MUTLASS_PRAGMA_UNROLL
+            for (int row = 0; row < size(row_sum); ++row) {
+              row_sum(row) = storage.final_sum[row][thread_idx];
+              row_max(row) = storage.final_max[row][thread_idx];
+            }
+          }
+          pipeline_p.consumer_release(p_read);
+          ++p_read;
         }
       }
+    } else {
+      auto mla_fwd_step = [&](auto first_round, auto enable_fusion) {
+        static constexpr bool FirstRound   = decltype(first_round)::value;
+        static constexpr bool EnableFusion = decltype(enable_fusion)::value;
 
-      tPcP.data() = tPcP.data() + E<1>{} * get<1>(TileShape{});
-      ++tile_count_iter;
-    };
+        Tensor acc_qk = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQKLatent{}));
 
-    mla_fwd_step(mute::true_type{}, mute::false_type{});
+        // trigger zero init sqmma
+        clear(acc_qk);
 
-    while (tile_count_iter < min(unmasked_tile_count, end_block_idx)) {
-      mla_fwd_step(mute::false_type{}, mute::false_type{});
-    }
+        // MMA QK
+        MUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < IterationsQKLatent; ++i) {
+          pipeline_qk_latent.consumer_wait(smem_pipe_k_latent_read);
+          int k_read_stage = smem_pipe_k_latent_read.index();
+          mute::gemm(tiled_mma_qk, tSrQL(_, _, _, i), tSrKL(_, _, _, k_read_stage), acc_qk);
 
-    while (tile_count_iter < end_block_idx) {
-      mla_fwd_step(mute::false_type{}, mute::true_type{});
+          mate::warpsquad_commit_batch();
+          mate::warpsquad_wait();
+          pipeline_qk_latent.consumer_release(smem_pipe_k_latent_read);
+          ++smem_pipe_k_latent_read;
+          if (i == 3) {
+            reuse_p.sync();
+          }
+        }
+
+        MUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < IterationsQKRope; ++i) {
+          pipeline_qk_rope.consumer_wait(smem_pipe_k_rope_read);
+          int k_read_stage = smem_pipe_k_rope_read.index();
+          mute::gemm(tiled_mma_qk, tSrQR(_, _, _, i), tSrKR(_, _, _, k_read_stage), acc_qk);
+
+          mate::warpsquad_commit_batch();
+          mate::warpsquad_wait();
+          pipeline_qk_rope.consumer_release(smem_pipe_k_rope_read);
+          ++smem_pipe_k_rope_read;
+        }
+
+        // Softmax
+        if constexpr (FirstRound) {
+          softmax.step(acc_qk, tiled_mma_qk, softmax_state, tPcP, problem_size);
+        } else {
+          softmax.template step<EnableFusion>(
+              acc_qk, tiled_mma_qk, softmax_state, acc_pv_final, tiled_mma_pv, tPcP, problem_size);
+        }
+
+        // Sts
+        convert_and_sts(acc_qk);
+
+        MUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < IterationsPV; ++i) {
+          pipeline_pv.consumer_wait(smem_pipe_v_read);
+          int pv_read_stage = smem_pipe_v_read.index();
+
+          mute::gemm(tiled_mma_pv, tOrP, tOrV(_, _, _, pv_read_stage), acc_pv(_, _, _, i));
+
+          mate::warpsquad_commit_batch();
+          mate::warpsquad_wait();
+          pipeline_pv.consumer_release(smem_pipe_v_read);
+
+          ++smem_pipe_v_read;
+          if (i == 3) {
+            reuse_p.sync();
+          }
+        }
+
+        tPcP.data() = tPcP.data() + E<1>{} * get<1>(TileShape{});
+        ++tile_count_iter;
+      };
+
+      mla_fwd_step(mute::true_type{}, mute::false_type{});
+
+      while (tile_count_iter < min(unmasked_tile_count, end_block_idx)) {
+        mla_fwd_step(mute::false_type{}, mute::false_type{});
+      }
+
+      while (tile_count_iter < end_block_idx) {
+        mla_fwd_step(mute::false_type{}, mute::true_type{});
+      }
     }
 
     Tensor lse = softmax.tail(softmax_state, acc_pv_final, tiled_mma_pv);

@@ -489,7 +489,8 @@ void mla_with_kvcache(ffi::TensorView                q_latent,
                                                            static_cast<int>(softmax_lse_work.stride(0))))
                                  : make_stride(_1{}, make_stride(static_cast<int>(softmax_lse_work.stride(0)), 0));
 
-  auto run_mla = [&](auto element_type, auto use_trival_scheduler, auto causal, auto varlen_q) {
+  auto run_kernel = [&](auto element_type, auto use_trival_scheduler, auto causal, auto varlen_q, auto small_m) {
+    static constexpr bool SmallM             = decltype(small_m)::value;
     static constexpr bool UseTrivalScheduler = decltype(use_trival_scheduler)::value;
     static constexpr bool Causal             = decltype(causal)::value;
     static constexpr bool VarlenQ            = decltype(varlen_q)::value;
@@ -499,7 +500,7 @@ void mla_with_kvcache(ffi::TensorView                q_latent,
     using StrideO   = decltype(stride_out);
     using StrideLse = decltype(stride_lse);
     using Element   = decltype(element_type);
-    using TileShape = Shape<_128, _64, Shape<_512, _64>>;
+    using TileShape = conditional_t<SmallM, Shape<_32, _64, Shape<_512, _64>>, Shape<_128, _64, Shape<_512, _64>>>;
 
     using Fusion             = conditional_t<Causal,
                                              mutlass::fmha::collective::CausalFusion<false, true>,
@@ -591,6 +592,14 @@ void mla_with_kvcache(ffi::TensorView                q_latent,
       combine_params.o_head_stride        = static_cast<int>(out_work.stride(2));
 
       run_mla_combine_kernel<Element, VarlenQ>(combine_params, stream);
+    }
+  };
+
+  auto run_mla = [&](auto element, auto scheduler, auto causal, auto varlen) {
+    if (q_seq_per_hk <= 32) {
+      run_kernel(element, scheduler, causal, varlen, mute::true_type{});
+    } else {
+      run_kernel(element, scheduler, causal, varlen, mute::false_type{});
     }
   };
 

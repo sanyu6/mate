@@ -24,6 +24,7 @@ struct MlaKernelTmeWarpSpecialized {
   static constexpr int  NumMmaWarpSquads    = CollectiveMainloop::NumMmaWarpSquads;
   static constexpr bool UseTrivialScheduler = TileScheduler::UseTrivialScheduler;
   static constexpr bool VarlenQ             = CollectiveMainloop::VarlenQ;
+  static constexpr bool SeparatePV          = CollectiveMainloop::SeparatePV;
 
   using TileShape     = typename CollectiveMainloop::TileShape;
   using SharedStorage = typename CollectiveMainloop::SharedStorage;
@@ -59,6 +60,8 @@ struct MlaKernelTmeWarpSpecialized {
   struct MUTE_ALIGNAS(1) BarrierStorage {
     uint8_t PipelineQKLatent[MainloopPipelineQKLatent::NumBarriers];
     uint8_t PipelineQKRope[MainloopPipelineQKRope::NumBarriers];
+    uint8_t PipelinePV[SeparatePV ? MainloopPipelinePV::NumBarriers : 0];
+    uint8_t PipelineP[SeparatePV ? 4 : 0];
     uint8_t ReuseP[1];
     uint8_t FlipSync[1];
   };
@@ -120,7 +123,7 @@ struct MlaKernelTmeWarpSpecialized {
 
     PipelineQKLatentParams pipeline_params_qk_latent;
     pipeline_params_qk_latent.transaction_bytes = CollectiveMainloop::TmeTransactionBytesC;
-    pipeline_params_qk_latent.num_consumers     = NumMmaWarps;
+    pipeline_params_qk_latent.num_consumers     = CollectiveMainloop::NumQKMmaWarpSquads * NumWarpsPerWarpSquad;
     pipeline_params_qk_latent.num_producers     = 1;
 
     MainloopPipelineQKLatent pipeline_qk_latent(pipeline_params_qk_latent,
@@ -131,7 +134,7 @@ struct MlaKernelTmeWarpSpecialized {
 
     PipelineQKRopeParams pipeline_params_qk_rope;
     pipeline_params_qk_rope.transaction_bytes = CollectiveMainloop::TmeTransactionBytesKRope;
-    pipeline_params_qk_rope.num_consumers     = NumMmaWarps;
+    pipeline_params_qk_rope.num_consumers     = CollectiveMainloop::NumQKMmaWarpSquads * NumWarpsPerWarpSquad;
     pipeline_params_qk_rope.num_producers     = 1;
 
     MainloopPipelineQKRope pipeline_qk_rope(pipeline_params_qk_rope,
@@ -140,9 +143,50 @@ struct MlaKernelTmeWarpSpecialized {
         mutlass::make_producer_start_state<MainloopPipelineQKRope>();
     PipelineQKRopeState mainloop_pipe_qk_rope_consumer_state;
 
+    auto pipeline_pv = [&]() {
+      if constexpr (SeparatePV) {
+        PipelinePVParams pv_params;
+        pv_params.transaction_bytes = CollectiveMainloop::TmeTransactionBytesC;
+        pv_params.num_consumers     = CollectiveMainloop::NumPVMmaWarpSquads * NumWarpsPerWarpSquad;
+        pv_params.num_producers     = 1;
+        return MainloopPipelinePV(pv_params, reinterpret_cast<uint64_t>(&barrier_storage->PipelinePV));
+      } else {
+        return pipeline_qk_latent;
+      }
+    }();
+    PipelinePVState pv_producer_state = mutlass::make_producer_start_state<MainloopPipelinePV>();
+    PipelinePVState pv_consumer_state;
+    auto&           pv_producer = [&]() -> auto& {
+      if constexpr (SeparatePV)
+        return pv_producer_state;
+      else
+        return mainloop_pipe_qk_latent_producer_state;
+    }();
+    auto& pv_consumer = [&]() -> auto& {
+      if constexpr (SeparatePV)
+        return pv_consumer_state;
+      else
+        return mainloop_pipe_qk_latent_consumer_state;
+    }();
+
+    // Probability readiness is independent of both TME streams. In the
+    // original M128 path this aliases an existing pipeline without new barriers.
+    auto pipeline_p = [&]() {
+      if constexpr (SeparatePV) {
+        typename mutlass::Mp31PipelineAsync<2>::Params p_params;
+        p_params.producer_arv_count = CollectiveMainloop::NumQKMmaWarpSquads * NumWarpsPerWarpSquad;
+        p_params.consumer_arv_count = CollectiveMainloop::NumPVMmaWarpSquads * NumWarpsPerWarpSquad;
+        return mutlass::Mp31PipelineAsync<2>(p_params, reinterpret_cast<uint64_t>(&barrier_storage->PipelineP));
+      } else {
+        return pipeline_qk_latent;
+      }
+    }();
+    auto p_write = mutlass::make_producer_start_state<mutlass::Mp31PipelineAsync<2>>();
+    typename mutlass::Mp31PipelineAsync<2>::PipelineState p_read;
+
     NamedBarrier reuse_p(reinterpret_cast<uint64_t>(&barrier_storage->ReuseP));
     if (warp_idx == 0) {
-      reuse_p.init(NumMmaWarps);
+      reuse_p.init(CollectiveMainloop::NumQKMmaWarpSquads * NumWarpsPerWarpSquad);
     }
 
     __syncthreads();
@@ -174,8 +218,8 @@ struct MlaKernelTmeWarpSpecialized {
                       mainloop_pipe_qk_latent_producer_state,
                       pipeline_qk_rope,
                       mainloop_pipe_qk_rope_producer_state,
-                      pipeline_qk_latent,
-                      mainloop_pipe_qk_latent_producer_state,
+                      pipeline_pv,
+                      pv_producer,
                       blk_coord,
                       params.problem_size,
                       warp_idx,
@@ -193,30 +237,36 @@ struct MlaKernelTmeWarpSpecialized {
                                         mainloop_pipe_qk_latent_consumer_state,
                                         pipeline_qk_rope,
                                         mainloop_pipe_qk_rope_consumer_state,
-                                        pipeline_qk_latent,
-                                        mainloop_pipe_qk_latent_consumer_state,
+                                        pipeline_pv,
+                                        pv_consumer,
+                                        pipeline_p,
+                                        p_write,
+                                        p_read,
                                         reuse_p,
                                         shared_storage,
                                         thread_idx_in_warp_squad,
                                         consumer_warp_squad_idx,
                                         workload);
 
-        typename CollectiveMainloop::TiledMmaPV tiled_mma_pv;
-        auto consumer_qo_coord  = get<0>(blk_coord) * NumMmaWarpSquads + consumer_warp_squad_idx;
-        auto problem_size_epi   = make_shape(Q * H, cur_seqlen, H, 1, B, TotalQ, MaxQ);
-        auto blk_coord_epilogue = make_coord(qo_coord, _0{}, _0{}, batch_coord);
+        if (!SeparatePV || consumer_warp_squad_idx == 1) {
+          typename CollectiveMainloop::TiledMmaPV tiled_mma_pv;
+          auto                                    consumer_qo_coord =
+              SeparatePV ? get<0>(blk_coord) : get<0>(blk_coord) * NumMmaWarpSquads + consumer_warp_squad_idx;
+          auto problem_size_epi   = make_shape(Q * H, cur_seqlen, H, 1, B, TotalQ, MaxQ);
+          auto blk_coord_epilogue = make_coord(qo_coord, _0{}, _0{}, batch_coord);
 
-        int               split_idx = 0;
-        epilogue.template operator()<true>(blk_coord_epilogue,
-                                           results,
-                                           tiled_mma_pv,
-                                           problem_size_epi,
-                                           0,
-                                           params.epilogue,
-                                           thread_idx_in_warp_squad,
-                                           consumer_qo_coord,
-                                           split_idx,
-                                           0);
+          int               split_idx = 0;
+          epilogue.template operator()<true>(blk_coord_epilogue,
+                                             results,
+                                             tiled_mma_pv,
+                                             problem_size_epi,
+                                             0,
+                                             params.epilogue,
+                                             thread_idx_in_warp_squad,
+                                             consumer_qo_coord,
+                                             split_idx,
+                                             0);
+        }
       }
     }
     // FlashMla-style scheduler
@@ -272,8 +322,8 @@ struct MlaKernelTmeWarpSpecialized {
                           mainloop_pipe_qk_latent_producer_state,
                           pipeline_qk_rope,
                           mainloop_pipe_qk_rope_producer_state,
-                          pipeline_qk_latent,
-                          mainloop_pipe_qk_latent_producer_state,
+                          pipeline_pv,
+                          pv_producer,
                           blk_coord,
                           problem_size,
                           warp_idx,
@@ -294,43 +344,49 @@ struct MlaKernelTmeWarpSpecialized {
                                             mainloop_pipe_qk_latent_consumer_state,
                                             pipeline_qk_rope,
                                             mainloop_pipe_qk_rope_consumer_state,
-                                            pipeline_qk_latent,
-                                            mainloop_pipe_qk_latent_consumer_state,
+                                            pipeline_pv,
+                                            pv_consumer,
+                                            pipeline_p,
+                                            p_write,
+                                            p_read,
                                             reuse_p,
                                             shared_storage,
                                             thread_idx_in_warp_squad,
                                             consumer_warp_squad_idx,
                                             workload);
 
-            typename CollectiveMainloop::TiledMmaPV tiled_mma_pv;
-            auto consumer_qo_coord  = get<0>(blk_coord) * NumMmaWarpSquads + consumer_warp_squad_idx;
-            auto problem_size_epi   = make_shape(Q * H, cur_seqlen, H, 1, B, TotalQ, MaxQ);
-            auto blk_coord_epilogue = make_coord(qo_coord, _0{}, _0{}, batch_idx);
+            if (!SeparatePV || consumer_warp_squad_idx == 1) {
+              typename CollectiveMainloop::TiledMmaPV tiled_mma_pv;
+              auto                                    consumer_qo_coord =
+                  SeparatePV ? get<0>(blk_coord) : get<0>(blk_coord) * NumMmaWarpSquads + consumer_warp_squad_idx;
+              auto problem_size_epi   = make_shape(Q * H, cur_seqlen, H, 1, B, TotalQ, MaxQ);
+              auto blk_coord_epilogue = make_coord(qo_coord, _0{}, _0{}, batch_idx);
 
-            int split_idx = params.tile_scheduler.num_splits_ptr[batch_idx] + n_split_idx;
+              int split_idx = params.tile_scheduler.num_splits_ptr[batch_idx] + n_split_idx;
 
-            if (is_no_split) {
-              epilogue.template operator()<true>(blk_coord_epilogue,
-                                                 results,
-                                                 tiled_mma_pv,
-                                                 problem_size_epi,
-                                                 0,
-                                                 params.epilogue,
-                                                 thread_idx_in_warp_squad,
-                                                 consumer_qo_coord,
-                                                 split_idx,
-                                                 seq_q_begin);
-            } else {
-              epilogue.template operator()<false>(blk_coord_epilogue,
-                                                  results,
-                                                  tiled_mma_pv,
-                                                  problem_size_epi,
-                                                  0,
-                                                  params.epilogue,
-                                                  thread_idx_in_warp_squad,
-                                                  consumer_qo_coord,
-                                                  split_idx,
-                                                  seq_q_begin);
+              if (is_no_split) {
+                epilogue.template operator()<true>(blk_coord_epilogue,
+                                                   results,
+                                                   tiled_mma_pv,
+                                                   problem_size_epi,
+                                                   0,
+                                                   params.epilogue,
+                                                   thread_idx_in_warp_squad,
+                                                   consumer_qo_coord,
+                                                   split_idx,
+                                                   seq_q_begin);
+              } else {
+                epilogue.template operator()<false>(blk_coord_epilogue,
+                                                    results,
+                                                    tiled_mma_pv,
+                                                    problem_size_epi,
+                                                    0,
+                                                    params.epilogue,
+                                                    thread_idx_in_warp_squad,
+                                                    consumer_qo_coord,
+                                                    split_idx,
+                                                    seq_q_begin);
+              }
             }
           }
         }
