@@ -1,0 +1,35 @@
+#include <musa_runtime.h>
+#include <tvm/ffi/extra/musa/device_guard.h>
+#include "mate/mega_moe/prefill/mp32_prefill_stage2.hpp"
+#include "op_utils.hpp"
+using namespace tvm;
+void {{ func_name }}(ffi::TensorView l2_acts, ffi::TensorView l2_acts_sf,
+  ffi::TensorView weights, ffi::TensorView scales, ffi::TensorView ptrs,int rank) {
+  CHECK_INPUT_AND_TYPE(l2_acts,dl_float8_e4m3fn);
+  CHECK_INPUT_AND_TYPE(l2_acts_sf,dl_uint8);
+  CHECK_INPUT_AND_TYPE(weights,dl_int8);
+  CHECK_INPUT_AND_TYPE(scales,dl_uint8);
+  CHECK_DEVICE(weights,l2_acts);CHECK_DEVICE(scales,l2_acts);CHECK_DEVICE(l2_acts_sf,l2_acts);
+  CHECK_DIM(2,l2_acts);CHECK_DIM(2,l2_acts_sf);CHECK_DIM(3,weights);CHECK_DIM(3,scales);
+  TVM_FFI_ICHECK_EQ(l2_acts.size(0),{{ num_max_pool_tokens }});
+  TVM_FFI_ICHECK_EQ(l2_acts.size(1),{{ intermediate_hidden }});
+  TVM_FFI_ICHECK_EQ(l2_acts_sf.size(0),{{ intermediate_hidden }}/32);
+  TVM_FFI_ICHECK_EQ(l2_acts_sf.size(1),{{ num_max_pool_tokens }});
+  TVM_FFI_ICHECK_EQ(weights.size(0),{{ num_experts_per_rank }});
+  TVM_FFI_ICHECK_EQ(weights.size(1),{{ hidden }});
+  TVM_FFI_ICHECK_EQ(weights.size(2),{{ intermediate_hidden }}/2);
+  TVM_FFI_ICHECK_EQ(scales.size(0),{{ num_experts_per_rank }});
+  TVM_FFI_ICHECK_EQ(scales.size(1),{{ intermediate_hidden }}/32);
+  TVM_FFI_ICHECK_EQ(scales.size(2),{{ hidden }});
+
+  ffi::MUSADeviceGuard guard(l2_acts.device().device_id);
+  using Impl=::mega_moe::prefill::mp32::Stage2<{{ num_max_tokens_per_rank }},{{ hidden }},{{ intermediate_hidden }},
+    {{ num_experts }},{{ num_topk }},{{ num_max_pool_tokens }},{{ num_mps }},{{ num_ranks }}>;
+  auto params=Impl::RS::params({{ num_max_pool_tokens }},{{ num_experts_per_rank }},
+    l2_acts.data_ptr(),l2_acts_sf.data_ptr(),weights.data_ptr(),scales.data_ptr());
+  auto sym=mate::mega_moe::make_sym_buffer<{{ num_ranks }}>(ptrs,rank);
+  auto kernel=::mega_moe::prefill::mp32::stage2_kernel<Impl>;
+  MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(kernel,musaFuncAttributeMaxDynamicSharedMemorySize,Impl::SmemSize));
+  kernel<<<{{ num_mps }},Impl::kNumThreads,Impl::SmemSize,get_stream(l2_acts.device())>>>(sym,params);
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}

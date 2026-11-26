@@ -4,11 +4,18 @@ import functools
 from typing import Optional, Tuple, Union, cast
 
 import torch
+from mate.execution_context import call_or_return_if_dry_run
 
 from mate.artifacts import ensure_mubin_module_artifacts
-from mate.mate_runtime import get_physical_num_mps
+from mate.mate_runtime import get_arch, get_physical_num_mps
 from mate.utils import ceil_div
 
+from ..common import (
+    Arch,
+    MP31_ARCH,
+    MP32_ARCH,
+    _resolve_grouped_fp8_recipe,
+)
 from ..launcher import get_mubin_launch_function, render_gemm_mubin_launcher
 from .dispatch import (
     RAGGED_EXPERT_LAYOUT_BLOCK_CANDIDATES,
@@ -23,17 +30,18 @@ from .types import (
 
 
 @functools.cache
-def _get_gemm_mubin_runtime() -> MoeGemmMubinDispatcher:
-    module_dir = ensure_mubin_module_artifacts("gemm")
-    return get_moe_gemm_mubin_dispatcher(module_dir / "kernel_map.json")
+def _get_gemm_mubin_runtime(arch: Arch) -> MoeGemmMubinDispatcher:
+    module_dir = ensure_mubin_module_artifacts("gemm", arch=arch)
+    return get_moe_gemm_mubin_dispatcher(module_dir / "kernel_map.json", arch)
 
 
 @functools.cache
 def _get_gemm_mubin_launch_plan(
     get_asm_id: str,
+    arch: Arch,
     **dispatch_args,
 ):
-    dispatcher = _get_gemm_mubin_runtime()
+    dispatcher = _get_gemm_mubin_runtime(arch)
     asm_id = getattr(dispatcher, get_asm_id)(**dispatch_args)
     entry, kernel_path = dispatcher.resolve_kernel_artifact(asm_id)
     launch = get_mubin_launch_function(
@@ -41,7 +49,19 @@ def _get_gemm_mubin_launch_plan(
         entry.kernel_name,
         render_gemm_mubin_launcher(asm_id, entry.kernel_name),
     )
-    return str(kernel_path), launch
+    return str(kernel_path), call_or_return_if_dry_run(launch, dry_run_result=None)
+
+
+def _require_mp31_grouped_mubin(device: torch.device, operation: str) -> Arch:
+    """Fail before artifact resolution when a grouped path has no MP32 object."""
+
+    arch = get_arch(device)
+    if arch != MP31_ARCH:
+        raise NotImplementedError(
+            f"{operation} is not available on MP32; no matching MUBIN "
+            "artifact has been delivered"
+        )
+    return arch
 
 
 def get_gemm_quant_mode_from_recipe(quant_recipe: Tuple[int, int]) -> TensorQuantMode:
@@ -79,8 +99,9 @@ def _estimate_optimal_block(
     n: int,
     num_expert: int,
     num_mp: int,
+    arch: Arch,
 ) -> int:
-    dispatcher = _get_gemm_mubin_runtime()
+    dispatcher = _get_gemm_mubin_runtime(arch)
     best_score = -1.0
     best_candidate_id = 0
     for candidate_id, (block, base_score) in enumerate(
@@ -116,6 +137,7 @@ def ragged_moe_gemm_8bit_mubin(
 
     m = a.shape[0]
     num_expert = b.shape[0]
+    arch = _require_mp31_grouped_mubin(a.device, "ragged FP8 GEMM")
     _, scale_granularity_n, scale_granularity_k = scale_granularity_mnk
     if scale_granularity_n != 128 or scale_granularity_k != 128:
         raise ValueError("scale_granularity_mnk must have n and k granularity 128")
@@ -125,6 +147,7 @@ def ragged_moe_gemm_8bit_mubin(
     tme_cache_hint_b = num_expert > 0 and m / num_expert <= 192
     kernel_path, launch = _get_gemm_mubin_launch_plan(
         "get_ragged_asm_id",
+        arch=arch,
         type_a=a.dtype,
         type_b=b.dtype,
         type_d=out.dtype,
@@ -166,6 +189,7 @@ def masked_moe_gemm_8bit_mubin(
     b, scale_b = input_b
 
     _, n, _ = b.shape
+    arch = _require_mp31_grouped_mubin(a.device, "masked FP8 GEMM")
     _, scale_granularity_n, scale_granularity_k = scale_granularity_mnk
     if scale_granularity_n != 128 or scale_granularity_k != 128:
         raise ValueError("scale_granularity_mnk must have n and k granularity 128")
@@ -177,6 +201,7 @@ def masked_moe_gemm_8bit_mubin(
 
     kernel_path, launch = _get_gemm_mubin_launch_plan(
         "get_masked_asm_id",
+        arch=arch,
         type_a=a.dtype,
         type_b=b.dtype,
         type_d=out.dtype,
@@ -223,6 +248,7 @@ def ragged_moe_gemm_w4a8_mubin(
     *,
     mixed_dtype: str = "s4fp8",
 ):
+    arch = _require_mp31_grouped_mubin(input_a[0].device, "ragged grouped W4A8 GEMM")
     if mixed_dtype not in ("s4fp8", "fp4fp8"):
         raise ValueError("mixed_dtype must be 's4fp8' or 'fp4fp8'")
     is_fp4 = mixed_dtype == "fp4fp8"
@@ -252,6 +278,7 @@ def ragged_moe_gemm_w4a8_mubin(
     tme_cache_hint_b = num_expert > 0 and m / num_expert <= 192
     kernel_path, launch = _get_gemm_mubin_launch_plan(
         "get_w4a8_ragged_asm_id",
+        arch=arch,
         type_a=a.dtype,
         type_d=out.dtype,
         type_scale_b=scale_b.dtype,
@@ -294,6 +321,7 @@ def masked_moe_gemm_w4a8_mubin(
     *,
     mixed_dtype: str = "s4fp8",
 ):
+    arch = _require_mp31_grouped_mubin(input_a[0].device, "masked grouped W4A8 GEMM")
     if expect_tokens is None:
         expect_tokens = 0
     if mixed_dtype not in ("s4fp8", "fp4fp8"):
@@ -323,6 +351,7 @@ def masked_moe_gemm_w4a8_mubin(
     )
     kernel_path, launch = _get_gemm_mubin_launch_plan(
         "get_w4a8_masked_asm_id",
+        arch=arch,
         type_a=a.dtype,
         type_d=out.dtype,
         type_scale_b=scale_b.dtype,
@@ -354,6 +383,162 @@ def masked_moe_gemm_w4a8_mubin(
     return None
 
 
+def _require_mp32_mxfp_device(packed_a: torch.Tensor) -> None:
+    if get_arch(packed_a.device) != MP32_ARCH:
+        raise NotImplementedError("MXFP grouped GEMM requires MP32")
+
+
+def ragged_moe_gemm_mxfp_mubin(
+    input_a: tuple[torch.Tensor, torch.Tensor],
+    input_b: tuple[torch.Tensor, torch.Tensor],
+    ragged_tokens_info: torch.Tensor,
+    out: torch.Tensor,
+    alignment_m: int = 128,
+    num_mp: int | None = None,
+):
+    """Launch MP32 MXFP mode-3 with native MN-major UE8M0 scales."""
+
+    packed_a, scale_a = input_a
+    packed_b, scale_b = input_b
+    _require_mp32_mxfp_device(packed_a)
+
+    if packed_a.dtype == torch.int8 and packed_b.dtype == torch.int8:
+        kernel_path, launch = _get_gemm_mubin_launch_plan(
+            "get_mp32_mxfp4_ragged_asm_id", arch=MP32_ARCH, alignment_m=alignment_m
+        )
+    else:
+        kernel_path, launch = _get_gemm_mubin_launch_plan(
+            "get_mp32_ragged_asm_id",
+            arch=MP32_ARCH,
+            type_a=packed_a.dtype,
+            type_b=packed_b.dtype,
+            type_d=out.dtype,
+            quant_tile=32,
+            alignment_m=alignment_m,
+        )
+    launch(
+        kernel_path,
+        packed_a,
+        packed_b,
+        out,
+        scale_a,
+        scale_b,
+        None,
+        ragged_tokens_info,
+        None,
+        None,
+        num_mp,
+    )
+
+
+def masked_moe_gemm_mxfp_mubin(
+    input_a: tuple[torch.Tensor, torch.Tensor],
+    input_b: tuple[torch.Tensor, torch.Tensor],
+    masked_tokens_info: torch.Tensor,
+    out: torch.Tensor,
+    expect_tokens: int | None = None,
+    num_mp: int | None = None,
+):
+    """Launch MP32 MXFP mode-4 with native MN-major UE8M0 scales."""
+
+    packed_a, scale_a = input_a
+    packed_b, scale_b = input_b
+    _require_mp32_mxfp_device(packed_a)
+
+    if packed_a.dtype == torch.int8 and packed_b.dtype == torch.int8:
+        kernel_path, launch = _get_gemm_mubin_launch_plan(
+            "get_mp32_mxfp4_masked_asm_id", arch=MP32_ARCH
+        )
+    else:
+        kernel_path, launch = _get_gemm_mubin_launch_plan(
+            "get_mp32_masked_asm_id",
+            arch=MP32_ARCH,
+            type_a=packed_a.dtype,
+            type_b=packed_b.dtype,
+            type_d=out.dtype,
+            quant_tile=32,
+        )
+    launch(
+        kernel_path,
+        packed_a,
+        packed_b,
+        out,
+        scale_a,
+        scale_b,
+        None,
+        masked_tokens_info,
+        None,
+        None,
+        num_mp,
+    )
+
+
+def _validate_mxfp_ks(
+    value_a: torch.Tensor,
+    ks_cpu: Optional[list[int]],
+    grouped_layout: torch.Tensor,
+) -> None:
+    """Validate the host K partition, which is not passed to the C++ launcher."""
+    if (
+        not isinstance(ks_cpu, (list, tuple))
+        or not ks_cpu
+        or any(type(k) is not int or k <= 0 or k % 32 for k in ks_cpu)
+    ):
+        raise ValueError("MP32 ks_cpu must contain positive multiples of 32")
+    if not isinstance(grouped_layout, torch.Tensor):
+        raise TypeError("MP32 grouped_layout must be a torch.Tensor")
+    if value_a.dim() == 0 or sum(ks_cpu) != value_a.size(0):
+        raise ValueError("MP32 sum(ks_cpu) must match A total K")
+    if grouped_layout.numel() != len(ks_cpu):
+        raise ValueError("MP32 grouped_layout length must match ks_cpu")
+
+
+def ragged_k_moe_gemm_mxfp_mubin(
+    input_a: Tuple[torch.Tensor, torch.Tensor],
+    input_b: Tuple[torch.Tensor, torch.Tensor],
+    ragged_tokens_info: torch.Tensor,
+    scale_granularity_mnk: Tuple[int, int, int],
+    out: torch.Tensor,
+    num_mp: Optional[int] = None,
+    ks_cpu: list[int] | None = None,
+    *,
+    c: torch.Tensor | None = None,
+    zero_output: bool = False,
+):
+    a, scale_a = input_a
+    b, scale_b = input_b
+    _require_mp32_mxfp_device(a)
+    arch = MP32_ARCH
+    scale_granularity_mnk = _resolve_grouped_fp8_recipe(
+        scale_granularity_mnk, arch, k_grouped=True
+    )
+    _validate_mxfp_ks(a, ks_cpu, ragged_tokens_info)
+    kernel_path, launch = _get_gemm_mubin_launch_plan(
+        "get_mp32_k_contig_asm_id",
+        arch=arch,
+        type_a=a.dtype,
+        type_b=b.dtype,
+        type_d=out.dtype,
+        quant_tile=scale_granularity_mnk[2],
+    )
+    launch(
+        kernel_path,  # object_path
+        a,  # a
+        b,  # b
+        out,  # out
+        scale_a,  # scale_a
+        scale_b,  # scale_b
+        None,  # scale_b1
+        ragged_tokens_info,  # token_info
+        None,  # signal
+        None,  # output_scale
+        num_mp,  # num_target_mp
+        c,  # input_c
+        zero_output,
+    )
+    return None
+
+
 def ragged_k_moe_gemm_8bit_mubin(
     input_a: Tuple[torch.Tensor, torch.Tensor],
     input_b: Tuple[torch.Tensor, torch.Tensor],
@@ -361,14 +546,17 @@ def ragged_k_moe_gemm_8bit_mubin(
     scale_granularity_mnk: Tuple[int, int, int],
     out: torch.Tensor,
     num_mp: Optional[int] = None,
+    ks_cpu: list[int] | None = None,
 ):
     a, scale_a = input_a
     b, scale_b = input_b
-    if scale_granularity_mnk != (1, 1, 128):
-        raise ValueError("ragged_k_moe_gemm_8bit_mubin only supports (1, 1, 128)")
-
+    arch = _require_mp31_grouped_mubin(a.device, "K-grouped FP8 GEMM")
+    scale_granularity_mnk = _resolve_grouped_fp8_recipe(
+        scale_granularity_mnk, arch, k_grouped=True
+    )
     kernel_path, launch = _get_gemm_mubin_launch_plan(
         "get_k_contig_asm_id",
+        arch=arch,
         type_a=a.dtype,
         type_b=b.dtype,
         type_d=out.dtype,
@@ -403,6 +591,7 @@ def m_grouped_contig_gemm_8bit_mubin(
     major_b_mode: str,
     num_mp: Optional[int] = None,
 ):
+    arch = _require_mp31_grouped_mubin(input_a[0].device, "per-expert M-group FP8 GEMM")
     dispatch_num_mp = get_physical_num_mps(input_a[0].device)
     if major_a_mode != "K":
         raise ValueError("m_grouped_contig_gemm_8bit_mubin only supports K-major A")
@@ -419,9 +608,12 @@ def m_grouped_contig_gemm_8bit_mubin(
     if scale_granularity_n != 128 or scale_granularity_k != 128:
         raise ValueError("scale_granularity_mnk must have n and k granularity 128")
     major_b = TensorMajor.K if major_b_mode == "K" else TensorMajor.MN
-    candidate_block_id = _estimate_optimal_block(m, n, num_expert, dispatch_num_mp)
+    candidate_block_id = _estimate_optimal_block(
+        m, n, num_expert, dispatch_num_mp, arch
+    )
     kernel_path, launch = _get_gemm_mubin_launch_plan(
         "get_ragged_expert_layout_asm_id",
+        arch=arch,
         type_a=a.dtype,
         type_b=b.dtype,
         type_d=out.dtype,
@@ -457,6 +649,7 @@ def ragged_moe_gemm_16bit_mubin(
     alignment_m: int,
     num_mp: Optional[int] = None,
 ):
+    arch = _require_mp31_grouped_mubin(a.device, "ragged grouped BF16 GEMM")
     m = a.shape[0]
     num_expert = b.shape[0]
     if use_psum_layout:
@@ -470,6 +663,7 @@ def ragged_moe_gemm_16bit_mubin(
     tme_cache_hint_b = num_expert > 0 and m / num_expert <= 192
     kernel_path, launch = _get_gemm_mubin_launch_plan(
         "get_ragged_asm_id",
+        arch=arch,
         type_a=a.dtype,
         type_b=b.dtype,
         type_d=out.dtype,
@@ -503,6 +697,7 @@ def masked_moe_gemm_16bit_mubin(
     signal: Optional[torch.Tensor],
     num_mp: Optional[int] = None,
 ):
+    arch = _require_mp31_grouped_mubin(a.device, "masked grouped BF16 GEMM")
     if expect_tokens is None:
         expect_tokens = 0
 
@@ -514,6 +709,7 @@ def masked_moe_gemm_16bit_mubin(
 
     kernel_path, launch = _get_gemm_mubin_launch_plan(
         "get_masked_asm_id",
+        arch=arch,
         type_a=a.dtype,
         type_b=b.dtype,
         type_d=out.dtype,
@@ -551,8 +747,10 @@ def ragged_k_moe_gemm_16bit_mubin(
     out: torch.Tensor,
     num_mp: Optional[int] = None,
 ):
+    arch = _require_mp31_grouped_mubin(a.device, "K-group BF16 GEMM")
     kernel_path, launch = _get_gemm_mubin_launch_plan(
         "get_k_contig_asm_id",
+        arch=arch,
         type_a=a.dtype,
         type_b=b.dtype,
         type_d=out.dtype,
@@ -586,6 +784,7 @@ def m_grouped_contig_gemm_16bit_mubin(
     major_b_mode: str,
     num_mp: Optional[int] = None,
 ):
+    arch = _require_mp31_grouped_mubin(a.device, "per-expert M-group BF16 GEMM")
     dispatch_num_mp = get_physical_num_mps(a.device)
     if major_a_mode != "K":
         raise ValueError("m_grouped_contig_gemm_16bit_mubin only supports K-major A")
@@ -597,9 +796,12 @@ def m_grouped_contig_gemm_16bit_mubin(
     n = b.shape[-2] if major_b_mode == "K" else b.shape[-1]
 
     major_b = TensorMajor.K if major_b_mode == "K" else TensorMajor.MN
-    candidate_block_id = _estimate_optimal_block(m, n, num_expert, dispatch_num_mp)
+    candidate_block_id = _estimate_optimal_block(
+        m, n, num_expert, dispatch_num_mp, arch
+    )
     kernel_path, launch = _get_gemm_mubin_launch_plan(
         "get_ragged_expert_layout_asm_id",
+        arch=arch,
         type_a=a.dtype,
         type_b=b.dtype,
         type_d=out.dtype,
@@ -635,6 +837,7 @@ def groupwise_gemm_8bit_fp8output_mubin(
     major_b_mode: str,
     num_mp: Optional[int] = None,
 ):
+    arch = _require_mp31_grouped_mubin(input_a[0].device, "FP8-output groupwise GEMM")
     if major_a_mode not in ("K", "MN"):
         raise ValueError("major_a_mode must be K or MN")
     if major_b_mode not in ("K", "MN"):
@@ -650,6 +853,7 @@ def groupwise_gemm_8bit_fp8output_mubin(
     major_b = TensorMajor.K if major_b_mode == "K" else TensorMajor.MN
     kernel_path, launch = _get_gemm_mubin_launch_plan(
         "get_normal_gemm_id",
+        arch=arch,
         type_a=a.dtype,
         type_b=b.dtype,
         type_d=out.dtype,

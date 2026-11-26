@@ -12,16 +12,13 @@ namespace mate::attention::msa::collective {
 
 using namespace mute;
 
-// Store a physical M16 tile as two adjacent TP8 query tokens:
-//   rows  0..7  -> q_abs + 0
-//   rows  8..15 -> q_abs + 1
+// Store query slices of a physical MMA tile, skipping absent queries.
 template <class ElementOutput_>
 struct MsaFwdPairEpilogue {
   using ElementOutput = ElementOutput_;
 
-  static constexpr int HeadRatio      = 8;
-  static constexpr int QueriesPerTile = 2;
-  static constexpr int HeadDim        = 128;
+  static constexpr int HeadRatio = 8;
+  static constexpr int HeadDim   = 128;
 
   static constexpr bool IsSupportedOutput = std::is_same_v<ElementOutput, mutlass::float_e4m3_t> ||
                                             std::is_same_v<ElementOutput, mutlass::half_t> ||
@@ -69,8 +66,7 @@ struct MsaFwdPairEpilogue {
                             TiledMmaPV      tiled_mma_pv,
                             WorkTile const& work_tile,
                             int             consumer_thread_idx) const {
-    // Each physical row is distributed over eight consumer threads.
-    if (consumer_thread_idx >= QueriesPerTile * HeadRatio * 8) {
+    if (consumer_thread_idx >= int(mute::size(TiledMmaPV{}))) {
       return;
     }
 

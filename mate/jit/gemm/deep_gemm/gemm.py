@@ -29,6 +29,16 @@ DEEP_GEMM_GEMM_EXTRA_CUDA_CFLAGS = list(DEEP_GEMM_CUDA_FLAGS) + [
     "-fno-signed-zeros",
 ]
 
+DEEP_GEMM_FP8_FP4_EXTRA_CUDA_CFLAGS = [
+    "-Od3",
+    "-fno-strict-aliasing",
+    "-std=c++17",
+    "-mllvm",
+    "-mtgpu-load-store-opt",
+    "-mllvm",
+    "-mtgpu-enchanced-minreg-schedule=false",
+]
+
 DEEP_GEMM_TEMPLATE_ENV = Environment(
     loader=FileSystemLoader(
         (jit_env.MATE_TEMPLATE_DIR / "gemm" / "deep_gemm").as_posix()
@@ -44,7 +54,7 @@ GEMM_TYPE_M_GROUPED_CONTIGUOUS_PSUM = (
 )
 GEMM_TYPE_M_GROUPED_MASKED = "mate::deep_gemm::GemmType::MGroupedMasked"
 
-_SUPPORTED_KINDS = ("bf16", "fp8")
+_SUPPORTED_KINDS = ("bf16", "fp8", "fp8_fp4")
 _SUPPORTED_GEMM_TYPES = (
     GEMM_TYPE_NORMAL,
     GEMM_TYPE_BATCHED,
@@ -116,6 +126,15 @@ DEEP_GEMM_CONFIGS = [
 ]
 
 
+# MP32 W4A8 configurations use TileK=128.
+DEEP_GEMM_FP8_FP4_CONFIGS = {
+    (128, 128): GemmJitConfig(tile_m=128, tile_n=128, stages=10, num_mma_warp_squads=2),
+    (128, 256): GemmJitConfig(tile_m=128, tile_n=256, stages=7, num_mma_warp_squads=4),
+    (256, 128): GemmJitConfig(tile_m=256, tile_n=128, stages=6, num_mma_warp_squads=2),
+    (256, 256): GemmJitConfig(tile_m=256, tile_n=256, stages=5, num_mma_warp_squads=4),
+}
+
+
 def deep_gemm_gemm_extra_include_paths() -> list[Path]:
     return [
         jit_env.MATE_INCLUDE_DIR,
@@ -130,8 +149,10 @@ def get_deep_gemm_gemm_template(name: str):
     return DEEP_GEMM_TEMPLATE_ENV.get_template(name)
 
 
-def _generated_source_path(dispatch_name: str) -> Path:
-    return jit_env.MATE_GEN_SRC_DIR / "deep_gemm" / f"{dispatch_name}.mu"
+def _generated_source_path(dispatch_name: str, arch: jit_env.MusaArch) -> Path:
+    return (
+        jit_env.resolve_musa_generated_dir(arch) / "deep_gemm" / f"{dispatch_name}.mu"
+    )
 
 
 def _select_config(m: int) -> GemmJitConfig:
@@ -146,6 +167,12 @@ def _select_fp8_grouped_config(m: int, alignment_m: int) -> GemmJitConfig:
     if alignment_m not in (128, 256):
         raise ValueError(f"alignment_m must be 128 or 256, got {alignment_m}")
     return _select_config(min(m, alignment_m))
+
+
+def _select_fp8_fp4_config(m: int, n: int) -> GemmJitConfig:
+    tile_m = 256 if m >= 256 else 128
+    tile_n = 256 if n >= 256 else 128
+    return DEEP_GEMM_FP8_FP4_CONFIGS[(tile_m, tile_n)]
 
 
 def _deep_gemm_gemm_op_name(gemm_type: str, kind: str) -> str:
@@ -236,7 +263,7 @@ def _deep_gemm_gemm_config_dict(
             tvm_dtype_b=TVM_DTYPE_BF16,
             tvm_dtype_d=TVM_DTYPE_BF16,
         )
-    else:
+    elif config.kind == "fp8":
         render_config.update(
             quant_tile=config.quant_tile,
             scale_accumulation_mode=config.scale_accumulation_mode,
@@ -380,9 +407,11 @@ def _render_deep_gemm_gemm_source(
     _validate_deep_gemm_gemm_kernel_config(kernel_config)
     render_config = _deep_gemm_gemm_config_dict(kernel_config)
     render_config["func_name"] = deep_gemm_gemm_dispatch_name(kernel_config)
-    template_name = (
-        "bf16_gemm_kern.j2" if kernel_config.kind == "bf16" else "fp8_gemm_1d2d_kern.j2"
-    )
+    template_name = {
+        "bf16": "bf16_gemm_kern.j2",
+        "fp8": "fp8_gemm_1d2d_kern.j2",
+        "fp8_fp4": "mp32_fp8_fp4_gemm_1d1d_kern.j2",
+    }[kernel_config.kind]
     return (
         TVM_HEADER
         + get_deep_gemm_gemm_template(template_name).render(render_config)
@@ -440,11 +469,13 @@ def get_deep_gemm_gemm_module(
     epilogue: str = DEEP_GEMM_EPILOGUE_GEMM,
     head_splits: tuple[int, int, int] = (0, 0, 0),
     major_b_mode: str = "K",
+    config_n: int | None = None,
 ):
     kernel_config = _resolve_deep_gemm_gemm_kernel_config(
         kind=kind,
         gemm_type=gemm_type,
         config_m=config_m,
+        config_n=config_n,
         alignment_m=alignment_m,
         config=config,
         scale_accumulation_mode=scale_accumulation_mode,
@@ -463,6 +494,7 @@ def select_deep_gemm_gemm_config(
     kind: str,
     gemm_type: str,
     config_m: int | None,
+    config_n: int | None = None,
     alignment_m: int = 128,
     config: Optional[GemmJitConfig] = None,
 ) -> GemmJitConfig:
@@ -474,6 +506,12 @@ def select_deep_gemm_gemm_config(
         return config
     if config_m is None:
         raise ValueError("config_m must be set when config is not provided")
+    if kind == "fp8_fp4":
+        if config_n is None:
+            raise ValueError("config_n must be set when config is not provided")
+        if gemm_type == GEMM_TYPE_M_GROUPED_CONTIGUOUS:
+            config_m = min(config_m, alignment_m)
+        return _select_fp8_fp4_config(config_m, config_n)
     if kind == "fp8" and gemm_type in (
         GEMM_TYPE_M_GROUPED_CONTIGUOUS,
         GEMM_TYPE_M_GROUPED_CONTIGUOUS_PSUM,
@@ -497,34 +535,30 @@ def _make_kernel_config(
         raise ValueError(f"Unsupported DeepGEMM GEMM kind: {kind}")
     if gemm_type not in _SUPPORTED_GEMM_TYPES:
         raise ValueError(f"Unsupported DeepGEMM GEMM type: {gemm_type}")
+    tile_k = 128
+    quant_tile = 0
+    resolved_scale_mode = FP8_SCALE_ACCUMULATION_MODE_ITERATIVE
+
     if kind == "bf16":
-        return DeepGemmGemmKernelConfig(
-            kind=kind,
-            gemm_type=gemm_type,
-            tile_m=config.tile_m,
-            tile_n=config.tile_n,
-            tile_k=64,
-            stages=config.stages,
-            num_mma_warp_squads=config.num_mma_warp_squads,
-            epilogue=epilogue,
-            head_splits=head_splits,
-            major_b_mode=major_b_mode,
+        tile_k = 64
+    elif kind == "fp8":
+        quant_tile = 128
+        if scale_accumulation_mode is None:
+            scale_accumulation_mode = config.scale_accumulation_mode
+        resolved_scale_mode = _resolve_fp8_scale_accumulation_mode(
+            config.tile_m, scale_accumulation_mode
         )
+
     return DeepGemmGemmKernelConfig(
         kind=kind,
         gemm_type=gemm_type,
         tile_m=config.tile_m,
         tile_n=config.tile_n,
-        tile_k=128,
+        tile_k=tile_k,
         stages=config.stages,
         num_mma_warp_squads=config.num_mma_warp_squads,
-        quant_tile=128,
-        scale_accumulation_mode=_resolve_fp8_scale_accumulation_mode(
-            config.tile_m,
-            scale_accumulation_mode
-            if scale_accumulation_mode is not None
-            else config.scale_accumulation_mode,
-        ),
+        quant_tile=quant_tile,
+        scale_accumulation_mode=resolved_scale_mode,
         epilogue=epilogue,
         head_splits=head_splits,
         major_b_mode=major_b_mode,
@@ -536,6 +570,7 @@ def _resolve_deep_gemm_gemm_kernel_config(
     kind: str,
     gemm_type: str,
     config_m: int | None,
+    config_n: int | None = None,
     alignment_m: int = 128,
     config: Optional[GemmJitConfig] = None,
     scale_accumulation_mode: Optional[str] = None,
@@ -547,6 +582,7 @@ def _resolve_deep_gemm_gemm_kernel_config(
         kind=kind,
         gemm_type=gemm_type,
         config_m=config_m,
+        config_n=config_n,
         alignment_m=alignment_m,
         config=config,
     )
@@ -570,29 +606,44 @@ def get_deep_gemm_gemm_aot_configs() -> list[dict[str, object]]:
         GEMM_TYPE_M_GROUPED_MASKED,
         GEMM_TYPE_BATCHED,
     )
-    for gemm_type in gemm_types:
-        for jit_config in DEEP_GEMM_CONFIGS:
-            configs.append(
-                _make_kernel_config(kind="bf16", gemm_type=gemm_type, config=jit_config)
-            )
-            configs.append(
-                _make_kernel_config(kind="fp8", gemm_type=gemm_type, config=jit_config)
-            )
-            if gemm_type == GEMM_TYPE_M_GROUPED_CONTIGUOUS:
+    architectures = jit_env.resolve_musa_arch_list()
+    if "mp31" in architectures:
+        for gemm_type in gemm_types:
+            for jit_config in DEEP_GEMM_CONFIGS:
                 configs.append(
                     _make_kernel_config(
-                        kind="fp8",
-                        gemm_type=gemm_type,
-                        config=jit_config,
-                        major_b_mode="N",
+                        kind="bf16", gemm_type=gemm_type, config=jit_config
                     )
                 )
+                configs.append(
+                    _make_kernel_config(
+                        kind="fp8", gemm_type=gemm_type, config=jit_config
+                    )
+                )
+                if gemm_type == GEMM_TYPE_M_GROUPED_CONTIGUOUS:
+                    configs.append(
+                        _make_kernel_config(
+                            kind="fp8",
+                            gemm_type=gemm_type,
+                            config=jit_config,
+                            major_b_mode="N",
+                        )
+                    )
+    if "mp32" in architectures:
+        for gemm_type in (GEMM_TYPE_M_GROUPED_CONTIGUOUS, GEMM_TYPE_M_GROUPED_MASKED):
+            for m in (128, 256):
+                for n in (128, 256):
+                    configs.append(
+                        _make_kernel_config(
+                            kind="fp8_fp4",
+                            gemm_type=gemm_type,
+                            config=_select_fp8_fp4_config(m, n),
+                        )
+                    )
     deduped = {}
     for kernel_config in configs:
         deduped[deep_gemm_gemm_dispatch_name(kernel_config)] = kernel_config
-    return [
-        _deep_gemm_gemm_config_dict(kernel_config) for kernel_config in deduped.values()
-    ]
+    return [_deep_gemm_gemm_config_dict(config) for config in deduped.values()]
 
 
 def gen_deep_gemm_gemm_spec(
@@ -600,13 +651,20 @@ def gen_deep_gemm_gemm_spec(
 ) -> JitSpec:
     kernel_config = _normalize_deep_gemm_gemm_config(config)
     dispatch_name = deep_gemm_gemm_dispatch_name(kernel_config)
-    source_file = _generated_source_path(dispatch_name)
+    if kernel_config.kind == "fp8_fp4":
+        arch = jit_env.MusaArch.parse("3.2")
+        cuda_flags = list(DEEP_GEMM_FP8_FP4_EXTRA_CUDA_CFLAGS)
+    else:
+        arch = jit_env.MusaArch.parse("3.1")
+        cuda_flags = list(DEEP_GEMM_GEMM_EXTRA_CUDA_CFLAGS)
+    source_file = _generated_source_path(dispatch_name, arch)
     return gen_jit_spec(
         name=dispatch_name,
         sources=[source_file],
         generated_sources={source_file: _render_deep_gemm_gemm_source(kernel_config)},
         extra_cflags=list(DEEP_GEMM_GEMM_EXTRA_CFLAGS),
-        extra_cuda_cflags=list(DEEP_GEMM_GEMM_EXTRA_CUDA_CFLAGS),
+        extra_cuda_cflags=cuda_flags,
+        target_arch=arch,
         extra_ldflags=list(get_mudnn_ldflags()),
         extra_include_paths=deep_gemm_gemm_extra_include_paths(),
     )

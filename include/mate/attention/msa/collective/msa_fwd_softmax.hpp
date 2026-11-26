@@ -26,7 +26,7 @@ struct MsaFwdSoftmax : ::mate::attention::fmha::Softmax<Rows, false, MaxOffset> 
   }
 
   template <bool IsFirst, bool CheckInf, class AccQK, class TiledMmaQK>
-  MUTLASS_DEVICE auto online_softmax(AccQK& acc_qk, TiledMmaQK const& tiled_mma_qk) {
+  MUTLASS_DEVICE auto online_softmax(AccQK& acc_qk, TiledMmaQK const& tiled_mma_qk, bool is_first = IsFirst) {
     auto          reduction_target_qk = ::mate::attention::fmha::reduction_target_n(tiled_mma_qk);
     constexpr int red_rank            = decltype(rank(reduction_target_qk))::value;
 
@@ -38,7 +38,7 @@ struct MsaFwdSoftmax : ::mate::attention::fmha::Softmax<Rows, false, MaxOffset> 
     TensorT correction_scales;
     Tensor  row_max_prev = make_fragment_like(this->row_max);
 
-    if constexpr (IsFirst) {
+    if (is_first) {
       mute::fill(correction_scales, Element{1.f});
     } else {
       mute::copy(this->row_max, row_max_prev);
@@ -68,15 +68,17 @@ struct MsaFwdSoftmax : ::mate::attention::fmha::Softmax<Rows, false, MaxOffset> 
         }
       });
 
-      if constexpr (!IsFirst) {
+      if (!is_first) {
         this->row_max(i) = max(row_max_prev(i), this->row_max(i));
       }
+      bool    is_all_masked = false;
+      Element max_scaled    = this->row_max(i);
       if constexpr (CheckInf) {
-        this->row_max(i) =
-            this->row_max(i) == -std::numeric_limits<Element>::infinity() ? Element{0} : this->row_max(i);
+        is_all_masked = this->row_max(i) == -std::numeric_limits<Element>::infinity();
+        max_scaled    = is_all_masked ? Element{0} : this->row_max(i);
       }
 
-      Element scale_max = this->row_max(i) * this->sm_scale_log2;
+      Element scale_max = max_scaled * this->sm_scale_log2;
       MUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < size<1>(acc_qk_mn); j += 4) {
         float4 values = make_float4(acc_qk_mn(i, j) * this->sm_scale_log2 - scale_max + MaxOffset,
@@ -90,9 +92,10 @@ struct MsaFwdSoftmax : ::mate::attention::fmha::Softmax<Rows, false, MaxOffset> 
         acc_qk_mn(i, j + 3) = values.w;
       }
 
-      if constexpr (!IsFirst) {
-        correction_scales(i) = exp2f((row_max_prev(i) - this->row_max(i)) * this->sm_scale_log2);
-        this->row_sum(i)     = correction_scales(i) * this->row_sum(i);
+      if (!is_first) {
+        correction_scales(i) =
+            is_all_masked ? Element{1.f} : exp2f((row_max_prev(i) - this->row_max(i)) * this->sm_scale_log2);
+        this->row_sum(i) = correction_scales(i) * this->row_sum(i);
       }
 
       float4 row_sum_cur;
@@ -108,7 +111,7 @@ struct MsaFwdSoftmax : ::mate::attention::fmha::Softmax<Rows, false, MaxOffset> 
       float2 row_sum_pair;
       mute::add(row_sum_pair, make_float2(row_sum_cur.x, row_sum_cur.y), make_float2(row_sum_cur.z, row_sum_cur.w));
       Element row_sum_block = row_sum_pair.x + row_sum_pair.y;
-      this->row_sum(i)      = IsFirst ? row_sum_block : this->row_sum(i) + row_sum_block;
+      this->row_sum(i)      = is_first ? row_sum_block : this->row_sum(i) + row_sum_block;
     }
 
     return correction_scales;

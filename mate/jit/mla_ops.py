@@ -33,10 +33,20 @@ INCLUDE_PATHS = [
 
 
 def gen_mla_ops_spec() -> JitSpec:
+    # The MP32 sparse decode metadata path does not need the legacy dense
+    # MP31 MLA kernels.  Keeping those templates in the same MP32 translation
+    # unit triggers MCC's dependency-graph pass before metadata compilation.
+    # Use a metadata-only binding for MP32; retain the full binding for MP31.
+    mla_pybind_source = (
+        jit_env.MATE_CSRC_DIR / "mla_pybind_mp32.mu"
+        if "mp32" in jit_env.MATE_MUSA_ARCH_LIST
+        and "mp31" not in jit_env.MATE_MUSA_ARCH_LIST
+        else jit_env.MATE_CSRC_DIR / "mla_pybind.mu"
+    )
     sources = [
         jit_env.MATE_CSRC_DIR / "attention_scheduler.mu",
         jit_env.MATE_CSRC_DIR / "attention_combine.mu",
-        jit_env.MATE_CSRC_DIR / "mla_pybind.mu",
+        mla_pybind_source,
     ]
     return gen_jit_spec(
         "mla_ops",

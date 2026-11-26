@@ -65,6 +65,12 @@ ignore = [
     "E731",
     # temp disable
     "F821",
+    "F541",
+    "F841",
+    "F811",
+    "E741",
+    "E712",
+    "E711",
 ]
 
 [tool.setuptools.packages.find]

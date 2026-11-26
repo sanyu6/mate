@@ -21,20 +21,34 @@ from ..flashmla_checks import (
     normalize_sparse_decode_indices,
     require_batch_topk_length,
 )
-from .sparse_mla_v32_decode_fwd_scheduled import (
-    tilelang_flashmla_interface as _decode_v32,
+from mate.mate_runtime import MP32_ARCH, get_musa_arch
+
+from .mp31.sparse_mla_v32_decode_fwd_scheduled import (
+    tilelang_flashmla_interface as _decode_v32_mp31,
 )
-from .sparse_mla_model1_decode_fwd_scheduled import (
-    sparse_mla_decode_fwd_scheduled_interface_model1 as _decode_model1,
+from .mp32.sparse_mla_v32_decode_fwd_scheduled import (
+    tilelang_flashmla_interface as _decode_v32_mp32,
+)
+from .mp31.sparse_mla_v4_decode_fwd_scheduled import (
+    sparse_mla_decode_fwd_scheduled_interface_model1 as _decode_model1_mp31,
+)
+from .mp32.sparse_mla_v4_mp32_decode_fwd_scheduled import (
+    sparse_mla_decode_fwd_scheduled_interface_v4_mp32 as _decode_model1_mp32,
 )
 
 
 MetadataGetter = Callable[..., Tuple[torch.Tensor, torch.Tensor]]
 
 
-def _model1_decode_schedule(num_heads_q: int) -> Tuple[int, int, int, int, int, int]:
+def _model1_decode_schedule(
+    num_heads_q: int, *, is_mp32: bool = False
+) -> Tuple[int, int, int, int, int, int]:
     """Choose MODEL1 decode tiling and role sizes from the visible q shape."""
-    if os.getenv("MATE_MODEL1_DECODE_FORCE_BM64", "0").lower() in ("1", "true", "yes"):
+    force_bm64 = os.getenv(
+        "MATE_V4_DECODE_FORCE_BM64",
+        os.getenv("MATE_MODEL1_DECODE_FORCE_BM64", "0"),
+    )
+    if force_bm64.lower() in ("1", "true", "yes") or is_mp32:
         return 64, 64, 256, 256, 128, 640
     if num_heads_q <= 16:
         return 16, 64, 256, 256, 128, 640
@@ -66,6 +80,9 @@ def sparse_mla_decode_fwd(
     tile_scheduler_metadata: Optional[torch.Tensor],
     num_splits: Optional[torch.Tensor],
     metadata_getter: MetadataGetter,
+    _fused_output=None,
+    q_rope_positions: Optional[torch.Tensor] = None,
+    q_rope_cos_sin: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Dispatch sparse decode by compile-time layout variant."""
 
@@ -117,6 +134,9 @@ def sparse_mla_decode_fwd(
             tile_scheduler_metadata=tile_scheduler_metadata,
             num_splits=num_splits,
             metadata_getter=metadata_getter,
+            _fused_output=_fused_output,
+            q_rope_positions=q_rope_positions,
+            q_rope_cos_sin=q_rope_cos_sin,
         )
 
     raise AssertionError(f"Unsupported sparse decode q.shape[-1]: {head_dim_q}")
@@ -163,7 +183,8 @@ def _sparse_decode_v32(
     assert num_splits is not None
 
     # Zero-copy flatten from official paged cache shape to the current V3.2 kernel ABI.
-    return _decode_v32(
+    decode_v32 = _decode_v32_mp32 if get_musa_arch(q) == MP32_ARCH else _decode_v32_mp31
+    return decode_v32(
         q,
         k_cache.view(-1, num_heads_k, dim_bytes),
         indices,
@@ -195,11 +216,15 @@ def _sparse_decode_model1(
     tile_scheduler_metadata: Optional[torch.Tensor],
     num_splits: Optional[torch.Tensor],
     metadata_getter: MetadataGetter,
+    _fused_output=None,
+    q_rope_positions: Optional[torch.Tensor] = None,
+    q_rope_cos_sin: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert head_dim_v == 512, "MODEL1 sparse decode only supports head_dim_v == 512"
     assert q.shape[-1] == 512, "MODEL1 sparse decode requires q.shape[-1] == 512"
-    check_model1_k_cache(k_cache)
-    assert dim_bytes == MODEL1_KV_BYTES_PER_TOKEN
+    check_model1_k_cache(k_cache, allow_v41=True)
+    cache_format = "v4" if dim_bytes == 584 else "v41"
+    extra_cache_format = cache_format
 
     indices = normalize_sparse_decode_indices(
         indices, batch_size, seq_len_q, num_heads_k, "indices"
@@ -218,7 +243,17 @@ def _sparse_decode_model1(
         assert extra_indices_in_kvcache is not None, (
             "extra_indices_in_kvcache must be provided with extra_k_cache"
         )
-        check_model1_k_cache(extra_k_cache, "extra_k_cache")
+        check_model1_k_cache(
+            extra_k_cache, "extra_k_cache", allow_v41=True, allow_fp4=True
+        )
+        assert (dim_bytes, extra_k_cache.shape[-1]) in (
+            (584, 584),
+            (528, 528),
+            (528, 288),
+        ), "unsupported main/extra cache format pair"
+        extra_cache_format = (
+            "v41_fp4" if extra_k_cache.shape[-1] == 288 else cache_format
+        )
         assert extra_k_cache.shape[2] == num_heads_k
         extra_indices = normalize_sparse_decode_indices(
             extra_indices_in_kvcache,
@@ -271,16 +306,9 @@ def _sparse_decode_model1(
         consumer1_threads,
         producer_threads,
         threads,
-    ) = _model1_decode_schedule(num_heads_q)
+    ) = _model1_decode_schedule(num_heads_q, is_mp32=get_musa_arch(q) == MP32_ARCH)
 
-    return _decode_model1(
-        q,
-        k_cache_nope,
-        k_cache_rope,
-        k_cache_scales,
-        indices,
-        tile_scheduler_metadata,
-        num_splits,
+    shared_kwargs = dict(
         extra_kv_nope=extra_k_cache_nope,
         extra_kv_rope=extra_k_cache_rope,
         extra_kv_scales=extra_k_cache_scales,
@@ -300,5 +328,43 @@ def _sparse_decode_model1(
         extra_page_block_size=(
             extra_k_cache.shape[1] if extra_k_cache is not None else None
         ),
+    )
+    use_mp32_v41 = os.getenv("MATE_DSV4_DECODE_MP32_V41", "1").lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    if get_musa_arch(q) == MP32_ARCH and (
+        cache_format == "v4" or (cache_format == "v41" and use_mp32_v41)
+    ):
+        return _decode_model1_mp32(
+            q,
+            k_cache_nope,
+            k_cache_rope,
+            k_cache_scales,
+            indices,
+            tile_scheduler_metadata,
+            num_splits,
+            cache_format=cache_format,
+            extra_cache_format=extra_cache_format,
+            q_rope_positions=q_rope_positions,
+            q_rope_cos_sin=q_rope_cos_sin,
+            **shared_kwargs,
+        )
+    assert q_rope_positions is None and q_rope_cos_sin is None, (
+        "Q RoPE fusion in core requires the MP32 V4/V4.1 decode kernel"
+    )
+    return _decode_model1_mp31(
+        q,
+        k_cache_nope,
+        k_cache_rope,
+        k_cache_scales,
+        indices,
+        tile_scheduler_metadata,
+        num_splits,
         _cache_strides_prepared=True,
+        cache_format=cache_format,
+        extra_cache_format=extra_cache_format,
+        _fused_output=_fused_output,
+        **shared_kwargs,
     )

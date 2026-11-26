@@ -40,6 +40,11 @@
         {
           "kind": "module_mate_api",
           "path": "mate/sparse_mla_interface.py"
+        },
+        {
+          "kind": "lazy_attr_modules",
+          "path": "mate/__init__.py",
+          "module_targets": ["sparse_mla.glm_nope"]
         }
       ],
       "detail_pages": [
@@ -49,6 +54,10 @@
             {
               "kind": "module_mate_api",
               "path": "mate/sparse_mla_interface.py"
+            },
+            {
+              "kind": "module_mate_api",
+              "path": "mate/sparse_mla/glm_nope.py"
             }
           ]
         }
@@ -123,6 +132,11 @@
           "path": "mate/deep_gemm.py",
           "import_module": "mate.mega_moe",
           "exclude_names": ["SymmBuffer"]
+        },
+        {
+          "kind": "lazy_attr_modules",
+          "path": "mate/__init__.py",
+          "module_targets": ["mega_moe_fp8_fp4"]
         }
       ],
       "detail_pages": [
@@ -134,6 +148,11 @@
               "path": "mate/deep_gemm.py",
               "import_module": "mate.mega_moe",
               "exclude_names": ["SymmBuffer"]
+            },
+            {
+              "kind": "lazy_attr_modules",
+              "path": "mate/__init__.py",
+              "module_targets": ["mega_moe_fp8_fp4"]
             }
           ]
         }
@@ -211,31 +230,6 @@
             {
               "kind": "module_mate_api",
               "path": "mate/kda.py"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "Mamba / SSU",
-      "summary_sources": [
-        {
-          "kind": "lazy_attr_modules",
-          "path": "mate/__init__.py",
-          "module_targets": ["mamba"]
-        },
-        {
-          "kind": "module_mate_api",
-          "path": "mate/mamba.py"
-        }
-      ],
-      "detail_pages": [
-        {
-          "path": "docs/source/api/mamba.rst",
-          "sources": [
-            {
-              "kind": "module_mate_api",
-              "path": "mate/mamba.py"
             }
           ]
         }

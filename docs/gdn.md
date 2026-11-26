@@ -20,7 +20,7 @@ GDN execution into two primary phases:
 
 | `state_layout` | `state.dtype` | `T` | Status | Notes |
 | --- | --- | --- | --- | --- |
-| `VK` | `bfloat16` | `1` | ❌ Not supported | Single-token BF16-state decode is not implemented yet |
+| `VK` | `bfloat16` | `1` | ✅ Supported | TileLang decode with FP32 accumulation |
 | `VK` | `bfloat16` | `> 1` | ✅ Supported | TileLang MTP path, currently K=V=128 |
 | `VK` | `float32` | `1` | ✅ Supported | Current active decode path |
 | `VK` | `float32` | `> 1` | ✅ Supported | TileLang MTP path, currently K=V=128 |
@@ -34,6 +34,7 @@ Current MATE decode support is intentionally narrow:
 - API: `mate.gated_delta_rule_decode(...)`
 - Supported combinations:
   - `state_layout="VK"`, `state.dtype=float32`, `T=1`
+  - `state_layout="VK"`, `state.dtype=bfloat16`, `T=1`
   - `state_layout="VK"`, `state.dtype=float32`, `T>1`, `K=V=128`
   - `state_layout="VK"`, `state.dtype=bfloat16`, `T>1`, `K=V=128`
 - Backend: TileLang
@@ -43,8 +44,8 @@ Current MATE decode support is intentionally narrow:
 
 | Item | MATE |
 | --- | --- |
-| `state_indices` | ✅ Supported on VK FP32 decode and VK MTP; negative entries are padding |
-| BF16 state backend | ✅ Supported on VK MTP (`T>1`, `K=V=128`) |
+| `state_indices` | ✅ Supported on VK decode and VK MTP; negative entries are padding |
+| BF16 state backend | ✅ Supported on VK decode and MTP (`K=V=128` for MTP) |
 | KV backend | ❌ Not supported |
 | MTP (`T > 1`) | ✅ Supported for VK float32/bfloat16 state with K=V=128 |
 | `intermediate_states_buffer` | ✅ Supported on VK MTP; dtype must match `state.dtype` |
@@ -58,7 +59,7 @@ On the currently supported MATE path:
 - `A_log`: `float32`
 - `dt_bias`: `float32` or `bfloat16`
 - `a / b`: same dtype as `q`
-- `state`: `float32` for single-token decode; `float32` or `bfloat16` for MTP
+- `state`: `float32` or `bfloat16` for single-token decode and MTP
 - `intermediate_states_buffer`: same dtype as `state`
 - `output`: optional, supports `float16` / `bfloat16` / `float32`
 
@@ -76,6 +77,7 @@ On the currently supported MATE path:
 | Gate Space | ✅ Supported | `is_log_space=True` treats `g` as `log(alpha)`; `is_log_space=False` treats `g` as alpha in `(0, 1]` |
 | Initial State | ✅ Supported | Optional `initial_state` with shape `[batch, head_sab, dim_v, dim_k]` (float32) |
 | Final State Output | ✅ Supported | `output_final_state=True` returns `(output, final_state)` |
+| State Checkpoints | ✅ MP32 only | `checkpoint_every_n_tokens=N` (a multiple of 64) also returns the state before tokens `0, N, 2N, ...` of every sequence, as in the cuDNN frontend GDN op |
 | Output Heads | ✅ Supported | `head_o = max(num_q_heads, num_v_heads)` |
 | QK L2 Norm Option | ✅ Supported | `use_qk_l2norm_in_kernel=True` normalizes Q and K in place with a standalone TileLang kernel before KKT/prefill |
 | Strided Q/K/V | ✅ Supported | Split-QKV views are supported when the last dimension is contiguous (`stride(-1) == 1`) |

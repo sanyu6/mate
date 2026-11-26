@@ -32,6 +32,8 @@ class FlashMLAMubinDispatcher:
 
     @functools.cache
     def get_asm_id(self, dtype, is_causal: bool, is_varlen_q: bool) -> FlashMLAMubinId:
+        # The published FlashMLA mubin artifact set is MP31-only. Callers must
+        # route other architectures to the native MLA implementation.
         return FlashMLAMubinId(
             arch=MP31_ARCH,
             dtype=dtype,

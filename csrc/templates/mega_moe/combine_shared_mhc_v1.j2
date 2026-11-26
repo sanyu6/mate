@@ -1,0 +1,69 @@
+#include "mate/mega_moe/decode/fp4_fp4/combine_shared_v1.hpp"
+#include "mate/mega_moe/prefill/fp4_fp4/prefill_host.hpp"
+namespace dev=::mega_moe::decode::mp32::fp4_fp4;
+using L=dev::DecodeLayout<{{ ranks }},{{ tokens }},{{ hidden }},{{ intermediate }},{{ experts }},{{ topk }}>;
+using S=dev::CombineSharedV1<L,24,128>;
+__device__ void tail(mutlass::bfloat16_t* shared,mutlass::bfloat16_t* reduced,mutlass::bfloat16_t* merged,
+ const __mt_bfloat16* residual,const float* post,const float* comb,const float* pre,const __mt_bfloat16* gamma,
+ __mt_bfloat16* updated,__mt_bfloat16* normalized,__mt_fp8_e4m3* q,uint8_t* sf){
+ int row=blockIdx.x;
+ for(int h=threadIdx.x;h<5120;h+=blockDim.x)merged[row*5120+h]=mutlass::bfloat16_t(__fadd_rn(float(reduced[row*5120+h]),float(shared[row*5120+h])));
+ __syncthreads();
+ mate::combine_mhc_tail_v1::mhc_post_combine_norm_body<true,1,false>(reinterpret_cast<const __mt_bfloat16*>(merged),residual,post,comb,pre,gamma,updated,normalized,q,sf,24,5120,4,1e-6f,row);
+}
+template<bool Fused,int Component=0>
+__global__ __launch_bounds__(S::Threads) void boundary_kernel(
+ MUTLASS_GRID_CONSTANT ::mega_moe::layout::SymBuffer<S::R> const sym,
+ MUTLASS_GRID_CONSTANT typename S::Params const params,
+ const mutlass::bfloat16_t* routed,const uint4* metadata,const int* counts,const int* offsets,bool weighted,float route_scale,
+ mutlass::bfloat16_t* shared,mutlass::bfloat16_t* reduced,mutlass::bfloat16_t* merged,int* status,
+ const __mt_bfloat16* residual,const float* post,const float* comb,const float* pre,const __mt_bfloat16* gamma,
+ __mt_bfloat16* updated,__mt_bfloat16* normalized,__mt_fp8_e4m3* q,uint8_t* sf){
+ extern __shared__ __align__(256) char smem[];
+ S::template run<Component!=2,Component!=1>(sym,params,routed,metadata,counts,offsets,weighted,route_scale,shared,reduced,status,smem);
+ if constexpr(Fused){cooperative_groups::this_grid().sync();tail(shared,reduced,merged,residual,post,comb,pre,gamma,updated,normalized,q,sf);}
+}
+__global__ __launch_bounds__(S::Threads) void tail_kernel(mutlass::bfloat16_t* shared,mutlass::bfloat16_t* reduced,mutlass::bfloat16_t* merged,
+ const __mt_bfloat16* residual,const float* post,const float* comb,const float* pre,const __mt_bfloat16* gamma,
+ __mt_bfloat16* updated,__mt_bfloat16* normalized,__mt_fp8_e4m3* q,uint8_t* sf){tail(shared,reduced,merged,residual,post,comb,pre,gamma,updated,normalized,q,sf);}
+void {{ func_name }}(ffi::TensorView buffer,ffi::TensorView ptrs,int rank,ffi::TensorView routed,ffi::TensorView metadata,ffi::TensorView counts,ffi::TensorView offsets,bool weighted,
+ ffi::TensorView x,ffi::TensorView xs,ffi::TensorView w,ffi::TensorView ws,ffi::TensorView shared,ffi::TensorView reduced,ffi::TensorView merged,ffi::TensorView status,
+ ffi::TensorView residual,ffi::TensorView post,ffi::TensorView comb,ffi::TensorView pre,ffi::TensorView gamma,ffi::TensorView updated,ffi::TensorView normalized,ffi::TensorView q,ffi::TensorView sf,double route_scale,int mode){
+ ffi::MUSADeviceGuard guard(buffer.device().device_id);auto d=buffer.device();namespace host=mate::fp4_prefill_host;
+ host::tensor(metadata,dl_int32,d,{routed.size(0),4},"metadata");host::tensor(counts,dl_int32,d,{L::kGroups},"counts");host::tensor(offsets,dl_int32,d,{L::kGroups+1},"offsets");
+ host::tensor(routed,dl_bfloat16,d,{routed.size(0),5120},"routed");
+ host::tensor(x,dl_uint8,d,{24,2304},"shared input");host::tensor(xs,dl_uint8,d,{72,24},"input scale");
+ host::tensor(w,dl_uint8,d,{5120,2304},"shared weight");host::tensor(ws,dl_uint8,d,{72,5120},"weight scale");
+ for(auto t:{shared,reduced,merged,normalized})host::tensor(t,dl_bfloat16,d,{24,5120},"output");
+ host::tensor(residual,dl_bfloat16,d,{24,4,5120},"residual");host::tensor(updated,dl_bfloat16,d,{24,4,5120},"updated");
+ host::tensor(post,dl_float32,d,{24,4},"post");host::tensor(pre,dl_float32,d,{24,4},"pre");host::tensor(comb,dl_float32,d,{24,4,4},"comb");
+ host::tensor(gamma,dl_bfloat16,d,{5120},"gamma");host::tensor(q,dl_uint8,d,{24,5120},"q");host::tensor(sf,dl_uint8,d,{160,24},"sf");
+ TVM_FFI_ICHECK_GE(buffer.numel(),L::allocation_bytes());
+ TVM_FFI_ICHECK(mode>=0 && mode<=2);
+ auto sym=mate::mega_moe::make_sym_buffer<L::kRanks>(ptrs,rank);
+ TVM_FFI_ICHECK_EQ(sym.base,reinterpret_cast<int64_t>(buffer.data_ptr()));auto params=S::Gemm::params(24,w.data_ptr(),ws.data_ptr(),x.data_ptr(),xs.data_ptr());
+ auto rp=static_cast<mutlass::bfloat16_t*>(routed.data_ptr());auto md=reinterpret_cast<uint4*>(metadata.data_ptr());auto ct=static_cast<int*>(counts.data_ptr());auto of=static_cast<int*>(offsets.data_ptr());float rs=float(route_scale);
+ auto sh=static_cast<mutlass::bfloat16_t*>(shared.data_ptr());auto rd=static_cast<mutlass::bfloat16_t*>(reduced.data_ptr());auto me=static_cast<mutlass::bfloat16_t*>(merged.data_ptr());auto st=static_cast<int*>(status.data_ptr());
+ auto r=static_cast<__mt_bfloat16*>(residual.data_ptr());auto po=static_cast<float*>(post.data_ptr());auto co=static_cast<float*>(comb.data_ptr());auto pr=static_cast<float*>(pre.data_ptr());auto ga=static_cast<__mt_bfloat16*>(gamma.data_ptr());
+ auto up=static_cast<__mt_bfloat16*>(updated.data_ptr());auto no=static_cast<__mt_bfloat16*>(normalized.data_ptr());auto qp=reinterpret_cast<__mt_fp8_e4m3*>(q.data_ptr());auto sc=static_cast<uint8_t*>(sf.data_ptr());
+ static thread_local int configured=-1;
+ if(configured!=d.device_id){
+  check_mp32(d,"combine shared mHC");host::mps(24,d);
+  MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(boundary_kernel<true>,musaFuncAttributeMaxDynamicSharedMemorySize,sizeof(S::Shared)));
+  MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(boundary_kernel<false>,musaFuncAttributeMaxDynamicSharedMemorySize,sizeof(S::Shared)));
+  MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(boundary_kernel<false,1>,musaFuncAttributeMaxDynamicSharedMemorySize,sizeof(S::Shared)));
+  MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(boundary_kernel<false,2>,musaFuncAttributeMaxDynamicSharedMemorySize,sizeof(S::Shared)));
+  int blocks=0,mps=0;MATE_MUSA_RUNTIME_CHECK(musaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,boundary_kernel<true>,S::Threads,sizeof(S::Shared)));
+  MATE_MUSA_RUNTIME_CHECK(musaDeviceGetAttribute(&mps,musaDevAttrMultiProcessorCount,d.device_id));TVM_FFI_ICHECK_GE(blocks*mps,24);
+  configured=d.device_id;
+ }
+ if(mode==0){void* args[]={&sym,&params,&rp,&md,&ct,&of,&weighted,&rs,&sh,&rd,&me,&st,&r,&po,&co,&pr,&ga,&up,&no,&qp,&sc};
+  MATE_MUSA_RUNTIME_CHECK(musaLaunchCooperativeKernel(reinterpret_cast<const void*>(boundary_kernel<true>),dim3(24),dim3(S::Threads),args,sizeof(S::Shared),get_stream(d)));
+ }else{
+  if(mode==1)boundary_kernel<false><<<24,S::Threads,sizeof(S::Shared),get_stream(d)>>>(sym,params,rp,md,ct,of,weighted,rs,sh,rd,me,st,r,po,co,pr,ga,up,no,qp,sc);
+  else {boundary_kernel<false,1><<<24,S::Threads,sizeof(S::Shared),get_stream(d)>>>(sym,params,rp,md,ct,of,weighted,rs,sh,rd,me,st,r,po,co,pr,ga,up,no,qp,sc);
+        boundary_kernel<false,2><<<24,S::Threads,sizeof(S::Shared),get_stream(d)>>>(sym,params,rp,md,ct,of,weighted,rs,sh,rd,me,st,r,po,co,pr,ga,up,no,qp,sc);}
+  tail_kernel<<<24,S::Threads,0,get_stream(d)>>>(sh,rd,me,r,po,co,pr,ga,up,no,qp,sc);}
+ MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }},{{ func_name }});

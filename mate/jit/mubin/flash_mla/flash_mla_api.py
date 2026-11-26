@@ -6,10 +6,20 @@ from typing import Optional
 import torch
 
 from mate.artifacts import ensure_mubin_module_artifacts
+from mate.mate_runtime import (
+    MP31_ARCH,
+    get_musa_arch,
+)
 
 from ..common import get_asm_dtype_from_torch_dtype
 from ..launcher import get_mubin_launch_function, render_mubin_launcher
 from .dispatch import FlashMLAMubinDispatcher, get_flash_mla_mubin_dispatcher
+
+
+def is_flash_mla_asm_mubin_supported(tensor: torch.Tensor) -> bool:
+    """Return whether the MP31-only FlashMLA mubin can run on ``tensor``."""
+    arch = get_musa_arch(tensor)
+    return arch == MP31_ARCH
 
 
 @functools.cache
@@ -59,6 +69,8 @@ def flash_mla_asm_mubin(
 ):
     if q_nope.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("flash_mla_asm_mubin only supports fp16 and bf16")
+    if not is_flash_mla_asm_mubin_supported(q_nope):
+        raise ValueError("flash_mla_asm_mubin only supports MP31")
 
     is_varlen_q = cu_seqlens_q is not None
     kernel_path, launch = _get_flash_mla_mubin_launch_plan(

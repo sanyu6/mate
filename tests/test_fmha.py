@@ -10,7 +10,12 @@ import pytest
 import torch
 import torch_musa  # noqa: F401
 
-from mate import flash_attn_combine  # noqa: F401
+from mate import (
+    flash_attn_combine,  # noqa: F401
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+    get_scheduler_metadata,
+)
 from mate.execution_context import is_dry_run_enabled, raise_complete_if_dry_run
 from mate.testing.flash_attn import attention_ref
 from mate.testing.operators import OpMode
@@ -29,6 +34,9 @@ from mate.testing.operators.fmha import (
 from mate.testing import supported_musa_compute_capability
 
 
+pytestmark = pytest.mark.mate_dry_run
+
+
 HEADS = ((40, 8), (96, 8), (32, 8), (64, 4), (8, 1))
 HEAD_DIMS = ((128, 128), (256, 256))
 NORMAL_TENSOR = FmhaTensorSpec()
@@ -41,6 +49,7 @@ RAGGED_SEQUENCES = (
     ((55, 666), (256, 463), (111, 1328)),
     ((111, 1328), (55, 666), (222, 463)),
 )
+MUBIN_EMPTY_K_SEQUENCE = ((64, 64), (64, 0))
 PAGED_SEQUENCES = (
     ((32, 512), (192, 192), (128, 256)),
     tuple((index, index + 1234) for index in range(11)),
@@ -249,6 +258,125 @@ RAGGED_WORKLOADS = [
         (False, True),
         (-1, 0, 5),
         (1, 2, 4),
+    )
+]
+
+TILELANG_FWD_INPUTS = (
+    {
+        "batch_size": 2,
+        "seqlen_q": 257,
+        "seqlen_k": 255,
+        "q": NORMAL_TENSOR,
+        "k": NORMAL_TENSOR,
+        "v": NORMAL_TENSOR,
+    },
+    {
+        **_sequence_options(((127, 129), (257, 255))),
+        "q": RAGGED_TENSOR,
+        "k": RAGGED_TENSOR,
+        "v": RAGGED_TENSOR,
+    },
+)
+
+TILELANG_FWD_WORKLOADS = [
+    FmhaWorkload(
+        api=FmhaApi.VARLEN,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+        head_dim_qk=head_dim_qk,
+        head_dim_v=head_dim_v,
+        dtype=dtype,
+        causal=causal,
+        window_size=(-1, -1),
+        backend="tilelang",
+        num_splits=-1,  # TODO: Tilelang does not support metadata yet.
+        **input_options,
+    )
+    for input_options, (num_heads_q, num_heads_kv), (
+        head_dim_qk,
+        head_dim_v,
+    ), dtype, causal in product(
+        TILELANG_FWD_INPUTS,
+        ((6, 6), (6, 2), (6, 1)),
+        ((128, 128), (192, 128), (256, 256)),
+        (torch.float16, torch.bfloat16),
+        (False, True),
+    )
+] + [
+    # One numerical case per padded dispatch class checks output and LSE slicing.
+    FmhaWorkload(
+        api=FmhaApi.VARLEN,
+        batch_size=2,
+        seqlen_q=257,
+        seqlen_k=255,
+        num_heads_q=6,
+        num_heads_kv=6,
+        head_dim_qk=96,
+        head_dim_v=96,
+        dtype=torch.bfloat16,
+        q=NORMAL_TENSOR,
+        k=NORMAL_TENSOR,
+        v=NORMAL_TENSOR,
+        window_size=(-1, -1),
+        backend="tilelang",
+        num_splits=-1,  # TODO: Tilelang does not support metadata yet.
+    ),
+    FmhaWorkload(
+        api=FmhaApi.VARLEN,
+        num_heads_q=6,
+        num_heads_kv=2,
+        head_dim_qk=224,
+        head_dim_v=224,
+        dtype=torch.float16,
+        q=RAGGED_TENSOR,
+        k=RAGGED_TENSOR,
+        v=RAGGED_TENSOR,
+        causal=True,
+        window_size=(-1, -1),
+        backend="tilelang",
+        num_splits=-1,  # TODO: Tilelang does not support metadata yet.
+        **_sequence_options(((127, 129), (257, 255))),
+    ),
+    # Exercise supported leading-stride views through the standard tensor spec.
+    FmhaWorkload(
+        api=FmhaApi.VARLEN,
+        num_heads_q=6,
+        num_heads_kv=2,
+        head_dim_qk=128,
+        head_dim_v=128,
+        dtype=torch.bfloat16,
+        q=FmhaTensorSpec(layout=FmhaLayout.RAGGED, init=noncontiguous_tensor_init),
+        k=FmhaTensorSpec(layout=FmhaLayout.RAGGED, init=noncontiguous_tensor_init),
+        v=FmhaTensorSpec(layout=FmhaLayout.RAGGED, init=noncontiguous_tensor_init),
+        window_size=(-1, -1),
+        backend="tilelang",
+        num_splits=-1,  # TODO: Tilelang does not support metadata yet.
+        **_sequence_options(((127, 129), (257, 255))),
+    ),
+]
+
+MUBIN_EMPTY_K_WORKLOADS = [
+    FmhaWorkload(
+        api=FmhaApi.VARLEN,
+        q=RAGGED_TENSOR,
+        k=RAGGED_TENSOR,
+        v=RAGGED_TENSOR,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+        head_dim_qk=128,
+        head_dim_v=128,
+        backend="auto",
+        compare_lse=True,
+        pack_gqa=pack_gqa,
+        num_splits=num_splits,
+        **_sequence_options(MUBIN_EMPTY_K_SEQUENCE),
+        **_mask_options(mask),
+    )
+    for (num_heads_q, num_heads_kv), mask, pack_gqa, num_splits in product(
+        HEADS,
+        (None, "causal"),
+        (False, True),
+        (-1, 0, 5),
     )
 ]
 
@@ -462,7 +590,7 @@ def _run_fmha_workload(workload: FmhaWorkload) -> None:
         torch.musa.empty_cache()
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("workload", METADATA_WORKLOADS, ids=str)
 @torch.inference_mode()
 def test_metadata(workload: FmhaWorkload) -> None:
@@ -487,11 +615,102 @@ def test_mubin_accepts_large_singleton_batch_strides(
     _run_fmha_workload(workload)
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("workload", DENSE_WORKLOADS, ids=str)
 @torch.inference_mode()
 def test_varlen_func_bshd(workload: FmhaWorkload) -> None:
     _run_fmha_workload(workload)
+
+
+@supported_musa_compute_capability([31, 32])
+@pytest.mark.parametrize("api", ["varlen", "kvcache"])
+@pytest.mark.parametrize("num_splits", [1, 3])
+@pytest.mark.parametrize("return_lse", [False, True])
+@torch.inference_mode()
+def test_max_logits(api: str, num_splits: int, return_lse: bool) -> None:
+    torch.manual_seed(666)
+    q, k, v = [
+        torch.randn(shape, dtype=torch.bfloat16, device="musa")
+        for shape in ((2, 17, 4, 64), (2, 259, 2, 64), (2, 259, 2, 64))
+    ]
+    metadata = None
+    if num_splits > 1:
+        metadata = get_scheduler_metadata(
+            batch_size=2,
+            max_seqlen_q=17,
+            max_seqlen_k=259,
+            num_heads_q=4,
+            num_heads_kv=2,
+            headdim=64,
+            qkv_dtype=q.dtype,
+            causal=True,
+            num_splits=num_splits,
+            pack_gqa=False,
+        )
+        if not is_dry_run_enabled():
+            assert metadata[:2].min().item() > 1
+    kwargs = dict(
+        softmax_scale=0.23,
+        causal=True,
+        num_splits=num_splits,
+        pack_gqa=False,
+        scheduler_metadata=metadata,
+        return_softmax_lse=return_lse,
+        return_max_logits=True,
+    )
+    if api == "varlen":
+        result = flash_attn_varlen_func(q, k, v, backend="mutlass", **kwargs)
+    else:
+        result = flash_attn_with_kvcache(q, k, v, **kwargs)
+    raise_complete_if_dry_run()
+    out_ref, _, scores = attention_ref(
+        q.cpu(), k.cpu(), v.cpu(), softmax_scale=0.23, causal=True
+    )
+    assert len(result) == (3 if return_lse else 2)
+    maximum = result[-1]
+    assert maximum.shape == (4,)
+    assert maximum.dtype == torch.float32
+    assert maximum.device == q.device
+    torch.testing.assert_close(
+        maximum.cpu(), scores.amax(dim=(0, 2, 3)), atol=2e-4, rtol=2e-4
+    )
+    torch.testing.assert_close(result[0].cpu(), out_ref, atol=1.5e-2, rtol=1e-2)
+    if return_lse:
+        torch.testing.assert_close(
+            result[1].cpu(), scores.logsumexp(dim=-1), atol=2e-3, rtol=2e-3
+        )
+
+
+@supported_musa_compute_capability([31, 32])
+@pytest.mark.parametrize("ragged", [False, True])
+@pytest.mark.parametrize("case", ["valid", "empty", "masked"])
+@torch.inference_mode()
+def test_max_logits_ignores_unused_queries(ragged: bool, case: str) -> None:
+    from mate.mha_interface import _reduce_max_logits
+
+    maximum = torch.tensor(
+        [
+            [[1000.0, 1000.0, 1000.0], [1000.0, 1000.0, 1000.0]],
+            [[-8.0, -2.0, 1000.0], [-9.0, -4.0, 1000.0]],
+            [[-5.0, 1000.0, 1000.0], [-3.0, 1000.0, 1000.0]],
+        ],
+        device="musa",
+    )
+    used = torch.tensor([0, 2, 1], dtype=torch.int32, device="musa")
+    cu_seqlens = None
+    if ragged:
+        maximum = maximum[1:].permute(1, 0, 2).reshape(2, 6)
+        cu_seqlens = torch.tensor([0, 0, 3, 6], dtype=torch.int32, device="musa")
+    if case == "empty":
+        maximum = maximum[..., :0]
+    elif case == "masked":
+        used.zero_()
+    actual = _reduce_max_logits(maximum, used, cu_seqlens)
+    raise_complete_if_dry_run()
+    expected = [-2.0, -3.0] if case == "valid" else [-float("inf")] * 2
+    torch.testing.assert_close(
+        actual, torch.tensor(expected, device="musa"), atol=0, rtol=0
+    )
 
 
 @supported_musa_compute_capability([31])
@@ -566,49 +785,64 @@ def test_fp8_softcap_all_masked_block(workload: FmhaWorkload) -> None:
             operator.verify(inputs, outputs, reference)
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("workload", RAGGED_WORKLOADS, ids=str)
 @torch.inference_mode()
 def test_varlen_func_ragged_qkv(workload: FmhaWorkload) -> None:
     _run_fmha_workload(workload)
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([32])
+@pytest.mark.parametrize("workload", TILELANG_FWD_WORKLOADS, ids=str)
+@torch.inference_mode()
+def test_tilelang_forward(workload: FmhaWorkload) -> None:
+    pytest.xfail(reason="TODO: Tilelang forward has precision issues.")
+    _run_fmha_workload(workload)
+
+
+@supported_musa_compute_capability([31, 32])
+@pytest.mark.parametrize("workload", MUBIN_EMPTY_K_WORKLOADS, ids=str)
+@torch.inference_mode()
+def test_varlen_func_mubin_empty_k(workload: FmhaWorkload) -> None:
+    _run_fmha_workload(workload)
+
+
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("workload", RAGGED_FEATURE_WORKLOADS, ids=str)
 @torch.inference_mode()
 def test_varlen_func_ragged_qkv_features(workload: FmhaWorkload) -> None:
     _run_fmha_workload(workload)
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("workload", PAGED_WORKLOADS, ids=str)
 @torch.inference_mode()
 def test_paged_attn(workload: FmhaWorkload) -> None:
     _run_fmha_workload(workload)
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("workload", PAGED_FEATURE_WORKLOADS, ids=str)
 @torch.inference_mode()
 def test_paged_attn_features(workload: FmhaWorkload) -> None:
     _run_fmha_workload(workload)
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("workload", COMBINE_WORKLOADS[:-4], ids=str)
 @torch.inference_mode()
 def test_combine(workload: FmhaWorkload) -> None:
     _run_fmha_workload(workload)
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("workload", COMBINE_WORKLOADS[-4:], ids=str)
 @torch.inference_mode()
 def test_combine_high_splits(workload: FmhaWorkload) -> None:
     _run_fmha_workload(workload)
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("workload", KVCACHE_FEATURE_WORKLOADS, ids=str)
 @torch.inference_mode()
 def test_kvcache_features(workload: FmhaWorkload) -> None:

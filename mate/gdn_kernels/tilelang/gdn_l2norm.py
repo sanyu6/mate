@@ -1,4 +1,5 @@
 import torch
+from mate.execution_context import skip_kernel_launch_if_dry_run
 import tilelang
 import tilelang.language as T
 
@@ -134,5 +135,6 @@ def gdn_l2norm_(
         rows_per_block=rows_per_block,
         lanes_per_row=lanes_per_row,
     )
-    kernel(x, float(eps))
+    if not skip_kernel_launch_if_dry_run():
+        kernel(x, float(eps))
     return x

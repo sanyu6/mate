@@ -1,5 +1,8 @@
 from .dispatch import FlashMLAMubinDispatcher as FlashMLAMubinDispatcher
 from .flash_mla_api import flash_mla_asm_mubin as flash_mla_asm_mubin
+from .flash_mla_api import (
+    is_flash_mla_asm_mubin_supported as is_flash_mla_asm_mubin_supported,
+)
 from .types import FlashMLAMubinId as FlashMLAMubinId
 
-__all__ = ["flash_mla_asm_mubin"]
+__all__ = ["flash_mla_asm_mubin", "is_flash_mla_asm_mubin_supported"]

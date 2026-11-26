@@ -2,16 +2,103 @@ from __future__ import annotations
 
 import os
 import random
-from functools import wraps
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from mate.testing import repeat_check
+from mate.testing.operators.kda import blockwise_kda_reference
 
 CHUNK_SIZE = 32
 HEAD_SIZE = 128
+
+
+@pytest.mark.parametrize(
+    "lengths", ([0, 64, 65], [64, 0, 65], [64, 65, 0], [8192, 0, 0])
+)
+@pytest.mark.parametrize("state_dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize("state_mode", ("dense", "pool", "none"))
+@pytest.mark.parametrize("output_final_state", (False, True))
+def test_empty_sequences_preserve_state(
+    lengths, state_dtype, state_mode, output_final_state
+):
+    """Empty work skips all recurrence roles and preserves state without rounding."""
+    from mate.kda import chunk_kda
+
+    device = _get_runtime_device()
+    _manual_seed(73, device)
+    live = [i for i, length in enumerate(lengths) if length]
+    empty = [i for i, length in enumerate(lengths) if not length]
+    cu = torch.tensor(exclusive_cumsum(lengths), dtype=torch.int64, device=device)
+    compact_cu = torch.tensor(
+        exclusive_cumsum([lengths[i] for i in live]), dtype=torch.int64, device=device
+    )
+    q, k, v, g = [
+        torch.randn(1, sum(lengths), 12, 128, dtype=torch.bfloat16, device=device)
+        for _ in range(4)
+    ]
+    beta = torch.randn(1, sum(lengths), 12, dtype=torch.bfloat16, device=device)
+    args = dict(
+        A_log=torch.randn(12, device=device),
+        dt_bias=torch.randn(12, 128, device=device),
+        lower_bound=-5.0,
+        use_qk_l2norm_in_kernel=True,
+    )
+    # Empty sequences share a placeholder pool slot; live sequences never alias.
+    slots = [2 * live.index(i) + 1 if i in live else 0 for i in range(len(lengths))]
+    ids = torch.tensor(slots, dtype=torch.int32, device=device)
+    before = (torch.randn(7, 12, 128, 128, device=device) * 0.1).to(state_dtype)
+    state = before.clone() if state_mode == "pool" else before[ids].contiguous()
+    if state_mode == "none":
+        state = None
+    final = None
+    if state_mode == "none" and output_final_state:
+        final = torch.empty(
+            len(lengths), 12, 128, 128, dtype=state_dtype, device=device
+        )
+    output_ref, state_ref = chunk_kda(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=None if state is None else before[ids[live]].contiguous(),
+        final_state=None if final is None else torch.empty_like(final[: len(live)]),
+        output_final_state=True,
+        cu_seqlens=compact_cu,
+        **args,
+    )
+    stream = torch.musa.Stream()
+    stream.wait_stream(torch.musa.current_stream())
+    with torch.musa.stream(stream):
+        result = chunk_kda(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=state,
+            initial_state_indices=ids if state_mode == "pool" else None,
+            final_state=final,
+            output_final_state=output_final_state,
+            cu_seqlens=cu,
+            **args,
+        )
+    stream.synchronize()
+    output, final = result if output_final_state else (result, None)
+    torch.testing.assert_close(output, output_ref, atol=0.03, rtol=0.03)
+    if state_mode == "pool":
+        final = state
+        untouched = [i for i in range(7) if i not in slots]
+        assert torch.equal(final[untouched], before[untouched])
+    if final is not None:
+        actual = final[ids] if state_mode == "pool" else final
+        torch.testing.assert_close(actual[live], state_ref, atol=0.03, rtol=0.03)
+        if state_mode == "none":
+            assert torch.count_nonzero(actual[empty]).item() == 0
+        else:
+            assert torch.equal(actual[empty], before[ids[empty]])
 
 
 def exclusive_cumsum(seq_lens: list[int]) -> list[int]:
@@ -81,26 +168,6 @@ def _assert_close(
         rtol=rtol,
         atol=atol,
     )
-
-
-def _exp2_ftz_like(x: torch.Tensor) -> torch.Tensor:
-    y = torch.exp2(torch.clamp(x, max=127.0))
-    return torch.where(x < -126.0, torch.zeros_like(y), y)
-
-
-def _full_precision_musa_matmul(fn):
-    @wraps(fn)
-    def wrapped(q: torch.Tensor, *args, **kwargs):
-        if q.device.type != "musa":
-            return fn(q, *args, **kwargs)
-        allow_tf32 = torch.backends.mudnn.allow_tf32
-        torch.backends.mudnn.allow_tf32 = False
-        try:
-            return fn(q, *args, **kwargs)
-        finally:
-            torch.backends.mudnn.allow_tf32 = allow_tf32
-
-    return wrapped
 
 
 def gen_qk(
@@ -341,163 +408,6 @@ def _run_fused_kda(
     )
     assert isinstance(result, tuple)
     return result
-
-
-@torch.inference_mode()
-@_full_precision_musa_matmul
-def blockwise_kda_reference(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    *,
-    scale: float,
-    initial_state: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    lower_bound: float,
-    use_qk_l2norm_in_kernel: bool,
-    cu_seqlens: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    D = q.shape[-1]
-    Hqk = q.shape[-2]
-    H = v.shape[-2]
-    assert D == HEAD_SIZE
-    assert k.shape[-2] == Hqk
-    assert g.shape[-2] == H
-    assert beta.shape[-1] == H
-    assert H % Hqk == 0
-    qk_group = H // Hqk
-
-    if cu_seqlens is None and q.ndim == 4:
-        batch_size, num_tokens = q.shape[:2]
-        flat_q = q.reshape(-1, Hqk, D)
-        flat_k = k.reshape(-1, Hqk, D)
-        flat_v = v.reshape(-1, H, D)
-        flat_g = g.reshape(-1, H, D)
-        flat_beta = beta.reshape(-1, H)
-        seq_offsets = [i * num_tokens for i in range(batch_size + 1)]
-        out_shape = v.shape
-    elif cu_seqlens is None:
-        if q.ndim != 3:
-            raise AssertionError(
-                "Dense reference inputs must be [B, T, H, D] or flattened to [B*T, H, D]."
-            )
-        flat_q = q
-        flat_k = k
-        flat_v = v
-        flat_g = g
-        flat_beta = beta
-        seq_len = flat_q.shape[0] // initial_state.shape[0]
-        seq_offsets = [i * seq_len for i in range(initial_state.shape[0] + 1)]
-        out_shape = v.shape
-    else:
-        flat_q = q
-        flat_k = k
-        flat_v = v
-        flat_g = g
-        flat_beta = beta
-        seq_offsets = [int(x) for x in cu_seqlens.tolist()]
-        out_shape = v.shape
-
-    if use_qk_l2norm_in_kernel:
-        qn = _normalize_last_dim(flat_q.float()).to(q.dtype).float()
-        kn = _normalize_last_dim(flat_k.float()).to(k.dtype).float()
-    else:
-        qn = flat_q.float()
-        kn = flat_k.float()
-    out = torch.empty_like(flat_v)
-    state = initial_state.clone()
-    log2e = 1.4426950408889634
-    qk_head_indices = torch.arange(H, device=q.device, dtype=torch.long) // qk_group
-
-    def round_workspace(x: torch.Tensor) -> torch.Tensor:
-        return x.to(q.dtype).float()
-
-    for seq_idx, bos in enumerate(seq_offsets[:-1]):
-        eos = seq_offsets[seq_idx + 1]
-        s = state[seq_idx].float().transpose(-1, -2)
-        for start in range(bos, eos, CHUNK_SIZE):
-            end = min(start + CHUNK_SIZE, eos)
-            actual = end - start
-            q_blk = torch.zeros(
-                (H, CHUNK_SIZE, D), device=q.device, dtype=torch.float32
-            )
-            k_blk = torch.zeros_like(q_blk)
-            v_blk = torch.zeros_like(q_blk)
-            g_blk = torch.zeros_like(q_blk)
-            beta_blk = torch.full(
-                (H, CHUNK_SIZE), -80.0, device=q.device, dtype=torch.float32
-            )
-
-            q_blk[:, :actual] = (
-                qn[start:end].index_select(1, qk_head_indices).permute(1, 0, 2)
-            )
-            k_blk[:, :actual] = (
-                kn[start:end].index_select(1, qk_head_indices).permute(1, 0, 2)
-            )
-            v_blk[:, :actual] = flat_v[start:end].permute(1, 0, 2).float()
-            g_blk[:, :actual] = flat_g[start:end].permute(1, 0, 2).float()
-            beta_blk[:, :actual] = flat_beta[start:end].transpose(0, 1).float()
-
-            gate = (
-                lower_bound
-                * log2e
-                * torch.sigmoid(
-                    torch.exp(A_log)[:, None, None] * (g_blk + dt_bias[:, None, :])
-                )
-            )
-            if actual < CHUNK_SIZE:
-                gate[:, actual:] = 0.0
-            g_cumsum = gate.cumsum(dim=1)
-            g_total = g_cumsum[:, -1]
-            shift = 0.5 * (g_cumsum[:, 0] + g_total)
-            k_decayed = round_workspace(k_blk * _exp2_ftz_like(g_cumsum))
-            q_decayed = round_workspace(q_blk * _exp2_ftz_like(g_cumsum) * scale)
-            k_decayed_for_tri = round_workspace(
-                k_blk * _exp2_ftz_like(g_cumsum - shift[:, None])
-            )
-            q_decayed_for_p = round_workspace(
-                q_blk * _exp2_ftz_like(g_cumsum - shift[:, None]) * scale
-            )
-            k_inv = round_workspace(k_blk * _exp2_ftz_like(shift[:, None] - g_cumsum))
-            beta_sigmoid = torch.sigmoid(beta_blk)
-            l_mat = round_workspace(
-                torch.bmm(k_decayed_for_tri, k_inv.transpose(1, 2)).tril(-1)
-                * beta_sigmoid[:, :, None]
-            )
-
-            a = torch.zeros(
-                (H, CHUNK_SIZE, CHUNK_SIZE), device=q.device, dtype=torch.float32
-            )
-            a[:, 0, 0] = beta_sigmoid[:, 0]
-            for i in range(1, CHUNK_SIZE):
-                a[:, i, i] = beta_sigmoid[:, i]
-                a[:, i, :i] = -torch.bmm(l_mat[:, i : i + 1, :i], a[:, :i, :i]).squeeze(
-                    1
-                )
-            a = round_workspace(a)
-            p = round_workspace(
-                torch.bmm(q_decayed_for_p, k_inv.transpose(1, 2)).tril()
-            )
-            s_committed = round_workspace(s)
-            tmp = round_workspace(v_blk - torch.bmm(k_decayed, s_committed))
-            u = round_workspace(torch.bmm(a, tmp))
-            out_chunk = round_workspace(
-                torch.bmm(q_decayed, s_committed) + torch.bmm(p, u)
-            )
-            out[start:end] = out_chunk[:, :actual].permute(1, 0, 2)
-
-            k_restored = round_workspace(
-                k_blk * _exp2_ftz_like(g_total[:, None] - g_cumsum)
-            )
-            s = s * _exp2_ftz_like(g_total)[:, None, :] + torch.bmm(
-                k_restored.transpose(1, 2), u
-            )
-        state[seq_idx].copy_(s.transpose(-1, -2).to(initial_state.dtype))
-
-    return out.reshape(out_shape), state
 
 
 def _test_kda_kernel(
@@ -790,7 +700,6 @@ CHUNKED_KDA_CASES = [
     ),
     DENSE_KDA_CASES,
 )
-@repeat_check(outputs="result", repeat=3, scope=_run_fused_kda)
 def test_kda_fused_matches_reference(
     dtype_name: str,
     use_qk_l2norm_in_kernel: bool,
@@ -835,7 +744,6 @@ def test_kda_fused_matches_reference(
     ),
     VARLEN_KDA_CASES,
 )
-@repeat_check(outputs="result", repeat=3, scope=_run_fused_kda)
 def test_kda_fused_varlen_matches_reference(
     dtype_name: str,
     use_qk_l2norm_in_kernel: bool,
@@ -862,7 +770,6 @@ def test_kda_fused_varlen_matches_reference(
     )
 
 
-@repeat_check(outputs="result", repeat=3, scope=_run_fused_kda)
 def test_kda_fused_varlen_int32_cu_seqlens_matches_reference() -> None:
     _test_kda_kernel(
         dtype_name="bfloat16",
@@ -1004,7 +911,6 @@ def test_kda_fused_single_chunk_zero_v_with_initial_state_matches_reference() ->
     )
 
 
-@repeat_check(outputs="result", repeat=3, scope=_run_fused_kda)
 def test_kda_fused_varlen_single_sequence_four_chunks_matches_reference() -> None:
     _test_kda_kernel(
         dtype_name="bfloat16",

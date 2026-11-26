@@ -3,8 +3,15 @@ import argparse
 import numpy as np
 import torch
 
+from mate.arch import MP32_ARCH
 from mate.gdn_prefill import chunk_gated_delta_rule
+from mate.mate_runtime import get_arch
 from mate.testing.utils import bench_kineto
+
+CHUNK_SIZE = 64
+# Logical bytes per (token, head) at d=128, KDA ``k2.md`` convention:
+# l2norm 1024 B + kkt 388 B + prefill 1416 B.
+LOGICAL_BYTES_PER_TOKEN_HEAD = 2828
 
 HEAD_CONFIGS = [
     # (h_qk, h_v, d, label)
@@ -20,6 +27,7 @@ HEAD_CONFIGS = [
     # Qwen3.5-2B and 0.8B (h_k=16, h_v=16, d=128)
     (16, 16, 128, "2B/0.8B TP1"),
     # Symmetric heads
+    (8, 8, 128, "Sym h8"),
     (32, 32, 128, "Sym h32"),
 ]
 
@@ -35,6 +43,10 @@ SEQ_CONFIGS = [
     ((1024 * 1, 8192), "1024+7168"),
     ((2048, 2048 * 2, 2048 * 3, 8192), "2048x4"),
     (tuple(1024 * (i + 1) for i in range(8)), "1024x8"),
+    # Long multi-sequence batches (peak state-checkpoint bandwidth on MP32)
+    (tuple(8192 * (i + 1) for i in range(6)), "8192x6"),
+    (tuple(4096 * (i + 1) for i in range(12)), "4096x12"),
+    (tuple(16384 * (i + 1) for i in range(6)), "16384x6"),
 ]
 
 
@@ -44,6 +56,25 @@ def _gdn_tflops(total_tokens: int, h_o: int, d: int, time_ms: float) -> float:
     return flops / time_ms / 1e9
 
 
+def _gdn_logical_bytes(
+    endpoints: tuple[int, ...],
+    h_o: int,
+    d: int,
+    every_n: int,
+    itemsize: int,
+) -> int:
+    # Inputs/outputs plus one d x d state per checkpoint and head.
+    nbytes = LOGICAL_BYTES_PER_TOKEN_HEAD * endpoints[-1] * h_o
+    if every_n:
+        starts = (0,) + endpoints[:-1]
+        num_checkpoints = sum(
+            (end - start + every_n - 1) // every_n
+            for start, end in zip(starts, endpoints)
+        )
+        nbytes += num_checkpoints * h_o * d * d * itemsize
+    return nbytes
+
+
 def bench_mate(
     endpoints: tuple[int, ...],
     h_qk: int,
@@ -51,6 +82,7 @@ def bench_mate(
     d: int,
     dtype: torch.dtype,
     num_tests: int,
+    every_n: int = 0,
 ) -> float:
     device = "musa"
     num_seqs = len(endpoints)
@@ -74,23 +106,34 @@ def bench_mate(
     )
     h0 = torch.randn((num_seqs, head_o, d, d), dtype=torch.float32, device=device)
 
-    run = lambda: chunk_gated_delta_rule(
-        q=q,
-        k=k,
-        v=v,
-        g=log_alpha,
-        beta=beta,
-        scale=None,
-        initial_state=h0,
-        output_final_state=True,
-        cu_seqlens=cu_seqlens,
-        use_qk_l2norm_in_kernel=True,
-    )
-    kernel_names = (
-        "tilelang_gdn_l2norm_kernel",
-        "tilelang_kkt_solve_kernel",
-        "tilelang_fused_chunk_gdn_prefill_kernel_",
-    )
+    def run() -> object:
+        return chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=log_alpha,
+            beta=beta,
+            scale=None,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=True,
+            checkpoint_every_n_tokens=every_n,
+        )
+
+    if get_arch(q.device) == MP32_ARCH:
+        # MP32 fuses kkt_solve into the prefill kernel and replaces the in-place
+        # l2norm with a read-only rnorm kernel.
+        kernel_names = (
+            "tilelang_gdn_qk_rnorm",
+            "tilelang_fused_chunk_gdn_prefill_kernel_",
+        )
+    else:
+        kernel_names = (
+            "tilelang_gdn_l2norm_kernel",
+            "tilelang_kkt_solve_kernel",
+            "tilelang_fused_chunk_gdn_prefill_kernel_",
+        )
 
     kernel_times = bench_kineto(
         run,
@@ -118,21 +161,38 @@ def main():
         choices=["fp16", "bf16"],
         help="Input dtype for q/k/v",
     )
+    parser.add_argument(
+        "--checkpoint-every-n-tokens",
+        type=int,
+        default=0,
+        help="Also store the state every N tokens, a multiple of 64 (MP32 only)",
+    )
     args = parser.parse_args()
 
     if not (hasattr(torch, "musa") and torch.musa.is_available()):
         raise RuntimeError("MUSA device is not available.")
 
     dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
+    every_n = args.checkpoint_every_n_tokens
+    if every_n and get_arch() != MP32_ARCH:
+        raise RuntimeError("--checkpoint-every-n-tokens is only supported on MP32.")
 
     print(f"\nMUSA: {torch.musa.get_device_name(0)}")
     print("Kernel: mate.gdn_prefill.chunk_gated_delta_rule")
-    print(f"dtype={args.dtype}, split_qkv=strided, qk_l2norm=standalone_inplace")
+    qk_l2norm = "fused" if get_arch() == MP32_ARCH else "standalone_inplace"
+    print(
+        f"dtype={args.dtype}, split_qkv=strided, qk_l2norm={qk_l2norm}, "
+        f"checkpoint_every_n_tokens={every_n}"
+    )
+    print(
+        f"GB/s: logical {LOGICAL_BYTES_PER_TOKEN_HEAD} B per token and head"
+        + ("" if not every_n else " + state checkpoints")
+    )
     print()
 
     header = (
         f"{'Heads':<15s}  {'Seqlens':<16s}  {'h_qk':>4s} {'h_v':>4s}"
-        f"  {'MATE (MUSA)':>12s}  {'TFLOPS':>7s}"
+        f"  {'MATE (MUSA)':>12s}  {'TFLOPS':>7s}  {'GB/s':>7s}"
     )
     print(header)
     print("-" * len(header))
@@ -147,11 +207,18 @@ def main():
                 d=d,
                 dtype=dtype,
                 num_tests=args.num_tests,
+                every_n=every_n,
             )
-            tflops = _gdn_tflops(total_tokens, max(h_qk, h_v), d, mate_ms)
+            h_o = max(h_qk, h_v)
+            tflops = _gdn_tflops(total_tokens, h_o, d, mate_ms)
+            gbps = (
+                _gdn_logical_bytes(endpoints, h_o, d, every_n, dtype.itemsize)
+                / mate_ms
+                / 1e6
+            )
             print(
                 f"{h_label:<15s}  {s_label:<16s}  {h_qk:>4d} {h_v:>4d}"
-                f"  {mate_ms:>11.3f}ms  {tflops:>6.1f}"
+                f"  {mate_ms:>11.3f}ms  {tflops:>6.1f}  {gbps:>7.1f}"
             )
         print()
 

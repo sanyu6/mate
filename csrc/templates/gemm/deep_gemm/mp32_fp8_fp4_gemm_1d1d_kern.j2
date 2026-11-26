@@ -1,0 +1,160 @@
+#include <algorithm>
+#include <cstdint>
+#include <mutlass/device_kernel.h>
+#include "mate/gemm/deep_gemm/mp32_fp8_fp4_gemm_1d1d.hpp"
+#include "gemm_common_utils.hpp"
+#include "op_utils.hpp"
+
+using namespace tvm;
+using namespace mute;
+
+// Internal FFI: scales have already been converted to UE8M0 bytes, expanded
+// to one scale per K32. With Q=ceil(K/32), SFA is contiguous [Q, M]
+// (contiguous) or [G, Q, M] (masked), and SFB is [G, Q, N]. No MN padding.
+// The caller guarantees metadata values: contiguous tiles identify one expert
+// in the first row and contain only that ID or -1; masked counts lie in [0, M].
+void {{ func_name }}(
+    ffi::TensorView a,
+    ffi::TensorView sfa,
+    ffi::TensorView b,
+    ffi::TensorView sfb,
+    ffi::TensorView d,
+    ffi::TensorView grouped_layout,
+    int num_mps
+) {
+  constexpr auto kType        = {{ gemm_type }};
+  using TileShape             = Shape<Int<{{ tile_m }}>, Int<{{ tile_n }}>, Int<{{ tile_k }}>>;
+  constexpr uint32_t kStages  = {{ stages }};
+
+  constexpr bool kIsMasked = kType == mate::deep_gemm::GemmType::MGroupedMasked;
+  constexpr bool kIsContiguous = kType == mate::deep_gemm::GemmType::MGroupedContiguous;
+  static_assert(kIsMasked || kIsContiguous,
+                "MP32 FP8 x FP4 GEMM supports contiguous and masked M-grouped modes");
+  using TensorGroup = mate::deep_gemm::detail::GemmTensorGroupTraits<kType>;
+  constexpr bool kGroupA = TensorGroup::kA;
+  constexpr bool kGroupD = TensorGroup::kD;
+  constexpr bool kGroupScaleA = TensorGroup::kScaleA;
+
+  CHECK_MUSA(a);
+  CHECK_DEVICE(b, a);
+  CHECK_DEVICE(d, a);
+  CHECK_DEVICE(sfa, a);
+  CHECK_DEVICE(sfb, a);
+  CHECK_DEVICE(grouped_layout, a);
+  CHECK_INPUT_TYPE(a, dl_float8_e4m3fn);
+  CHECK_INPUT_TYPE(b, dl_int8);
+  CHECK_INPUT_TYPE(d, dl_bfloat16);
+  CHECK_INPUT_TYPE(sfa, dl_uint8);
+  CHECK_INPUT_TYPE(sfb, dl_uint8);
+  CHECK_INPUT_TYPE(grouped_layout, dl_int32);
+  CHECK_DIM(kGroupA ? 3 : 2, a);
+  CHECK_DIM(kGroupD ? 3 : 2, d);
+  CHECK_DIM(kGroupScaleA ? 3 : 2, sfa);
+  CHECK_DIM(3, b);
+  CHECK_DIM(3, sfb);
+  CHECK_DIM(1, grouped_layout);
+
+  const int64_t G = b.size(0);
+  const int64_t M = kGroupA ? a.size(1) : a.size(0);
+  const int64_t K = kGroupA ? a.size(2) : a.size(1);
+  const int64_t N = b.size(1);
+  const int64_t KTiles = ceil_div(K, int64_t(32));
+
+  if constexpr (kGroupA) {
+    TVM_FFI_ICHECK(a.size(0) == G) << "a.shape[0] must match logical group count";
+  }
+  TVM_FFI_ICHECK(b.size(2) == K / 2) << "b.shape[2] must match packed K / 2";
+  if constexpr (kGroupD) {
+    TVM_FFI_ICHECK(d.size(0) == G) << "d.shape[0] must match logical group count";
+    TVM_FFI_ICHECK(d.size(1) == M) << "d.shape[1] must match logical M";
+    TVM_FFI_ICHECK(d.size(2) == N) << "d.shape[2] must match logical output N";
+  } else {
+    TVM_FFI_ICHECK(d.size(0) == M) << "d.shape[0] must match logical M";
+    TVM_FFI_ICHECK(d.size(1) == N) << "d.shape[1] must match logical output N";
+  }
+  if constexpr (kGroupScaleA) {
+    TVM_FFI_ICHECK(sfa.size(0) == G) << "sfa.shape[0] must match logical group count";
+    TVM_FFI_ICHECK(sfa.size(1) == KTiles) << "sfa.shape[1] must match ceil_div(K, 32)";
+    TVM_FFI_ICHECK(sfa.size(2) == M) << "sfa.shape[2] must match logical M";
+  } else {
+    TVM_FFI_ICHECK(sfa.size(0) == KTiles) << "sfa.shape[0] must match ceil_div(K, 32)";
+    TVM_FFI_ICHECK(sfa.size(1) == M) << "sfa.shape[1] must match logical M";
+  }
+  TVM_FFI_ICHECK(sfb.size(0) == G) << "sfb.shape[0] must match logical group count";
+  TVM_FFI_ICHECK(sfb.size(1) == KTiles) << "sfb.shape[1] must match ceil_div(K, 32)";
+  TVM_FFI_ICHECK(sfb.size(2) == N) << "sfb.shape[2] must match logical N";
+  if constexpr (kIsMasked) {
+    TVM_FFI_ICHECK(grouped_layout.size(0) == G)
+        << "grouped_layout.shape[0] must match logical group count";
+  } else {
+    TVM_FFI_ICHECK(grouped_layout.size(0) == M)
+        << "grouped_layout.shape[0] must match logical M";
+  }
+  if constexpr (kIsContiguous) {
+    TVM_FFI_ICHECK(M % size<0>(TileShape{}) == 0) << "Contiguous M must be divisible by TileM";
+  }
+
+  if (mate::gemm::common::gemm_early_return(
+          static_cast<int>(G), static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), d, false)) {
+    return;
+  }
+
+  TVM_FFI_ICHECK(a.is_contiguous() && b.is_contiguous() && d.is_contiguous() &&
+                 sfa.is_contiguous() && sfb.is_contiguous() && grouped_layout.is_contiguous());
+
+  using A = mutlass::mx_float8_t<mutlass::float_e4m3_t>;
+  using B = mutlass::mx_float4_t<mutlass::float_e2m1_t>;
+  using D = mutlass::bfloat16_t;
+
+  auto stride_a = [&]() {
+    if constexpr (kGroupA) {
+      return make_stride(a.stride(1), _1{}, a.stride(0));
+    }
+    return make_stride(a.stride(0), _1{}, M * K);
+  }();
+
+  // B stores two FP4 elements per int8; kernel strides count logical FP4 elements.
+  auto stride_b = make_stride(b.stride(1) * 2, _1{}, b.stride(0) * 2);
+
+  auto stride_d = [&]() {
+    if constexpr (kGroupD) {
+      return make_stride(d.stride(1), _1{}, d.stride(0));
+    }
+    return make_stride(d.stride(0), _1{}, M * N);
+  }();
+
+  using Kernel = mate::deep_gemm::Mp32Fp8Fp4Gemm1D1D<
+      kType, A, B, D, decltype(stride_a), decltype(stride_b), decltype(stride_d),
+      TileShape, kStages>;
+  static_assert(Kernel::NumMmaWarpSquads == {{ num_mma_warp_squads }},
+                "JIT MMA warp squad count must match the kernel");
+  ffi::MUSADeviceGuard guard(a.device().device_id);
+  musaDeviceProp props{};
+  MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&props, a.device().device_id));
+  int launch_num_mps = num_mps > 0 ? std::min(num_mps, props.multiProcessorCount) : props.multiProcessorCount;
+  typename Kernel::Arguments args{
+      .ptr_a              = static_cast<typename A::DataType const*>(a.data_ptr()),
+      .ptr_scale_a        = static_cast<typename A::ScaleFactorType const*>(sfa.data_ptr()),
+      .ptr_b              = static_cast<typename B::DataType const*>(b.data_ptr()),
+      .ptr_scale_b        = static_cast<typename B::ScaleFactorType const*>(sfb.data_ptr()),
+      .ptr_d              = static_cast<D*>(d.data_ptr()),
+      .ptr_grouped_layout = static_cast<int32_t const*>(grouped_layout.data_ptr()),
+      .stride_a           = stride_a,
+      .stride_b           = stride_b,
+      .stride_d           = stride_d,
+      .m                  = static_cast<int>(M),
+      .n                  = static_cast<int>(N),
+      .k                  = static_cast<int>(K),
+      .num_groups         = static_cast<int>(G),
+      .expected_m         = 0,
+      .num_mps            = launch_num_mps,
+  };
+  TVM_FFI_ICHECK(Kernel::can_implement(args));
+  auto params = Kernel::to_underlying_arguments(args);
+  dim3 grid   = Kernel::get_grid_shape_persistent(params);
+  MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(
+      mutlass::device_kernel<Kernel>, musaFuncAttributeMaxDynamicSharedMemorySize, Kernel::SharedStorageSize));
+  mutlass::device_kernel<Kernel><<<grid, Kernel::MaxThreadsPerBlock,
+      Kernel::SharedStorageSize, get_stream(a.device())>>>(params);
+  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
+}

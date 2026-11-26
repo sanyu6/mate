@@ -34,22 +34,20 @@ DecodingAttnImplMeta get_attn_impl_meta(Arch                   arch,
                                         bool                   is_sparse_attn,
                                         int                    tile_m = 128) {
   (void)h_q;
-  if (arch.is_mp31()) {
-    if (is_sparse_attn) {
-      if (is_fp8_kvcache) {
-        return {std::max(mp_count / h_k / mutlass::ceil_div(num_q_tokens_per_head_k, tile_m), 1), 5, 64};
-      } else {
-        TVM_FFI_ICHECK(false) << "Sparse BF16 MLA is not supported on MP31";
-      }
+  if (is_sparse_attn) {
+    TVM_FFI_ICHECK(arch.is_mp31() || arch.is_mp32()) << "Sparse MLA only supports MP31 and MP32";
+    if (is_fp8_kvcache) {
+      return {std::max(mp_count / h_k / mutlass::ceil_div(num_q_tokens_per_head_k, tile_m), 1), 5, 64};
     } else {
-      if (is_fp8_kvcache) {
-        TVM_FFI_ICHECK(false) << "Dense FP8 MLA is not supported on MP31";
-      } else {
-        return {std::max(mp_count / h_k / mutlass::ceil_div(num_q_tokens_per_head_k, tile_m), 1), 5, 64};
-      }
+      TVM_FFI_ICHECK(false) << "Sparse BF16 MLA is not supported on MP31 or MP32";
     }
   } else {
-    TVM_FFI_ICHECK(false) << "Unsupported GPU architecture";
+    TVM_FFI_ICHECK(arch.is_mp31()) << "Dense MLA only supports MP31";
+    if (is_fp8_kvcache) {
+      TVM_FFI_ICHECK(false) << "Dense FP8 MLA is not supported on MP31";
+    } else {
+      return {std::max(mp_count / h_k / mutlass::ceil_div(num_q_tokens_per_head_k, tile_m), 1), 5, 64};
+    }
   }
   return {0, 0, 0};
 }
@@ -159,6 +157,7 @@ void dispatch_mla_kernel(ffi::TensorView q_nope,
                 static_cast<uint32_t>(get<5>(problem_shape))};
   mutlass::device_kernel<MlaKernel>
       <<<grid_dim, MlaKernel::MaxThreadsPerBlock, MlaKernel::SharedStorageSize, stream>>>(params);
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
 }
 
 void mla(ffi::TensorView q_nope,
@@ -171,7 +170,7 @@ void mla(ffi::TensorView q_nope,
          ffi::TensorView lse,
          double          sm_scale,
          bool            is_causal) {
-  check_mp31(q_nope.device(), "mla");
+  check_mp31_only(q_nope.device(), "mla");
 
   CHECK_MUSA(q_nope);
   CHECK_MUSA(q_pe);
@@ -287,8 +286,6 @@ void mla(ffi::TensorView q_nope,
   } else {
     TVM_FFI_ICHECK(false) << "Unsupported MLA input dtype";
   }
-
-  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
 }
 
 void mla_with_kvcache(ffi::TensorView                q_latent,
@@ -305,7 +302,7 @@ void mla_with_kvcache(ffi::TensorView                q_latent,
                       ffi::TensorView                softmax_lse,
                       double                         softmax_scale,
                       bool                           is_causal) {
-  check_mp31(q_latent.device(), "mla_with_kvcache");
+  check_mp31_only(q_latent.device(), "mla_with_kvcache");
 
   CHECK_MUSA(q_latent);
   CHECK_MUSA(q_rope);
@@ -560,7 +557,9 @@ void mla_with_kvcache(ffi::TensorView                q_latent,
          stride_lse,
          static_cast<float*>(out_accum.data_ptr()),
          static_cast<float*>(softmax_lse_accum.data_ptr()),
-         q_seq_per_hk},
+         q_seq_per_hk,
+         VarlenQ ? out_work.stride(0) : 0,
+         VarlenQ ? softmax_lse_work.stride(1) : 0},
         {static_cast<int>(tile_scheduler_metadata.size(0)),
          static_cast<int32_t*>(tile_scheduler_metadata.data_ptr()),
          static_cast<int32_t*>(num_splits.data_ptr())}};
@@ -571,6 +570,7 @@ void mla_with_kvcache(ffi::TensorView                q_latent,
 
     mutlass::device_kernel<MlaKernel>
         <<<grid_dim, MlaKernel::MaxThreadsPerBlock, MlaKernel::SharedStorageSize, stream>>>(params);
+    MATE_CHECK_MUSA_KERNEL_LAUNCH();
 
     if constexpr (!UseTrivalScheduler) {
       mate::flash_mla::MlaCombineParams combine_params{};
@@ -587,8 +587,11 @@ void mla_with_kvcache(ffi::TensorView                q_latent,
       combine_params.h_r                  = heads_ratio;
       combine_params.h_k                  = 1;
       combine_params.o_batch_stride       = static_cast<int>(out_work.stride(0));
-      combine_params.o_row_stride         = static_cast<int>(out_work.stride(1));
-      combine_params.o_head_stride        = static_cast<int>(out_work.stride(2));
+      combine_params.o_row_stride         = VarlenQ ? out_work.stride(0) : out_work.stride(1);
+      combine_params.o_head_stride        = VarlenQ ? out_work.stride(1) : out_work.stride(2);
+      combine_params.lse_batch_stride     = softmax_lse_work.stride(0);
+      combine_params.lse_row_stride       = softmax_lse_work.stride(2);
+      combine_params.lse_head_stride      = softmax_lse_work.stride(1);
 
       run_mla_combine_kernel<Element, VarlenQ>(combine_params, stream);
     }
@@ -672,8 +675,6 @@ void mla_with_kvcache(ffi::TensorView                q_latent,
       }
     }
   }
-
-  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
 }
 
 MetadataResult get_mla_decoding_metadata_impl(ffi::Optional<ffi::TensorView> seqlens_k,
@@ -699,7 +700,7 @@ MetadataResult get_mla_decoding_metadata_impl(ffi::Optional<ffi::TensorView> seq
   MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&dprops, device_id));
   const int mp_count = dprops.multiProcessorCount;
   Arch      arch     = {dprops.major, dprops.minor};
-  TVM_FFI_ICHECK(arch.is_mp31()) << "Only MP31 is supported";
+  TVM_FFI_ICHECK(arch.is_mp31() || arch.is_mp32()) << "Only MP31 and MP32 are supported";
 
   const int batch_size = static_cast<int>(
       bs.has_value() ? bs.value() : (seqlens_k.has_value() ? seqlens_k.value().size(0) : q.value().size(0)));

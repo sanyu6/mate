@@ -7,13 +7,30 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from mate.arch import MP32_ARCH
 from mate.gdn_prefill import chunk_gated_delta_rule
+from mate.mate_runtime import get_arch
+from mate.testing.operators.gdn import blockwise_gdn_prefill_reference
 
 
 pytestmark = pytest.mark.usefixtures("disable_mudnn_tf32")
 
 CHUNK_SIZE = 64
 HEAD_SIZE = 128
+
+
+def _reference_qk(
+    q: torch.Tensor, k: torch.Tensor, use_qk_l2norm_in_kernel: bool, eps: float = 1e-6
+):
+    """q/k as the kernel sees them: with use_qk_l2norm_in_kernel the API l2-normalizes
+    them as x * rsqrt(sum(x^2) + eps).  MP32 does this without touching the inputs
+    (MP31 normalizes in place), so the reference normalizes its own fp32 copy on the
+    inputs' device."""
+    q, k = q.float(), k.float()
+    if use_qk_l2norm_in_kernel:
+        q = q * torch.rsqrt(q.pow(2).sum(-1, keepdim=True) + eps)
+        k = k * torch.rsqrt(k.pow(2).sum(-1, keepdim=True) + eps)
+    return q, k
 
 
 def exclusive_cumsum(seq_lens: list[int]) -> list[int]:
@@ -132,101 +149,6 @@ def _to_kernel_gate_space(g: torch.Tensor, is_log_space: bool) -> torch.Tensor:
     return torch.log(g) if is_log_space else g
 
 
-def _safe_exp(x: torch.Tensor) -> torch.Tensor:
-    return torch.exp(torch.where(x <= 0, x, torch.full_like(x, -float("inf"))))
-
-
-def _inverse_from_neg_strict_lower(p: torch.Tensor) -> torch.Tensor:
-    length = p.shape[0]
-    p = p.to(torch.float32)
-    s = torch.eye(length, device=p.device, dtype=torch.float32)
-    for i in range(1, length):
-        for j in range(i):
-            s[i, j] = torch.dot(p[i, j:i], s[j:i, j])
-    return s
-
-
-@torch.inference_mode()
-def blockwise_gdn_prefill_reference(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    seq_lens: list[int],
-    *,
-    initial_state: torch.Tensor,
-    chunk_size: int,
-    scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    total_seq_len, num_qk_heads, head_size = q.shape
-    num_v_heads = v.shape[1]
-    assert k.shape == (total_seq_len, num_qk_heads, head_size)
-    assert v.shape == (total_seq_len, num_v_heads, head_size)
-    assert g.shape == beta.shape == (total_seq_len, num_v_heads)
-    assert num_v_heads % num_qk_heads == 0
-    assert initial_state.shape == (
-        len(seq_lens),
-        num_v_heads,
-        head_size,
-        head_size,
-    )
-
-    group_size = num_v_heads // num_qk_heads
-    output = torch.empty(
-        total_seq_len, num_v_heads, head_size, device=q.device, dtype=torch.float32
-    )
-    final_state = torch.empty_like(initial_state, dtype=torch.float32)
-
-    cu_seqlens = exclusive_cumsum(seq_lens)
-    for seq_idx, seq_start in enumerate(cu_seqlens[:-1]):
-        seq_end = cu_seqlens[seq_idx + 1]
-        state = torch.transpose(initial_state[seq_idx].to(torch.float32).clone(), 1, 2)
-
-        for left in range(seq_start, seq_end, chunk_size):
-            right = min(left + chunk_size, seq_end)
-            q_blk = q[left:right].to(torch.float32)
-            k_blk = k[left:right].to(torch.float32)
-            v_blk = v[left:right].to(torch.float32)
-            g_blk = torch.cumsum(torch.log(g[left:right].to(torch.float32)), dim=0)
-            beta_blk = beta[left:right].to(torch.float32)
-
-            next_state = torch.empty_like(state)
-            for v_head in range(num_v_heads):
-                qk_head = v_head // group_size
-                q_h = q_blk[:, qk_head, :]
-                k_h = k_blk[:, qk_head, :]
-                v_h = v_blk[:, v_head, :]
-                g_h = g_blk[:, v_head]
-                beta_h = beta_blk[:, v_head]
-
-                gamma = torch.tril(_safe_exp(g_h[:, None] - g_h[None, :]))
-                gram = k_h @ k_h.transpose(0, 1)
-                transition = -gram * beta_h[:, None] * torch.tril(gamma, diagonal=-1)
-                solve = _inverse_from_neg_strict_lower(transition)
-
-                old_state = state[v_head]
-                g_exp = _safe_exp(g_h)
-                w = v_h - g_exp.unsqueeze(-1) * (k_h @ old_state)
-                new_v = (solve * beta_h[None, :]) @ w
-
-                o_inter = g_exp.unsqueeze(-1) * (q_h @ old_state)
-                attn = (q_h @ k_h.transpose(0, 1)) * gamma
-                output[left:right, v_head] = scale * (o_inter + attn @ new_v)
-
-                g_last = g_h[-1]
-                new_v_scaled = _safe_exp(g_last - g_h).unsqueeze(-1) * new_v
-                next_state[v_head] = (
-                    _safe_exp(g_last) * old_state + k_h.transpose(0, 1) @ new_v_scaled
-                )
-
-            state = next_state
-
-        final_state[seq_idx] = torch.transpose(state, 1, 2)
-
-    return output, final_state
-
-
 def _to_kernel_inputs(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -289,6 +211,7 @@ def _test_prefill_kernel(
     seed: int,
     is_log_space: bool = True,
     use_zero_alpha: bool = False,
+    unit_alpha_stride: int = 0,
     use_qk_l2norm_in_kernel: bool = True,
 ) -> None:
     device = _get_runtime_device()
@@ -309,6 +232,8 @@ def _test_prefill_kernel(
     g, beta = gen_gates(sum(seq_lens), num_v_heads, device)
     if use_zero_alpha:
         g[7::17, :] = 0.0
+    if unit_alpha_stride:
+        g[::unit_alpha_stride, :] = 1.0
     initial_state = 0.05 * torch.randn(
         len(seq_lens),
         num_v_heads,
@@ -345,14 +270,15 @@ def _test_prefill_kernel(
     )
     _synchronize(device)
 
+    ref_q, ref_k = _reference_qk(q, k, use_qk_l2norm_in_kernel)
     ref_o, ref_state = blockwise_gdn_prefill_reference(
-        q.float().cpu(),
-        k.float().cpu(),
-        v.float().cpu(),
-        g.cpu(),
-        beta.cpu(),
+        ref_q,
+        ref_k,
+        v.float(),
+        g,
+        beta,
         seq_lens,
-        initial_state=ref_initial_state.cpu(),
+        initial_state=ref_initial_state,
         chunk_size=CHUNK_SIZE,
         scale=scale,
     )
@@ -465,17 +391,18 @@ def _test_chunked_prefill(
         num_v_heads,
         HEAD_SIZE,
         HEAD_SIZE,
-        device="cpu",
+        device=device,
         dtype=torch.float32,
     )
+    ref_q, ref_k = _reference_qk(q, k, use_qk_l2norm_in_kernel)
     ref_o, ref_state = blockwise_gdn_prefill_reference(
-        q.float().cpu(),
-        k.float().cpu(),
-        v.float().cpu(),
-        g.cpu(),
-        beta.cpu(),
+        ref_q,
+        ref_k,
+        v.float(),
+        g,
+        beta,
         seq_lens,
-        initial_state=initial_state.cpu(),
+        initial_state=initial_state,
         chunk_size=CHUNK_SIZE,
         scale=scale,
     )
@@ -500,6 +427,14 @@ VARLEN_PREFILL_CASES = [
 CHUNKED_PREFILL_CASES = [
     pytest.param([64], [128], 1, 1, "auto", 6, id="chunked-full-h1"),
     pytest.param([31, 63], [33, 65], 1, 2, 1.0, 7, id="gva-chunked-tails"),
+]
+
+
+ZERO_LOG_GATE_CASES = [
+    pytest.param([256], 1, 1, False, 1, 10, id="full-256-all"),
+    pytest.param([256], 1, 2, False, 5, 11, id="gva-256-every5"),
+    pytest.param([100, 37, 300], 1, 1, True, 1, 12, id="varlen-all"),
+    pytest.param([100, 37, 300], 2, 2, True, 5, 13, id="varlen-every5-h2"),
 ]
 
 
@@ -552,6 +487,41 @@ def test_gdn_prefill_alpha_space_matches_reference() -> None:
         varlen=False,
         seed=seed,
         is_log_space=False,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "seq_lens",
+        "num_qk_heads",
+        "num_v_heads",
+        "varlen",
+        "unit_alpha_stride",
+        "seed_offset",
+    ),
+    ZERO_LOG_GATE_CASES,
+)
+def test_gdn_prefill_zero_log_gate_matches_reference(
+    seq_lens: list[int],
+    num_qk_heads: int,
+    num_v_heads: int,
+    varlen: bool,
+    unit_alpha_stride: int,
+    seed_offset: int,
+) -> None:
+    # log g == 0 (no decay) makes the in-chunk cumsum flat, so the causal mask must
+    # come from token order, not from the sign of the rounded cumsum difference.
+    seed = int(os.environ.get("SEED", "0")) + seed_offset
+    _test_prefill_kernel(
+        dtype_name="float16",
+        num_qk_heads=num_qk_heads,
+        num_v_heads=num_v_heads,
+        seq_lens=seq_lens,
+        scale=1.0,
+        use_initial_state=True,
+        varlen=varlen,
+        seed=seed,
+        unit_alpha_stride=unit_alpha_stride,
     )
 
 
@@ -631,3 +601,458 @@ def test_gdn_prefill_chunked_matches_reference(
         scale=scale,
         seed=seed,
     )
+
+
+@pytest.mark.parametrize("varlen", [True, False])
+@pytest.mark.parametrize("use_initial_state", [True, False])
+@pytest.mark.parametrize("preallocated_state", [True, False])
+def test_gdn_prefill_zero_tokens(
+    varlen: bool, use_initial_state: bool, preallocated_state: bool
+) -> None:
+    """An input without tokens launches no kernel and passes the state through."""
+    device = _get_runtime_device()
+    _manual_seed(int(os.environ.get("SEED", "0")) + 703, device)
+    num_seqs, num_qk_heads, num_v_heads = 3, 1, 2
+    token_shape = (0,) if varlen else (num_seqs, 0)
+    q = torch.empty(
+        *token_shape, num_qk_heads, HEAD_SIZE, dtype=torch.float16, device=device
+    )
+    k = torch.empty_like(q)
+    v = torch.empty(
+        *token_shape, num_v_heads, HEAD_SIZE, dtype=torch.float16, device=device
+    )
+    g = torch.empty(*token_shape, num_v_heads, dtype=torch.float32, device=device)
+    beta = torch.empty_like(g)
+    cu_seqlens = (
+        torch.zeros(num_seqs + 1, dtype=torch.int32, device=device) if varlen else None
+    )
+    initial_state = 0.05 * torch.randn(
+        num_seqs, num_v_heads, HEAD_SIZE, HEAD_SIZE, device=device
+    )
+    output_state = (
+        torch.full_like(initial_state, float("nan")) if preallocated_state else None
+    )
+
+    o, final_state = chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=HEAD_SIZE**-0.5,
+        initial_state=initial_state if use_initial_state else None,
+        output_final_state=True,
+        output_state=output_state,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=True,
+    )
+    _synchronize(device)
+
+    assert o.shape == v.shape
+    expected = initial_state if use_initial_state else torch.zeros_like(initial_state)
+    assert torch.equal(final_state, expected)
+    if preallocated_state:
+        assert final_state.data_ptr() == output_state.data_ptr()
+
+
+@pytest.mark.parametrize("varlen", [True, False])
+def test_gdn_prefill_mp32_state_checkpoints_zero_tokens(varlen: bool) -> None:
+    device = _get_runtime_device()
+    if get_arch(device) != MP32_ARCH:
+        pytest.skip("state checkpoints are only implemented by the MP32 kernel")
+    from mate.gdn_kernels.tilelang.mp32.gdn_prefill import fused_chunk_gdn_prefill
+
+    num_seqs, num_v_heads = 2, 2
+    batch = 1 if varlen else num_seqs
+    q = torch.empty(batch, 0, 1, HEAD_SIZE, dtype=torch.float16, device=device)
+    v = torch.empty(
+        batch, 0, num_v_heads, HEAD_SIZE, dtype=torch.float16, device=device
+    )
+    g = torch.empty(batch, 0, num_v_heads, dtype=torch.float32, device=device)
+    initial_state = 0.05 * torch.randn(
+        num_seqs, num_v_heads, HEAD_SIZE, HEAD_SIZE, device=device
+    )
+    cu_seqlens = (
+        torch.zeros(num_seqs + 1, dtype=torch.int32, device=device) if varlen else None
+    )
+
+    o, checkpoints, ht = fused_chunk_gdn_prefill(
+        q,
+        torch.empty_like(q),
+        v,
+        None,
+        g,
+        torch.empty_like(g),
+        initial_state=initial_state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        l2norm_eps=1e-6,
+        checkpoint_every_n_tokens=CHUNK_SIZE,
+    )
+    _synchronize(device)
+
+    assert o.shape == v.shape
+    rows = num_seqs if varlen else 0
+    assert checkpoints.shape == (rows, num_v_heads, HEAD_SIZE, HEAD_SIZE)
+    assert torch.equal(ht, initial_state)
+
+
+@pytest.mark.parametrize("every_n_tokens", [CHUNK_SIZE, 3 * CHUNK_SIZE])
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize(
+    ("seq_lens", "varlen"),
+    [([100, 64, 200, 0, 193], True), ([192, 192], False)],
+)
+def test_gdn_prefill_mp32_state_checkpoints(
+    every_n_tokens: int, dtype_name: str, seq_lens: list[int], varlen: bool
+) -> None:
+    device = _get_runtime_device()
+    if get_arch(device) != MP32_ARCH:
+        pytest.skip("state checkpoints are only implemented by the MP32 kernel")
+    from mate.gdn_kernels.tilelang.mp32.gdn_prefill import fused_chunk_gdn_prefill
+
+    _manual_seed(int(os.environ.get("SEED", "0")) + 700, device)
+    dtype = getattr(torch, dtype_name)
+    num_qk_heads, num_v_heads, scale, eps = 2, 4, HEAD_SIZE**-0.5, 1e-6
+    q, k, v = gen_qkv(seq_lens, num_qk_heads, num_v_heads, HEAD_SIZE, dtype, device)
+    g, beta = gen_gates(sum(seq_lens), num_v_heads, device)
+    initial_state = 0.05 * torch.randn(
+        len(seq_lens), num_v_heads, HEAD_SIZE, HEAD_SIZE, device=device
+    )
+    q_in, k_in, v_in, g_in, beta_in, cu_seqlens = _to_kernel_inputs(
+        q, k, v, g, beta, seq_lens, varlen=varlen, device=device
+    )
+    if varlen:
+        q_in, k_in, v_in, g_in, beta_in = (
+            x.unsqueeze(0) for x in (q_in, k_in, v_in, g_in, beta_in)
+        )
+
+    def run(every_n: int):
+        return fused_chunk_gdn_prefill(
+            q_in,
+            k_in,
+            v_in,
+            None,
+            torch.log(g_in),
+            beta_in,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            l2norm_eps=eps,
+            checkpoint_every_n_tokens=every_n,
+        )
+
+    o_ref_kernel, none, ht_ref_kernel = run(0)
+    o, checkpoints, ht = run(every_n_tokens)
+    _synchronize(device)
+
+    # Storing checkpoints must not change o / final_state.
+    assert none is None
+    assert torch.equal(o, o_ref_kernel)
+    assert torch.equal(ht, ht_ref_kernel)
+
+    counts = [(n + every_n_tokens - 1) // every_n_tokens for n in seq_lens]
+    total = sum(seq_lens)
+    rows = max(total // every_n_tokens + len(seq_lens), 1) if varlen else sum(counts)
+    assert checkpoints.shape == (rows, num_v_heads, HEAD_SIZE, HEAD_SIZE)
+    assert checkpoints.dtype == dtype
+    first = exclusive_cumsum(counts)
+    stored = checkpoints[: first[-1]]
+
+    # The first checkpoint of every non-empty sequence is the initial state.
+    for seq_idx, row in enumerate(first[:-1]):
+        if counts[seq_idx]:
+            assert torch.equal(stored[row], initial_state[seq_idx].to(dtype))
+
+    # Each checkpoint is the reference state before tokens 0, N, 2N, ...
+    ref_q, ref_k = _reference_qk(q, k, True, eps)
+    chunk_states: list[torch.Tensor] = []
+    blockwise_gdn_prefill_reference(
+        ref_q,
+        ref_k,
+        v.float(),
+        g,
+        beta,
+        seq_lens,
+        initial_state=initial_state,
+        chunk_size=CHUNK_SIZE,
+        scale=scale,
+        chunk_states=chunk_states,
+    )
+    stride = every_n_tokens // CHUNK_SIZE
+    chunks = [(n + CHUNK_SIZE - 1) // CHUNK_SIZE for n in seq_lens]
+    picked = [
+        chunk_states[c0 + c]
+        for c0, n in zip(exclusive_cumsum(chunks), chunks)
+        for c in range(0, n, stride)
+    ]
+    tol = 2e-2 if dtype == torch.bfloat16 else 1e-2
+    torch.testing.assert_close(stored.float(), torch.stack(picked), rtol=tol, atol=tol)
+
+    if every_n_tokens != CHUNK_SIZE:
+        # A coarser cadence stores exactly a subset of the per-chunk states.
+        _, per_chunk, _ = run(CHUNK_SIZE)
+        _synchronize(device)
+        subset = [
+            c0 + c
+            for c0, n in zip(exclusive_cumsum(chunks), chunks)
+            for c in range(0, n, stride)
+        ]
+        assert torch.equal(stored, per_chunk[subset])
+
+
+def test_gdn_prefill_state_checkpoints_public_api() -> None:
+    device = _get_runtime_device()
+    _manual_seed(int(os.environ.get("SEED", "0")) + 704, device)
+    seq_lens = [130, 64]
+    q, k, v = gen_qkv(seq_lens, 1, 2, HEAD_SIZE, torch.float16, device)
+    g, beta = gen_gates(sum(seq_lens), 2, device)
+    cu_seqlens = torch.tensor(
+        exclusive_cumsum(seq_lens), device=device, dtype=torch.int32
+    )
+
+    def call(every_n: int):
+        return chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=torch.log(g),
+            beta=beta,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=True,
+            checkpoint_every_n_tokens=every_n,
+        )
+
+    if get_arch(device) != MP32_ARCH:
+        with pytest.raises(NotImplementedError):
+            call(CHUNK_SIZE)
+        return
+    with pytest.raises(ValueError):
+        call(CHUNK_SIZE + 1)
+    o_ref, ht_ref = call(0)
+    o, ht, checkpoints = call(2 * CHUNK_SIZE)
+    _synchronize(device)
+    assert torch.equal(o, o_ref)
+    assert torch.equal(ht, ht_ref)
+    assert checkpoints.shape == (sum(seq_lens) // 128 + 2, 2, HEAD_SIZE, HEAD_SIZE)
+    assert checkpoints.dtype == q.dtype
+
+
+def test_gdn_prefill_mp32_varlen_tail_ignores_memory_after_rnorm(monkeypatch) -> None:
+    """Padded rows of the last tail chunk must not read past the rnorm buffer."""
+    device = _get_runtime_device()
+    if get_arch(device) != MP32_ARCH:
+        pytest.skip("q/k norm folding is only implemented by the MP32 kernel")
+    import mate.gdn_kernels.tilelang.mp32.gdn_prefill as mp32_prefill
+
+    _manual_seed(int(os.environ.get("SEED", "0")) + 702, device)
+    seq_lens = [100, 37, 300]
+    num_qk_heads, num_v_heads = 2, 2
+    q, k, v = gen_qkv(
+        seq_lens, num_qk_heads, num_v_heads, HEAD_SIZE, torch.float16, device
+    )
+    g, beta = gen_gates(sum(seq_lens), num_v_heads, device)
+    initial_state = 0.05 * torch.randn(
+        len(seq_lens), num_v_heads, HEAD_SIZE, HEAD_SIZE, device=device
+    )
+    cu_seqlens = torch.tensor(
+        exclusive_cumsum(seq_lens), device=device, dtype=torch.int32
+    )
+
+    def run():
+        return mp32_prefill.fused_chunk_gdn_prefill(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            None,
+            torch.log(g).unsqueeze(0),
+            beta.unsqueeze(0),
+            scale=HEAD_SIZE**-0.5,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            l2norm_eps=1e-6,
+        )
+
+    o_ref, _, ht_ref = run()
+    rnorm = mp32_prefill.gdn_qk_rnorm
+
+    def rnorm_followed_by_nan(q, k, eps, *args, **kwargs):
+        rn = rnorm(q, k, eps, *args, **kwargs)
+        padded = torch.full(
+            (rn.numel() + 4096,), float("nan"), dtype=rn.dtype, device=rn.device
+        )
+        padded[: rn.numel()] = rn.reshape(-1)
+        return padded[: rn.numel()].view(rn.shape)
+
+    monkeypatch.setattr(mp32_prefill, "gdn_qk_rnorm", rnorm_followed_by_nan)
+    o, _, ht = run()
+    _synchronize(device)
+
+    assert torch.isfinite(o).all() and torch.isfinite(ht).all()
+    assert torch.equal(o, o_ref)
+    assert torch.equal(ht, ht_ref)
+
+
+def _mp32_prefill_from_seq(
+    q, k, v, g, beta, initial_state, seq_len: int, start_seq: int, **kwargs
+):
+    """Run sequences ``start_seq..`` of an equal-length varlen batch on MP32."""
+    from mate.gdn_kernels.tilelang.mp32.gdn_prefill import fused_chunk_gdn_prefill
+
+    total = q.shape[1]
+    tokens = slice(start_seq * seq_len, total)
+    return fused_chunk_gdn_prefill(
+        q[:, tokens],
+        k[:, tokens],
+        v[:, tokens],
+        None,
+        g[:, tokens],
+        beta[:, tokens],
+        scale=HEAD_SIZE**-0.5,
+        initial_state=initial_state[start_seq:],
+        output_final_state=True,
+        cu_seqlens=torch.arange(
+            0,
+            total - start_seq * seq_len + 1,
+            seq_len,
+            dtype=torch.int32,
+            device=q.device,
+        ),
+        l2norm_eps=1e-6,
+        **kwargs,
+    )
+
+
+def test_gdn_prefill_mp32_state_checkpoints_over_2gib() -> None:
+    """Checkpoints past 2**31 bytes must be stored with 64-bit addresses."""
+    device = _get_runtime_device()
+    if get_arch(device) != MP32_ARCH:
+        pytest.skip("state checkpoints are only implemented by the MP32 kernel")
+
+    _manual_seed(int(os.environ.get("SEED", "0")) + 701, device)
+    # 4 seqs x 258 chunks x 64 heads x 128 x 128 x fp16 = 2.16 GB > 2**31 B.
+    num_seqs, chunks_per_seq, num_qk_heads, num_v_heads = 4, 258, 16, 64
+    seq_len = chunks_per_seq * CHUNK_SIZE
+    total = num_seqs * seq_len
+    q = torch.randn(
+        1, total, num_qk_heads, HEAD_SIZE, dtype=torch.float16, device=device
+    )
+    k = torch.randn_like(q)
+    v = torch.randn(
+        1, total, num_v_heads, HEAD_SIZE, dtype=torch.float16, device=device
+    )
+    g = -torch.rand(1, total, num_v_heads, device=device)
+    beta = torch.sigmoid(torch.randn(1, total, num_v_heads, device=device))
+    initial_state = 0.05 * torch.randn(
+        num_seqs, num_v_heads, HEAD_SIZE, HEAD_SIZE, device=device
+    )
+
+    def run(start_seq: int):
+        return _mp32_prefill_from_seq(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state,
+            seq_len,
+            start_seq,
+            checkpoint_every_n_tokens=CHUNK_SIZE,
+        )
+
+    o, h, ht = run(0)
+    used = num_seqs * chunks_per_seq
+    assert h[:used].numel() * h.element_size() > 2**31
+    # Sequences are independent, so the last one alone (small h) must match bitwise.
+    o_last, h_last, ht_last = run(num_seqs - 1)
+    _synchronize(device)
+
+    assert torch.equal(o[:, -seq_len:], o_last)
+    assert torch.equal(ht[-1:], ht_last)
+    assert torch.equal(h[used - chunks_per_seq : used], h_last[:chunks_per_seq])
+    for seq_idx in range(num_seqs):
+        assert torch.equal(
+            h[seq_idx * chunks_per_seq], initial_state[seq_idx].to(torch.float16)
+        )
+
+
+def test_gdn_prefill_mp32_fused_qkv_over_2gib() -> None:
+    """q/k/v split from one fused qkv that spans more than 2**31 bytes."""
+    device = _get_runtime_device()
+    if get_arch(device) != MP32_ARCH:
+        pytest.skip("the read-only rnorm kernel is only used on MP32")
+
+    _manual_seed(int(os.environ.get("SEED", "0")) + 702, device)
+    # Qwen3.5-397B TP1 heads: 6 x 16384 tokens x (16 + 16 + 64) x 128 x fp16 = 2.42 GB.
+    num_seqs, seq_len, num_qk_heads, num_v_heads = 6, 16384, 16, 64
+    total = num_seqs * seq_len
+    mixed_qkv = torch.randn(
+        1,
+        total,
+        (2 * num_qk_heads + num_v_heads) * HEAD_SIZE,
+        dtype=torch.float16,
+        device=device,
+    )
+    assert mixed_qkv.numel() * mixed_qkv.element_size() > 2**31
+    q, k, v = torch.split(
+        mixed_qkv,
+        [num_qk_heads * HEAD_SIZE, num_qk_heads * HEAD_SIZE, num_v_heads * HEAD_SIZE],
+        dim=-1,
+    )
+    q = q.view(1, total, num_qk_heads, HEAD_SIZE)
+    k = k.view(1, total, num_qk_heads, HEAD_SIZE)
+    v = v.view(1, total, num_v_heads, HEAD_SIZE)
+    g = -torch.rand(1, total, num_v_heads, device=device)
+    beta = torch.sigmoid(torch.randn(1, total, num_v_heads, device=device))
+    initial_state = 0.05 * torch.randn(
+        num_seqs, num_v_heads, HEAD_SIZE, HEAD_SIZE, device=device
+    )
+
+    o, _, ht = _mp32_prefill_from_seq(q, k, v, g, beta, initial_state, seq_len, 0)
+    # Sequences are independent; the last one alone spans far less than 2**31 bytes.
+    o_last, _, ht_last = _mp32_prefill_from_seq(
+        q, k, v, g, beta, initial_state, seq_len, num_seqs - 1
+    )
+    _synchronize(device)
+
+    assert torch.isfinite(o).all() and torch.isfinite(ht).all()
+    assert torch.equal(o[:, -seq_len:], o_last)
+    assert torch.equal(ht[-1:], ht_last)
+
+
+def test_gdn_prefill_mp32_states_over_2gib() -> None:
+    """Initial / final states past 2**31 bytes must use 64-bit addresses."""
+    device = _get_runtime_device()
+    if get_arch(device) != MP32_ARCH:
+        pytest.skip("covers the MP32 kernel's state addressing")
+
+    _manual_seed(int(os.environ.get("SEED", "0")) + 703, device)
+    # 516 seqs x 64 heads x 128 x 128 x fp32 = 2.16 GB > 2**31 B.
+    num_seqs, seq_len, num_qk_heads, num_v_heads = 516, CHUNK_SIZE, 16, 64
+    total = num_seqs * seq_len
+    q = torch.randn(
+        1, total, num_qk_heads, HEAD_SIZE, dtype=torch.float16, device=device
+    )
+    k = torch.randn_like(q)
+    v = torch.randn(
+        1, total, num_v_heads, HEAD_SIZE, dtype=torch.float16, device=device
+    )
+    g = -torch.rand(1, total, num_v_heads, device=device)
+    beta = torch.sigmoid(torch.randn(1, total, num_v_heads, device=device))
+    initial_state = 0.05 * torch.randn(
+        num_seqs, num_v_heads, HEAD_SIZE, HEAD_SIZE, device=device
+    )
+    assert initial_state.numel() * initial_state.element_size() > 2**31
+
+    o, _, ht = _mp32_prefill_from_seq(q, k, v, g, beta, initial_state, seq_len, 0)
+    o_last, _, ht_last = _mp32_prefill_from_seq(
+        q, k, v, g, beta, initial_state, seq_len, num_seqs - 1
+    )
+    _synchronize(device)
+
+    assert torch.isfinite(o).all() and torch.isfinite(ht).all()
+    assert torch.equal(o[:, -seq_len:], o_last)
+    assert torch.equal(ht[-1:], ht_last)

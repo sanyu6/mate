@@ -6,6 +6,7 @@ import torch
 import torch_musa  # noqa: F401
 from mate import flash_attn_varlen_func
 from mate.execution_context import (
+    MateDryRunComplete,
     is_dry_run_enabled,
     raise_complete_if_dry_run,
 )
@@ -14,6 +15,9 @@ from mate.flash_attention.tilelang.flash_attention_varlen_bwd import (
 )
 from typing import NamedTuple, Optional  # noqa: F401
 from mate.testing import supported_musa_compute_capability
+
+
+pytestmark = pytest.mark.mate_dry_run
 
 
 def ref_attn(
@@ -74,13 +78,14 @@ def ref_attn(
             mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
             attn.masked_fill_(mask, float("-inf"))
 
-        # LSE (head, query)
-        lse = torch.logsumexp(attn, dim=-1)  # shape [H, Q]
-        lse = torch.nan_to_num(lse)
-        lse_outputs.append(lse)
+        # Keep all-masked rows at zero probability and zero gradient without
+        # differentiating logsumexp(-inf), whose derivative is undefined.
+        has_keys = torch.isfinite(attn).any(dim=-1)
+        norm = torch.logsumexp(torch.where(has_keys.unsqueeze(-1), attn, 0.0), dim=-1)
+        lse_outputs.append(torch.where(has_keys, norm, float("-inf")))
 
         # softmax = exp(score - lse)
-        attn = torch.exp(attn - lse.unsqueeze(-1)).to(v.dtype)
+        attn = torch.exp(attn - norm.unsqueeze(-1)).to(v.dtype)
 
         # output
         out = torch.einsum("hqk,khd->qhd", attn, v)
@@ -188,6 +193,7 @@ def _run_fmha_case(
     max_kv_len: Optional[int],
     is_causal: bool,
     deterministic: bool,
+    backend: str,
 ) -> FmhaRunResult:
     q_fa, k_fa, v_fa = map(clone_with_grad, (query, key_cache, value_cache))
     out_fa = flash_attn_varlen_func(
@@ -200,6 +206,7 @@ def _run_fmha_case(
         max_seqlen_k=max_kv_len,
         causal=is_causal,
         deterministic=deterministic,
+        backend=backend,
     )
     out_fa.backward(gradient=grad_out.detach().clone())
     torch.musa.synchronize()
@@ -234,6 +241,7 @@ def _stress_fmha_bwd_case(
     max_kv_len: Optional[int],
     is_causal: bool,
     deterministic: bool,
+    backend: str,
     ref_result: FmhaRunResult,
     pt_result: FmhaRunResult,
 ) -> None:
@@ -261,6 +269,7 @@ def _stress_fmha_bwd_case(
                 max_kv_len=max_kv_len,
                 is_causal=is_causal,
                 deterministic=deterministic,
+                backend=backend,
             )
         except Exception as exc:
             layout = "varlen" if cu_query_lens is not None else "bshd"
@@ -309,6 +318,7 @@ def _dry_run_fmha_forward_backward(
     max_seqlen_k: Optional[int],
     is_causal: bool,
     deterministic: bool,
+    backend: str,
 ) -> None:
     flash_attn_varlen_func(
         q=q,
@@ -320,6 +330,7 @@ def _dry_run_fmha_forward_backward(
         max_seqlen_k=max_seqlen_k,
         causal=is_causal,
         deterministic=deterministic,
+        backend=backend,
     )
 
     out = torch.empty((*q.shape[:-1], v.shape[-1]), dtype=q.dtype, device=q.device)
@@ -334,61 +345,42 @@ def _dry_run_fmha_forward_backward(
             device=q.device,
         )
 
-    flashattn_varlen_bwd_interface(
-        q,
-        k,
-        v,
-        out,
-        torch.empty_like(out),
-        softmax_lse,
-        max_seqlen_q,
-        max_seqlen_k,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        is_causal=is_causal,
-        smscale=q.shape[-1] ** -0.5,
-        dtype=None,
-        is_bhsd=False,
-        deterministic=deterministic,
-    )
+    try:
+        flashattn_varlen_bwd_interface(
+            q,
+            k,
+            v,
+            out,
+            torch.empty_like(out),
+            softmax_lse,
+            max_seqlen_q,
+            max_seqlen_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            is_causal=is_causal,
+            smscale=q.shape[-1] ** -0.5,
+            dtype=None,
+            is_bhsd=False,
+            deterministic=deterministic,
+        )
+    except MateDryRunComplete:
+        # MP32 signals completion after compiling main and preprocessing/post.
+        # MP31 retains the master branch's return-without-launch convention.
+        pass
     raise_complete_if_dry_run()
 
 
-@supported_musa_compute_capability([31])
-@pytest.mark.parametrize(
-    "seq_lens",
-    [
-        [
-            (512, 512),
-            (511, 511),
-            (384, 384),
-            (257, 257),
-            (128, 128),
-            (65, 65),
-            (320, 320),
-            (192, 192),
-        ]
-    ],
-)
-@pytest.mark.parametrize("num_heads", [(6, 1), (6, 6)])
-@pytest.mark.parametrize(
-    "head_size",
-    [(64, 64), (100, 80), (128, 128), (192, 128), (192, 192), (256, 256)],
-)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("is_causal", [True, False])
-@pytest.mark.parametrize("is_varlen", [True])
-@pytest.mark.parametrize("deterministic", [True, False])
-def test_varlen_fast_attn(
+def _run_varlen_fast_attn(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     head_size: tuple[int, int],
     dtype: torch.dtype,
     is_causal: bool,
-    is_varlen: bool,
     deterministic: bool,
+    backend: str,
     pytestconfig: pytest.Config,
 ) -> None:
+    is_varlen = True
     torch.manual_seed(42)
     torch.musa.manual_seed(42)
     device = torch.device("musa")
@@ -449,6 +441,7 @@ def test_varlen_fast_attn(
             max_seqlen_k=max_kv_len,
             is_causal=is_causal,
             deterministic=deterministic,
+            backend=backend,
         )
         return
 
@@ -462,6 +455,7 @@ def test_varlen_fast_attn(
         max_seqlen_k=max_kv_len,
         causal=is_causal,
         deterministic=deterministic,
+        backend=backend,
     )
 
     grad_out = torch.randn_like(out_fa)
@@ -525,13 +519,28 @@ def test_varlen_fast_attn(
         max_kv_len=max_kv_len,
         is_causal=is_causal,
         deterministic=deterministic,
+        backend=backend,
         ref_result=_detach_result(ref_output, dq_t, dk_t, dv_t),
         pt_result=_detach_result(pt_output, dq_pt, dk_pt, dv_pt),
     )
 
 
 @supported_musa_compute_capability([31])
-@pytest.mark.parametrize("seq_lens", [[(511, 511)], [(63, 63)]])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [
+            (512, 512),
+            (511, 511),
+            (384, 384),
+            (257, 257),
+            (128, 128),
+            (65, 65),
+            (320, 320),
+            (192, 192),
+        ]
+    ],
+)
 @pytest.mark.parametrize("num_heads", [(6, 1), (6, 6)])
 @pytest.mark.parametrize(
     "head_size",
@@ -539,18 +548,87 @@ def test_varlen_fast_attn(
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("is_causal", [True, False])
-@pytest.mark.parametrize("is_varlen", [False])
 @pytest.mark.parametrize("deterministic", [True, False])
-def test_bshd_fast_attn(
+def test_varlen_fast_attn(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     head_size: tuple[int, int],
     dtype: torch.dtype,
     is_causal: bool,
-    is_varlen: bool,
     deterministic: bool,
     pytestconfig: pytest.Config,
 ) -> None:
+    _run_varlen_fast_attn(
+        seq_lens,
+        num_heads,
+        head_size,
+        dtype,
+        is_causal,
+        deterministic,
+        "auto",
+        pytestconfig,
+    )
+
+
+@supported_musa_compute_capability([32])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [
+            (512, 512),
+            (511, 511),
+            (384, 384),
+            (257, 257),
+            (128, 128),
+            (65, 65),
+            (320, 320),
+            (192, 192),
+        ],
+        [(65, 97), (129, 257)],
+        [(97, 65), (257, 129)],
+    ],
+)
+@pytest.mark.parametrize(
+    "num_heads", [(6, 1), (6, 2), (6, 6)], ids=["mqa", "gqa", "mha"]
+)
+@pytest.mark.parametrize(
+    "head_size",
+    [(64, 64), (128, 128), (192, 128), (192, 192), (256, 256)],
+    ids=["d64", "d128", "d192v128", "d192", "d256"],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("is_causal", [True, False], ids=["causal", "noncausal"])
+def test_tilelang_mp32_varlen_backward(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: tuple[int, int],
+    dtype: torch.dtype,
+    is_causal: bool,
+    pytestconfig: pytest.Config,
+) -> None:
+    _run_varlen_fast_attn(
+        seq_lens,
+        num_heads,
+        head_size,
+        dtype,
+        is_causal,
+        False,
+        "tilelang",
+        pytestconfig,
+    )
+
+
+def _run_bshd_fast_attn(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: tuple[int, int],
+    dtype: torch.dtype,
+    is_causal: bool,
+    deterministic: bool,
+    backend: str,
+    pytestconfig: pytest.Config,
+) -> None:
+    is_varlen = False
     torch.manual_seed(42)
     torch.musa.manual_seed(42)
     device = torch.device("musa")
@@ -600,6 +678,7 @@ def test_bshd_fast_attn(
             max_seqlen_k=None,
             is_causal=is_causal,
             deterministic=deterministic,
+            backend=backend,
         )
         return
 
@@ -613,6 +692,7 @@ def test_bshd_fast_attn(
         max_seqlen_k=None,
         causal=is_causal,
         deterministic=deterministic,
+        backend=backend,
     )
 
     grad_out = torch.randn_like(out_fa)
@@ -676,6 +756,70 @@ def test_bshd_fast_attn(
         max_kv_len=None,
         is_causal=is_causal,
         deterministic=deterministic,
+        backend=backend,
         ref_result=_detach_result(ref_output, dq_t, dk_t, dv_t),
         pt_result=_detach_result(pt_output, dq_pt, dk_pt, dv_pt),
+    )
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("seq_lens", [[(511, 511)], [(63, 63)]])
+@pytest.mark.parametrize("num_heads", [(6, 1), (6, 6)])
+@pytest.mark.parametrize(
+    "head_size",
+    [(64, 64), (100, 80), (128, 128), (192, 128), (192, 192), (256, 256)],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("is_causal", [True, False])
+@pytest.mark.parametrize("deterministic", [True, False])
+def test_bshd_fast_attn(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: tuple[int, int],
+    dtype: torch.dtype,
+    is_causal: bool,
+    deterministic: bool,
+    pytestconfig: pytest.Config,
+) -> None:
+    _run_bshd_fast_attn(
+        seq_lens,
+        num_heads,
+        head_size,
+        dtype,
+        is_causal,
+        deterministic,
+        "auto",
+        pytestconfig,
+    )
+
+
+@supported_musa_compute_capability([32])
+@pytest.mark.parametrize("seq_lens", [[(511, 511)], [(63, 63)], [(65, 97), (65, 97)]])
+@pytest.mark.parametrize(
+    "num_heads", [(6, 1), (6, 2), (6, 6)], ids=["mqa", "gqa", "mha"]
+)
+@pytest.mark.parametrize(
+    "head_size",
+    [(64, 64), (128, 128), (192, 128), (192, 192), (256, 256)],
+    ids=["d64", "d128", "d192v128", "d192", "d256"],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("is_causal", [True, False], ids=["causal", "noncausal"])
+def test_tilelang_mp32_bshd_backward(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: tuple[int, int],
+    dtype: torch.dtype,
+    is_causal: bool,
+    pytestconfig: pytest.Config,
+) -> None:
+    _run_bshd_fast_attn(
+        seq_lens,
+        num_heads,
+        head_size,
+        dtype,
+        is_causal,
+        False,
+        "tilelang",
+        pytestconfig,
     )

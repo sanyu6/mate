@@ -49,6 +49,7 @@ quantization, reusable decode scheduler metadata, and FP8 sparse decode.
 
 - ``mate.sparse_mla_interface.mla_rope_quantize_fp8``
 - ``mate.sparse_mla_interface.sparse_mla_fp8_decode``
+- ``mate.sparse_mla_nope_decode``
 
 SageAttention
 -------------
@@ -71,6 +72,10 @@ helpers.
 - ``mate.gemm.ragged_k_moe_gemm_8bit``
 - ``mate.gemm.ragged_k_moe_gemm_16bit``
 - ``mate.gemm.masked_moe_gemm_8bit``
+- ``mate.gemm.transform_mxfp_sf``
+- ``mate.gemm.ragged_m_moe_gemm_mxfp``
+- ``mate.gemm.masked_moe_gemm_mxfp``
+- ``mate.gemm.ragged_k_moe_gemm_mxfp``
 - ``mate.gemm.masked_moe_gemm_16bit``
 - ``mate.gemm.ragged_moe_gemm_mixed_dtype``
 - ``mate.gemm.masked_moe_gemm_mixed_dtype``
@@ -80,18 +85,26 @@ helpers.
 - ``mate.deep_gemm.tf32_hc_prenorm_gemm``
 - ``mate.deep_gemm.fp8_gemm_nt_skip_head_mid``
 - ``mate.deep_gemm.get_paged_mqa_logits_metadata``
+- ``mate.deep_gemm.paged_mqa_logits``
 - ``mate.deep_gemm.fp8_paged_mqa_logits``
+- ``mate.deep_gemm.get_mqa_logits_metadata``
+- ``mate.deep_gemm.mqa_logits``
 
 Mega MoE
 --------
 
+- ``mate.fp8_fp4_mega_moe`` (MP32 prefill, packed FP4 weights)
+
+
 Distributed :doc:`Mega MoE <api/mega_moe>` entrypoints for DeepGEMM-style
 expert execution across a process group. Use this path when you need the
-fused distributed FP8 expert runtime rather than a single MoE GEMM operator.
+split-prefill distributed FP8 expert runtime rather than a single MoE GEMM
+operator.
 The same APIs are available through ``mate.deep_gemm`` and ``mate.mega_moe``;
 the ``mate.deep_gemm`` aliases are the usual integration surface.
 
 - ``mate.deep_gemm.get_symm_buffer_for_mega_moe``
+- ``mate.deep_gemm.get_token_alignment_for_mega_moe``
 - ``mate.deep_gemm.transform_weights_for_mega_moe``
 - ``mate.deep_gemm.fp8_fp8_mega_moe``
 
@@ -123,19 +136,6 @@ the ``flash_kda`` wrapper is not the right integration surface.
 - ``mate.chunk_kda``
 - ``mate.kda.chunk_kda``
 - ``mate.kda.gated_delta_rule_decode``
-
-Mamba / SSU
------------
-
-Direct :doc:`Mamba SSU <api/mamba>` entrypoints for the Mamba2 selective state
-update on a single decode step, exposed both as the native MATE family and as the
-FlashInfer-shaped compatibility surface used by serving frameworks.
-
-- ``mate.selective_state_update``
-- ``mate.mamba.selective_state_update``
-- ``mate.mamba.prewarm_selective_state_update``
-- ``mate.mamba.ssd_combined_fwd_varlen``
-- ``mate.mamba.prewarm_ssd_combined_fwd_varlen``
 
 MSA
 ---

@@ -8,11 +8,11 @@
 
 namespace mate::attention::msa {
 
-// Two adjacent query tokens share one physical M16 SQMMA tile.  This
-// scheduler intentionally keeps pairs inside one varlen request; the last
-// tile of an odd-length request carries q_count == 1.
-struct MsaFwdPairTileScheduler {
-  static constexpr int QTokensPerTile = 2;
+// Adjacent queries share one SQMMA tile without crossing a varlen request.
+// The last group records only the queries present in that request.
+template <int QTokensPerTile_, bool ReuseMetadata = true>
+struct MsaFwdQueryGroupTileScheduler {
+  static constexpr int QTokensPerTile = QTokensPerTile_;
   static constexpr int CtasPerMp      = 4;
 
   struct Arguments {
@@ -161,6 +161,10 @@ struct MsaFwdPairTileScheduler {
   }
 
   MUTLASS_DEVICE WorkTileInfo get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+    if constexpr (!ReuseMetadata) {
+      // Retain only the work index across compute; decode the next tile afresh.
+      return make_work_tile(params, current_work.work_idx + static_cast<int>(gridDim.x));
+    }
     return make_next_work_tile(params, current_work);
   }
 
@@ -168,5 +172,7 @@ struct MsaFwdPairTileScheduler {
     return work_info.q_count > 0;
   }
 };
+
+struct Mp31MsaFwdPairTileScheduler : MsaFwdQueryGroupTileScheduler<2> {};
 
 }  // namespace mate::attention::msa

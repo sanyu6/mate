@@ -10,7 +10,9 @@ from typing import Sequence
 import torch
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 
-from mate import msa_interface as msa
+from importlib import import_module
+
+
 from .operator import (
     Operator,
     OperatorInputs,
@@ -18,6 +20,11 @@ from .operator import (
     OperatorReference,
     OperatorWorkload,
 )
+
+
+def _msa():
+    return import_module("mate.msa_interface")
+
 
 _FP8_E4M3_DTYPE = getattr(torch, "float8_e4m3fn", None)
 _DTYPE_NAMES = {
@@ -197,6 +204,28 @@ class MsaWorkload(OperatorWorkload):
 
 @dataclass(kw_only=True)
 class MsaInputs(OperatorInputs):
+    api: MsaApi | None = None
+    kernel_mode: MsaKernelMode | None = None
+    kv_layout: MsaKvLayout | None = None
+    num_q_heads: int | None = None
+    num_kv_heads: int | None = None
+    head_dim: int | None = None
+    causal: bool | None = None
+    page_size: int | None = None
+    sparse_block_size: int | None = None
+    topk: int | None = None
+    softmax_scale: float | None = None
+    k_scale: float | None = None
+    v_scale: float | None = None
+    num_valid_pages: int | None = None
+    force_begin_blocks: int | None = None
+    force_end_blocks: int | None = None
+    force_blocks_count_in_topk: bool | None = None
+    q_lengths: Sequence[int] | None = None
+    kv_lengths: Sequence[int] | None = None
+    preallocated_output: bool | None = None
+    preallocated_max_score: bool | None = None
+    lse: torch.Tensor | None = None
     workload: MsaWorkload | None = None
 
     q: torch.Tensor | None = None
@@ -213,6 +242,49 @@ class MsaInputs(OperatorInputs):
     out: torch.Tensor | None = None
     query_positions: torch.Tensor | None = None
 
+    def __post_init__(self) -> None:
+        defaults = dict(
+            kernel_mode=MsaKernelMode.PREFILL,
+            kv_layout=MsaKvLayout.PAGED,
+            causal=True,
+            page_size=128,
+            sparse_block_size=128,
+            topk=16,
+            k_scale=1.0,
+            v_scale=1.0,
+            force_begin_blocks=0,
+            force_end_blocks=0,
+            force_blocks_count_in_topk=True,
+            preallocated_output=False,
+            preallocated_max_score=False,
+        )
+        names = (
+            "api",
+            "num_q_heads",
+            "num_kv_heads",
+            "head_dim",
+            "softmax_scale",
+            "num_valid_pages",
+            "q_lengths",
+            "kv_lengths",
+            *defaults,
+        )
+        for name in names:
+            if getattr(self, name) is None:
+                value = (
+                    getattr(self.workload, name)
+                    if self.workload is not None
+                    else defaults.get(name)
+                )
+                setattr(self, name, value)
+        if self.q is not None:
+            if self.num_q_heads is None:
+                self.num_q_heads = self.q.shape[-2]
+            if self.head_dim is None:
+                self.head_dim = self.q.shape[-1]
+        if self.k is not None and self.num_kv_heads is None:
+            self.num_kv_heads = self.k.shape[1]
+
 
 @dataclass(frozen=True, kw_only=True)
 class MsaOutputs(OperatorOutputs):
@@ -224,6 +296,7 @@ class MsaOutputs(OperatorOutputs):
 
 @dataclass(frozen=True, kw_only=True)
 class MsaReference(OperatorReference):
+    lse: torch.Tensor | None = None
     out: torch.Tensor | None = None
     out_fp32: torch.Tensor | None = None
     max_score: torch.Tensor | None = None
@@ -242,22 +315,20 @@ class MsaOperator(Operator):
         return self._generate_sparse_fwd(workload)
 
     def call(self, inputs):
-        workload = inputs.workload
-        if workload is None:
-            raise ValueError("operator inputs must carry their workload")
-        if workload.api is MsaApi.MAXSCORE:
+        if not isinstance(inputs.api, MsaApi):
+            raise ValueError("operator inputs must specify api")
+        if inputs.api is MsaApi.MAXSCORE:
             return self._call_maxscore(inputs)
-        if workload.api is MsaApi.SPARSE_TOPK:
+        if inputs.api is MsaApi.SPARSE_TOPK:
             return self._call_sparse_topk(inputs)
         return self._call_sparse_fwd(inputs)
 
     def reference(self, inputs):
-        workload = inputs.workload
-        if workload is None:
-            raise ValueError("operator inputs must carry their workload")
-        if workload.api is MsaApi.MAXSCORE:
+        if not isinstance(inputs.api, MsaApi):
+            raise ValueError("operator inputs must specify api")
+        if inputs.api is MsaApi.MAXSCORE:
             return self._reference_maxscore(inputs)
-        if workload.api is MsaApi.SPARSE_TOPK:
+        if inputs.api is MsaApi.SPARSE_TOPK:
             return self._reference_sparse_topk(inputs)
         return self._reference_sparse_fwd(inputs)
 
@@ -267,32 +338,28 @@ class MsaOperator(Operator):
         outputs,
         reference,
     ) -> None:
-        workload = inputs.workload
-        if workload is None:
-            raise ValueError("operator inputs must carry their workload")
-        if workload.api is MsaApi.MAXSCORE:
+        if not isinstance(inputs.api, MsaApi):
+            raise ValueError("operator inputs must specify api")
+        if inputs.api is MsaApi.MAXSCORE:
             if outputs.max_score is None or reference.max_score is None:
                 raise ValueError("maxscore verification requires max_score outputs")
             if outputs.out is not None:
                 raise AssertionError(
                     "maxscore workloads must not produce attention output"
                 )
-            if workload.preallocated_max_score:
+            if inputs.max_score is not None:
                 if outputs.max_score is not inputs.max_score:
                     raise AssertionError(
                         "MSA maxscore did not reuse the supplied output tensor"
                     )
             self._verify_maxscore(outputs.max_score, reference.max_score)
             return
-        if workload.api is MsaApi.SPARSE_TOPK:
+        if inputs.api is MsaApi.SPARSE_TOPK:
             if outputs.selected_blocks is None or reference.selected_blocks is None:
                 raise ValueError(
                     "sparse-topk verification requires selected block outputs"
                 )
-            if (
-                workload.preallocated_output
-                and outputs.selected_blocks is not inputs.out
-            ):
+            if inputs.out is not None and outputs.selected_blocks is not inputs.out:
                 raise AssertionError(
                     "MSA sparse topk did not reuse the supplied output tensor"
                 )
@@ -304,6 +371,18 @@ class MsaOperator(Operator):
         if outputs.out is None or reference.out is None or reference.out_fp32 is None:
             raise ValueError("sparse-fwd verification requires forward outputs")
         self._verify_sparse_fwd(outputs.out, reference.out_fp32, reference.out)
+        if (outputs.lse is None) != (reference.lse is None):
+            raise AssertionError("MSA LSE presence differs from reference")
+        if reference.lse is not None:
+            torch.testing.assert_close(outputs.lse, reference.lse, atol=2e-2, rtol=2e-2)
+        if inputs.out is not None and outputs.out.data_ptr() != inputs.out.data_ptr():
+            raise AssertionError("MSA output buffer was not reused")
+        if (
+            inputs.lse is not None
+            and outputs.lse is not None
+            and outputs.lse.data_ptr() != inputs.lse.data_ptr()
+        ):
+            raise AssertionError("MSA LSE buffer was not reused")
 
     # ------------------------------------------------------------------
     # Generation
@@ -491,6 +570,11 @@ class MsaOperator(Operator):
             kv_indices=kv_indices,
             kv_block_indexes=kv_block_indexes,
             plan_info=plan_info,
+            lse=torch.empty(
+                (total_q, workload.num_q_heads), device=device, dtype=torch.float32
+            )
+            if workload.kernel_mode is MsaKernelMode.PREFILL
+            else None,
         )
 
     # ------------------------------------------------------------------
@@ -506,7 +590,7 @@ class MsaOperator(Operator):
             or inputs.plan_info is None
         ):
             raise ValueError("maxscore calls require q, k, v, and plan_info")
-        out, max_score = msa.msa(
+        out, max_score = _msa().msa(
             inputs.q,
             inputs.k,
             inputs.v,
@@ -519,26 +603,22 @@ class MsaOperator(Operator):
 
     @staticmethod
     def _call_sparse_topk(inputs: MsaInputs) -> MsaOutputs:
-        workload = inputs.workload
-        assert workload is not None
         if inputs.max_score is None:
             raise ValueError("sparse-topk calls require max_score")
-        selected = msa.sparse_topk_select(
+        selected = _msa().sparse_topk_select(
             inputs.max_score,
-            topk=workload.topk,
-            num_valid_pages=workload.num_valid_pages,
+            topk=inputs.topk,
+            num_valid_pages=inputs.num_valid_pages,
             output=inputs.out,
-            force_begin_blocks=workload.force_begin_blocks,
-            force_end_blocks=workload.force_end_blocks,
-            force_blocks_count_in_topk=workload.force_blocks_count_in_topk,
+            force_begin_blocks=inputs.force_begin_blocks,
+            force_end_blocks=inputs.force_end_blocks,
+            force_blocks_count_in_topk=inputs.force_blocks_count_in_topk,
             query_positions=inputs.query_positions,
         )
         return MsaOutputs(selected_blocks=selected)
 
     @staticmethod
     def _call_sparse_fwd(inputs: MsaInputs) -> MsaOutputs:
-        workload = inputs.workload
-        assert workload is not None
         if (
             inputs.q is None
             or inputs.k is None
@@ -546,31 +626,35 @@ class MsaOperator(Operator):
             or inputs.plan_info is None
         ):
             raise ValueError("sparse-fwd calls require q, k, v, and plan_info")
-        if workload.kernel_mode is MsaKernelMode.PREFILL:
-            out, lse = msa.sparse_msa(
+        if inputs.kernel_mode is MsaKernelMode.PREFILL:
+            out, lse = _msa().sparse_msa(
                 inputs.q,
                 inputs.k,
                 inputs.v,
                 inputs.plan_info,
                 kv_indices=inputs.kv_indices,
                 kv_block_indexes=inputs.kv_block_indexes,
-                sm_scale=workload.softmax_scale,
-                k_scale=workload.k_scale,
-                v_scale=workload.v_scale,
+                sm_scale=inputs.softmax_scale,
+                k_scale=inputs.k_scale,
+                v_scale=inputs.v_scale,
+                out=inputs.out,
+                lse=inputs.lse,
             )
-            return MsaOutputs(out=out, lse=lse)
-        out = msa.sparse_decode_atten_func(
+            return MsaOutputs(out=out, lse=lse if lse is not None else inputs.lse)
+        out = _msa().sparse_decode_atten_func(
             inputs.q,
             inputs.k,
             inputs.v,
             inputs.plan_info,
             kv_indices=inputs.kv_indices,
             kv_block_indexes=inputs.kv_block_indexes,
-            sm_scale=workload.softmax_scale,
-            k_scale=workload.k_scale,
-            v_scale=workload.v_scale,
+            sm_scale=inputs.softmax_scale,
+            k_scale=inputs.k_scale,
+            v_scale=inputs.v_scale,
+            out=inputs.out,
+            lse=inputs.lse,
         )
-        return MsaOutputs(out=out)
+        return MsaOutputs(out=out, lse=inputs.lse)
 
     # ------------------------------------------------------------------
     # Reference
@@ -578,9 +662,6 @@ class MsaOperator(Operator):
 
     @staticmethod
     def _reference_maxscore(inputs: MsaInputs) -> MsaReference:
-        workload = inputs.workload
-        assert workload is not None
-        assert workload.q_lengths is not None
         if (
             inputs.q is None
             or inputs.k is None
@@ -588,41 +669,41 @@ class MsaOperator(Operator):
             or inputs.kv_lens is None
         ):
             raise ValueError("maxscore references require q, k, and lengths")
-        max_k_tiles = MsaOperator._maxscore_k_tiles(max(workload.kv_lengths))
+        max_k_tiles = MsaOperator._maxscore_k_tiles(
+            max(inputs.kv_lengths)
+            if inputs.kv_lengths is not None
+            else int(inputs.kv_lens.max().item())
+        )
         max_score = MsaOperator._dense_msa_output_maxscore_reference(
             inputs.q,
             inputs.k,
             inputs.q_lens,
             inputs.kv_lens,
-            workload.num_kv_heads,
+            inputs.num_kv_heads,
             max_k_tiles,
-            causal=workload.causal,
+            causal=inputs.causal,
             page_table=inputs.page_table,
-            page_size=workload.page_size,
+            page_size=inputs.page_size,
         )
         return MsaReference(max_score=max_score)
 
     @staticmethod
     def _reference_sparse_topk(inputs: MsaInputs) -> MsaReference:
-        workload = inputs.workload
-        assert workload is not None
         if inputs.max_score is None:
             raise ValueError("sparse-topk references require max_score")
         selected = MsaOperator._sparse_topk_select_reference(
             inputs.max_score,
-            topk=workload.topk,
-            num_valid_pages=workload.num_valid_pages,
-            force_begin_blocks=workload.force_begin_blocks,
-            force_end_blocks=workload.force_end_blocks,
-            force_blocks_count_in_topk=workload.force_blocks_count_in_topk,
+            topk=inputs.topk,
+            num_valid_pages=inputs.num_valid_pages,
+            force_begin_blocks=inputs.force_begin_blocks,
+            force_end_blocks=inputs.force_end_blocks,
+            force_blocks_count_in_topk=inputs.force_blocks_count_in_topk,
             query_positions=inputs.query_positions,
         )
         return MsaReference(selected_blocks=selected)
 
     @staticmethod
     def _reference_sparse_fwd(inputs: MsaInputs) -> MsaReference:
-        workload = inputs.workload
-        assert workload is not None
         if (
             inputs.q is None
             or inputs.k is None
@@ -634,35 +715,41 @@ class MsaOperator(Operator):
         ):
             raise ValueError("sparse-fwd references require full sparse inputs")
         softmax_scale = (
-            workload.softmax_scale
-            if workload.softmax_scale is not None
-            else workload.head_dim**-0.5
+            inputs.softmax_scale
+            if inputs.softmax_scale is not None
+            else inputs.head_dim**-0.5
         )
         common = dict(
-            causal=workload.causal,
+            causal=inputs.causal,
             softmax_scale=softmax_scale,
             q_lens=inputs.q_lens,
             kv_lens=inputs.kv_lens,
-            sparse_block_size=workload.sparse_block_size,
+            sparse_block_size=inputs.sparse_block_size,
         )
         out = MsaOperator._dense_sparse_prefill_reference(
             inputs.q,
-            inputs.k,
-            inputs.v,
+            inputs.k.float() * inputs.k_scale,
+            inputs.v.float() * inputs.v_scale,
             inputs.page_table,
             inputs.kv_block_indexes,
             **common,
+        )
+        lse_buffer = (
+            torch.empty(inputs.q.shape[:2], device=inputs.q.device, dtype=torch.float32)
+            if inputs.lse is not None
+            else None
         )
         out_fp32 = MsaOperator._dense_sparse_prefill_reference(
             inputs.q,
-            inputs.k,
-            inputs.v,
+            inputs.k.float() * inputs.k_scale,
+            inputs.v.float() * inputs.v_scale,
             inputs.page_table,
             inputs.kv_block_indexes,
             output_dtype=torch.float32,
+            lse_out=lse_buffer,
             **common,
         )
-        return MsaReference(out=out, out_fp32=out_fp32)
+        return MsaReference(out=out, out_fp32=out_fp32, lse=lse_buffer)
 
     # ------------------------------------------------------------------
     # Verification
@@ -736,7 +823,7 @@ class MsaOperator(Operator):
         **kwargs,
     ):
         with unset_fake_temporarily():
-            return msa._msa_plan_from_lengths(
+            return _msa()._msa_plan_from_lengths(
                 torch.tensor(tuple(q_lengths), dtype=torch.int32),
                 torch.tensor(tuple(kv_lengths), dtype=torch.int32),
                 *args,
@@ -942,6 +1029,7 @@ class MsaOperator(Operator):
         sparse_block_size: int = 128,
         upcast: bool = True,
         output_dtype: torch.dtype | None = None,
+        lse_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_pages, num_kv_heads, page_size, head_dim_qk = k_pages_hpd.shape
         _, _, _, head_dim_v = v_pages_hpd.shape
@@ -967,6 +1055,8 @@ class MsaOperator(Operator):
             dtype=out_dtype,
             device=q.device,
         )
+        if lse_out is not None:
+            lse_out.fill_(-torch.inf)
         q_abs = 0
         for batch_idx, q_len in enumerate(q_lens_cpu):
             kv_len = kv_lens_cpu[batch_idx]
@@ -1018,6 +1108,10 @@ class MsaOperator(Operator):
                         v_sel = v_sel.to(torch.float32)
                         q_sel = q_sel.to(torch.float32)
                     scores = torch.matmul(q_sel, k_sel.transpose(0, 1)) * softmax_scale
+                    if lse_out is not None:
+                        lse_out[q_abs, hq_begin:hq_end] = torch.logsumexp(
+                            scores, dim=-1
+                        )
                     probs = torch.softmax(scores, dim=-1)
                     out[q_abs, hq_begin:hq_end] = torch.matmul(probs, v_sel).to(
                         dtype=out_dtype

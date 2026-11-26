@@ -40,7 +40,16 @@ from .gemm.deep_gemm.hyperconnection import (
     get_hyperconnection_module as get_hyperconnection_module,
 )
 from .gemm.deep_gemm.mqa_logits import gen_mqa_logits_aot as gen_mqa_logits_aot
+from .gemm.deep_gemm.mqa_logits_blockscale import (
+    gen_mqa_logits_blockscale_aot as gen_mqa_logits_blockscale_aot,
+)
+from .gemm.deep_gemm.mqa_logits_blockscale import (
+    gen_mqa_logits_blockscale_spec as gen_mqa_logits_blockscale_spec,
+)
 from .gemm.deep_gemm.mqa_logits import gen_mqa_logits_spec as gen_mqa_logits_spec
+from .gemm.deep_gemm.mqa_logits_blockscale import (
+    get_mqa_logits_blockscale_module as get_mqa_logits_blockscale_module,
+)
 from .gemm.deep_gemm.mqa_logits import (
     get_mqa_logits_module as get_mqa_logits_module,
 )
@@ -77,6 +86,15 @@ from .mega_moe import (
     get_fp8_fp8_mega_moe_stage1_module as get_fp8_fp8_mega_moe_stage1_module,
     get_fp8_fp8_mega_moe_stage2_module as get_fp8_fp8_mega_moe_stage2_module,
     get_mega_moe_runtime_utils_module as get_mega_moe_runtime_utils_module,
+)
+from .mega_moe_prefill import (
+    PrefillMegaMoEKernelConfig as PrefillMegaMoEKernelConfig,
+    gen_prefill_stage1_spec as gen_prefill_stage1_spec,
+    gen_prefill_stage2_spec as gen_prefill_stage2_spec,
+    gen_prefill_stage3_spec as gen_prefill_stage3_spec,
+    get_prefill_stage1_module as get_prefill_stage1_module,
+    get_prefill_stage2_module as get_prefill_stage2_module,
+    get_prefill_stage3_module as get_prefill_stage3_module,
 )
 from .msa_ops import gen_msa_ops_aot as gen_msa_ops_aot
 from .msa_ops import gen_msa_ops_spec as gen_msa_ops_spec
@@ -117,12 +135,24 @@ __all__ = [
     "gen_hyperconnection_spec",
     "get_hyperconnection_module",
     "gen_mqa_logits_aot",
+    "gen_mqa_logits_blockscale_aot",
+    "gen_mqa_logits_blockscale_spec",
     "gen_mqa_logits_spec",
+    "get_mqa_logits_blockscale_module",
+    "gen_mqa_logits_blockscale_metadata_aot",
+    "gen_mqa_logits_blockscale_metadata_spec",
+    "get_mqa_logits_blockscale_metadata_module",
     "get_mqa_logits_module",
     "gen_masked_moe_gemm_mixed_dtype_aot",
     "gen_paged_mqa_logits_aot",
     "gen_paged_mqa_logits_spec",
     "get_paged_mqa_logits_module",
+    "gen_paged_mqa_logits_blockscale_aot",
+    "gen_paged_mqa_logits_blockscale_spec",
+    "get_paged_mqa_logits_blockscale_module",
+    "gen_paged_mqa_logits_blockscale_metadata_aot",
+    "gen_paged_mqa_logits_blockscale_metadata_spec",
+    "get_paged_mqa_logits_blockscale_metadata_module",
     "gen_mla_ops_aot",
     "gen_mla_ops_spec",
     "get_mla_ops_module",
@@ -134,6 +164,13 @@ __all__ = [
     "get_fp8_fp8_mega_moe_stage1_module",
     "get_fp8_fp8_mega_moe_stage2_module",
     "get_mega_moe_runtime_utils_module",
+    "PrefillMegaMoEKernelConfig",
+    "gen_prefill_stage1_spec",
+    "gen_prefill_stage2_spec",
+    "gen_prefill_stage3_spec",
+    "get_prefill_stage1_module",
+    "get_prefill_stage2_module",
+    "get_prefill_stage3_module",
     "gen_msa_ops_aot",
     "gen_msa_ops_spec",
     "get_msa_ops_module",
@@ -164,7 +201,11 @@ def prewarm_modules(
     include_mixed_dtype_moe: bool = False,
     include_hyperconnection: bool = False,
     include_mqa_logits: bool = False,
+    include_mqa_logits_blockscale: bool = False,
+    include_mqa_logits_blockscale_metadata: bool = False,
     include_paged_mqa_logits: bool = False,
+    include_paged_mqa_logits_blockscale: bool = False,
+    include_paged_mqa_logits_blockscale_metadata: bool = False,
     include_kda: bool = False,
     include_mla: bool = False,
     include_msa: bool = False,
@@ -213,10 +254,34 @@ def prewarm_modules(
         from .gemm.deep_gemm.mqa_logits import gen_mqa_logits_aot
 
         specs.extend(gen_mqa_logits_aot())
+    if include_mqa_logits_blockscale:
+        from .gemm.deep_gemm.mqa_logits_blockscale import (
+            gen_mqa_logits_blockscale_aot,
+        )
+
+        specs.extend(gen_mqa_logits_blockscale_aot())
+    if include_mqa_logits_blockscale_metadata:
+        from .gemm.deep_gemm.mqa_logits_blockscale_metadata import (
+            gen_mqa_logits_blockscale_metadata_aot,
+        )
+
+        specs.extend(gen_mqa_logits_blockscale_metadata_aot())
     if include_paged_mqa_logits:
         from .gemm.deep_gemm.paged_mqa_logits import gen_paged_mqa_logits_aot
 
         specs.extend(gen_paged_mqa_logits_aot())
+    if include_paged_mqa_logits_blockscale:
+        from .gemm.deep_gemm.paged_mqa_logits_blockscale import (
+            gen_paged_mqa_logits_blockscale_aot,
+        )
+
+        specs.extend(gen_paged_mqa_logits_blockscale_aot())
+    if include_paged_mqa_logits_blockscale_metadata:
+        from .gemm.deep_gemm.paged_mqa_logits_blockscale_metadata import (
+            gen_paged_mqa_logits_blockscale_metadata_aot,
+        )
+
+        specs.extend(gen_paged_mqa_logits_blockscale_metadata_aot())
     if include_kda:
         from .kda_ops import gen_kda_prepare_ops_spec, gen_kda_recurrence_ops_spec
 

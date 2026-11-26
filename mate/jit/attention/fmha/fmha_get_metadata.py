@@ -1,25 +1,39 @@
 import functools
 import math
+import os
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Sequence
 
 import torch
 
+from mate._jit_dependencies import JitSourceTemplate
+
+from ....execution_context import skip_kernel_launch_if_dry_run
 from ... import env as jit_env
-from ...core import JitSpec, gen_jit_spec
-from ...utils import EXPORT_FUNC, TVM_HEADER, dtype_torch2mutlass_map
 from ...configs import KernelConfigGraph, ParamSpec, domain_by_case
+from ...core import JitSpec, gen_jit_spec
+from ...utils import EXPORT_FUNC_SOURCE, TVM_HEADER, dtype_torch2mutlass_map
 from .fmha_utils import (
     _ELEMENT_NAME_SUFFIX,
     _FP8_DTYPES,
     FMHA_EXTRA_CUDA_CFLAGS,
-    _get_fwd_kernel_config as _get_metadata_kernel_config,
-    fmha_extra_include_paths,
-    get_fmha_template,
     _resolve_mask,
     round_multiple,
+    fmha_extra_include_paths,
+    _get_fwd_kernel_config as _get_metadata_kernel_config,
 )
-from ....execution_context import skip_kernel_launch_if_dry_run
+
+if TYPE_CHECKING:
+    from ...env import MusaArch
+
+
+_JIT_DUMP_CONTEXT = None
+if os.environ.get("MATE_JIT_DUMP_DIR"):
+    from ...dump import get_jit_dump_context
+
+    _JIT_DUMP_CONTEXT = get_jit_dump_context()
+    assert _JIT_DUMP_CONTEXT is not None
+_JIT_DUMP_CONFIG_CC = _JIT_DUMP_CONTEXT.dump_arch.cc if _JIT_DUMP_CONTEXT else None
 
 
 def _fmha_get_metadata_encode(config: Mapping[str, object]) -> str:
@@ -63,16 +77,14 @@ def _fmha_get_metadata_encode(config: Mapping[str, object]) -> str:
     return "_".join(name_list)
 
 
-def _render_fmha_metadata_source(config: Mapping[str, object]) -> str:
+def _fmha_metadata_render_config(
+    config: Mapping[str, object],
+) -> dict[str, object]:
     render_config = dict(config)
     render_config["func_name"] = str(
         render_config.get("func_name") or _fmha_get_metadata_encode(render_config)
     )
-    return (
-        TVM_HEADER
-        + get_fmha_template("metadata_kern.j2").render(render_config)
-        + EXPORT_FUNC.render(render_config)
-    )
+    return render_config
 
 
 def _fmha_metadata_module(config: Mapping[str, object]):
@@ -82,7 +94,10 @@ def _fmha_metadata_module(config: Mapping[str, object]):
 
 @functools.cache
 def _load_fmha_metadata_module(frozen_config: tuple[tuple[str, object], ...]):
-    return gen_fmha_metadata_spec(dict(frozen_config)).build_and_load()
+    target_arch = _JIT_DUMP_CONTEXT.current_arch if _JIT_DUMP_CONTEXT else None
+    return gen_fmha_metadata_spec(
+        dict(frozen_config), target_arch=target_arch
+    ).build_and_load()
 
 
 def config_selector(cfg):
@@ -238,15 +253,38 @@ def get_fmha_metadata_aot_configs(config_level: int) -> list[dict[str, object]]:
     return _gen_specs_from_config(config_level)
 
 
-def gen_fmha_metadata_spec(config: Mapping[str, object]) -> JitSpec:
+def gen_fmha_metadata_spec(
+    config: Mapping[str, object],
+    *,
+    target_arch: Optional["MusaArch"] = None,
+) -> JitSpec:
     dispatch_name = _fmha_get_metadata_encode(config)
-    source_file = Path(jit_env.MATE_GEN_SRC_DIR / f"{dispatch_name}.mu")
+    generated_dir = (
+        jit_env.resolve_musa_generated_dir(target_arch)
+        if target_arch is not None
+        else jit_env.MATE_GEN_SRC_DIR
+    )
+    source_file = Path(generated_dir / f"{dispatch_name}.mu")
+    render_config = _fmha_metadata_render_config(config)
     return gen_jit_spec(
         name=dispatch_name,
         sources=[source_file],
-        generated_sources={source_file: _render_fmha_metadata_source(config)},
+        generated_sources={
+            source_file: JitSourceTemplate(
+                template=(
+                    jit_env.MATE_TEMPLATE_DIR
+                    / "attention"
+                    / "fmha"
+                    / "metadata_kern.j2"
+                ),
+                context=render_config,
+                prefix=TVM_HEADER,
+                suffix=EXPORT_FUNC_SOURCE,
+            )
+        },
         extra_cuda_cflags=list(FMHA_EXTRA_CUDA_CFLAGS),
         extra_include_paths=fmha_extra_include_paths(),
+        target_arch=target_arch,
     )
 
 
@@ -284,6 +322,7 @@ def _fmha_get_metadata(
     num_splits: int = 1,
     packgqa: Optional[bool] = None,
     mp_margin: int = 0,
+    override_cc: Optional[int] = None,
 ) -> torch.Tensor:
     if cu_seqlens_q is not None:
         assert max_seqlen_q is not None
@@ -376,6 +415,8 @@ def _fmha_get_metadata(
         consumers_pv,
         tile_head_dim,
         enable_packgqa,
+        _mma_pv_rs,
+        _cc,
     ) = _get_metadata_kernel_config(
         max_seqlen_q,
         qhead_per_kvhead,
@@ -386,6 +427,9 @@ def _fmha_get_metadata(
         has_qv,
         qkv_dtype in _FP8_DTYPES,
         is_local and attention_chunk != 0,
+        override_cc=(
+            _JIT_DUMP_CONFIG_CC if _JIT_DUMP_CONFIG_CC is not None else override_cc
+        ),
     )
 
     packgqa = (

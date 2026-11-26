@@ -1,7 +1,7 @@
 """TileLang backend for the active GDN unified decode path.
 
 This module intentionally stays backend-oriented: it builds and runs the active
-VK-layout, FP32-state decode kernel and assumes API-level validation is handled
+VK-layout, FP32-accumulation decode kernel and assumes API-level validation is handled
 by ``mate.gdn_decode``.
 """
 
@@ -10,16 +10,22 @@ import functools
 import tilelang
 import tilelang.language as T
 import torch
+from mate.execution_context import skip_kernel_launch_if_dry_run
+
+from mate.arch import Arch, MP31_ARCH, MP32_ARCH
+from mate.mate_runtime import get_arch
 
 __all__ = ["run_gated_delta_rule_decode_vk_fp32"]
 
 _LOG2E = 1.4426950408889634
+_LN2 = 0.6931471805599453094
 _SOFTPLUS_BETA = 1.0
 _SOFTPLUS_THRESHOLD = 20.0
 _KERNEL_THREADS = 128
+# Row loop strides by one warp per v-row; the factory rejects a v_tile it cannot divide.
+_WARPS = _KERNEL_THREADS // 32
 
 _STATE_TME_INNER_CACHE_POLICY = "cache_normal"
-_STATE_TME_OUTER_CACHE_POLICY = "cache_none"
 
 # Tuned on S5000 from benchmarks/perf_all.log with continuous batch ranges.
 _AUTO_TUNED_BATCH_CONFIGS = (
@@ -30,6 +36,22 @@ _AUTO_TUNED_BATCH_CONFIGS = (
 _AUTO_TUNED_LARGE_BATCH_CONFIG = (4, 1, 8)
 _LOW_PARALLEL_SPLIT_CTA_THRESHOLD = 256
 _LOW_PARALLEL_SPLIT_CONFIG = (8, 1, 4)
+
+# MP32/S6000 small-batch tuning: increase V-direction splitting so the
+# 48-MP device has enough CTAs before launch/synchronization overhead dominates.
+_MP32_AUTO_TUNED_BATCH_CONFIGS = (
+    (1, (8, 1, 16)),
+    (2, (8, 1, 16)),
+    (4, (8, 1, 8)),
+    (8, (8, 1, 8)),
+    (16, (8, 1, 4)),
+)
+# For B>16, a 2-deep pipeline over few split blocks wins; B=32 still needs a 2-way
+# split for enough CTAs on 48 MPs. This tiling regresses on MP31, so the MP32 and
+# MP31 config tables must stay separate.
+_MP32_SPLIT_MAX_BATCH = 32
+_MP32_AUTO_TUNED_MID_BATCH_CONFIG = (8, 2, 2)
+_MP32_AUTO_TUNED_LARGE_BATCH_CONFIG = (8, 1, 1)
 
 
 def _exp2_f32(value):
@@ -54,13 +76,25 @@ def _should_use_low_parallel_split(
 
 @functools.lru_cache(maxsize=64)
 def _resolve_autotuned_kernel_config_tuple(
-    batch: int, head: int
+    batch: int, head: int, arch: Arch
 ) -> tuple[int, int, int]:
-    for max_batch, config in _AUTO_TUNED_BATCH_CONFIGS:
+    batch_configs = (
+        _MP32_AUTO_TUNED_BATCH_CONFIGS
+        if arch == MP32_ARCH
+        else _AUTO_TUNED_BATCH_CONFIGS
+    )
+    for max_batch, config in batch_configs:
         if batch <= max_batch:
             break
     else:
-        config = _AUTO_TUNED_LARGE_BATCH_CONFIG
+        if arch == MP32_ARCH:
+            config = (
+                _MP32_AUTO_TUNED_MID_BATCH_CONFIG
+                if batch <= _MP32_SPLIT_MAX_BATCH
+                else _MP32_AUTO_TUNED_LARGE_BATCH_CONFIG
+            )
+        else:
+            config = _AUTO_TUNED_LARGE_BATCH_CONFIG
 
     _, _, num_blocks_per_state = config
     if _should_use_low_parallel_split(batch, head, num_blocks_per_state):
@@ -68,8 +102,8 @@ def _resolve_autotuned_kernel_config_tuple(
     return config
 
 
-def _resolve_autotuned_kernel_config(batch: int, head: int) -> dict:
-    config = _resolve_autotuned_kernel_config_tuple(batch, head)
+def _resolve_autotuned_kernel_config(batch: int, head: int, arch: Arch) -> dict:
+    config = _resolve_autotuned_kernel_config_tuple(batch, head, arch)
     return _make_kernel_config(*config)
 
 
@@ -82,11 +116,13 @@ def _build_decode_fp32_vk_kernel_factory(
     gate_batch_dtype: str,
     dt_bias_dtype: str,
     output_dtype: str,
+    state_dtype: str,
     use_qk_l2norm: bool,
     v_tile: int,
     num_blocks_per_state: int,
     stage: int,
     use_identity_state_indices: bool,
+    arch: Arch,
 ):
     if qk_head <= 0:
         raise ValueError("qk_head must be positive.")
@@ -112,6 +148,8 @@ def _build_decode_fp32_vk_kernel_factory(
         raise ValueError(f"Unsupported dt_bias_dtype={dt_bias_dtype}")
     if output_dtype not in ("float16", "bfloat16", "float32"):
         raise ValueError(f"Unsupported output_dtype={output_dtype}")
+    if state_dtype not in ("float32", "bfloat16"):
+        raise ValueError(f"Unsupported state_dtype={state_dtype}")
 
     head_group_size = head // qk_head
     num_v_tiles = dim_v // v_tile
@@ -138,7 +176,20 @@ def _build_decode_fp32_vk_kernel_factory(
             f"per-block output elements={num_v_tiles_per_block * v_tile} exceeds "
             f"kernel threads={_KERNEL_THREADS}."
         )
+    if v_tile % _WARPS != 0:
+        raise ValueError(
+            f"v_tile={v_tile} must be a multiple of the warp count {_WARPS} "
+            f"(threads={_KERNEL_THREADS}), otherwise the row loop would index "
+            f"past the end of the state tile."
+        )
+    # Interleaving two v-rows per warp needs exactly 2*_WARPS rows in the tile.
+    # Every MP32 config uses v_tile=8; MP31's (4,1,8) does not, so it keeps the
+    # original row loop.
+    row_pair = v_tile == 2 * _WARPS
     vec_size = dim_k // 32
+    # TileLang's mp_32 TMA template only accepts cache_normal for the outer
+    # dimension; MP31 is faster with cache_none.
+    state_tme_outer_cache_policy = "cache_none" if arch == MP31_ARCH else "cache_normal"
 
     batch = T.dynamic("batch")
     pool_size = T.dynamic("pool_size")
@@ -186,12 +237,19 @@ def _build_decode_fp32_vk_kernel_factory(
         },
         compile_flags=[
             "-O3",
+            # Extra codegen flags mirroring the KDA MP32 decode kernel.
+            "-fno-signed-zeros",
+            "-fmusa-flush-denormals-to-zero",
             "-mllvm",
             "-misched=mtgpu-max-ilp",
             "-mllvm",
             "-mtgpu-if-convert=1",
             "-mllvm",
             "-mtgpu-tiny-offset-hint=1",
+            "-mllvm",
+            "-mtgpu-combine-fop-instr=1",
+            "-mllvm",
+            "-mtgpu-enable-postra-sched=0",
             "-mllvm",
             "-misched-recompute-slotindex=1",
         ],
@@ -212,7 +270,7 @@ def _build_decode_fp32_vk_kernel_factory(
             state_indices: T.StridedTensor(
                 state_indices_shape, state_indices_strides, "int32"
             ),
-            state: T.Tensor([pool_size, head, dim_v, dim_k], "float32"),
+            state: T.Tensor([pool_size, head, dim_v, dim_k], state_dtype),
             o: T.StridedTensor(o_shape, o_strides, output_dtype),
         ):
             with T.Kernel(
@@ -222,16 +280,22 @@ def _build_decode_fp32_vk_kernel_factory(
                 block_inner = bx % num_blocks_per_state
                 start_v_tile = block_inner * num_v_tiles_per_block
 
-                state_load_stage = T.alloc_shared([stage, v_tile, dim_k], "float32")
+                # Match MTP's BF16 state-storage contract while keeping all recurrent
+                # math in FP32 registers; this only changes state I/O.
+                state_load_stage = T.alloc_shared([stage, v_tile, dim_k], state_dtype)
                 output_tile = T.alloc_shared(
                     [num_v_tiles_per_block * v_tile], output_dtype
                 )
                 value_tile = T.alloc_shared([dim_v], "float32")
-                state_store_stage = T.alloc_shared([2, v_tile, dim_k], "float32")
+                state_store_stage = T.alloc_shared([2, v_tile, dim_k], state_dtype)
 
                 q_reg = T.alloc_local([vec_size], "float32")
                 k_reg = T.alloc_local([vec_size], "float32")
                 h_reg = T.alloc_local([vec_size], "float32")
+                h_reg1 = T.alloc_local([vec_size], "float32")
+                v_row = T.alloc_local([2], "float32")
+                q_gated = T.alloc_local([vec_size], "float32")
+                k_gated = T.alloc_local([vec_size], "float32")
 
                 sum_q = T.alloc_local([1], "float32")
                 sum_k = T.alloc_local([1], "float32")
@@ -239,6 +303,9 @@ def _build_decode_fp32_vk_kernel_factory(
                 beta_reg = T.alloc_local([1], "float32")
                 sum_hk = T.alloc_local([1], "float32")
                 sum_hq = T.alloc_local([1], "float32")
+                sum_hk1 = T.alloc_local([1], "float32")
+                sum_hq1 = T.alloc_local([1], "float32")
+                sum_kq = T.alloc_local([1], "float32")
                 stage_idx_var = T.alloc_var(T.int32)
 
                 mbars = T.alloc_barrier(mbarrier_list)
@@ -264,7 +331,7 @@ def _build_decode_fp32_vk_kernel_factory(
                             state_load_stage[i, :, :],
                             barrier=mbars[i],
                             inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
-                            outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
+                            outer_cache_policy=state_tme_outer_cache_policy,
                         )
                         T.mbarrier_arrive(mbarrier=mbars[i])
 
@@ -280,7 +347,7 @@ def _build_decode_fp32_vk_kernel_factory(
                         beta_x = _SOFTPLUS_BETA * x
                         softplus_x = T.if_then_else(
                             beta_x <= _SOFTPLUS_THRESHOLD,
-                            (1.0 / _SOFTPLUS_BETA) * T.log(1.0 + _exp2_f32(beta_x)),
+                            (_LN2 / _SOFTPLUS_BETA) * T.log2(1.0 + _exp2_f32(beta_x)),
                             x,
                         )
                         g_val = -_exp2_f32(A_log_val) * softplus_x
@@ -310,14 +377,29 @@ def _build_decode_fp32_vk_kernel_factory(
                             mask = 16 >> offset
                             sum_q[0] += T.shfl_xor(sum_q[0], mask)
                             sum_k[0] += T.shfl_xor(sum_k[0], mask)
-                        inv_norm_q = T.rsqrt(sum_q[0] + 1e-6)
-                        inv_norm_k = T.rsqrt(sum_k[0] + 1e-6)
+                        # exp2/log2 instead of rsqrtf, whose edge-case path is ~10x slower here.
+                        inv_norm_q = T.exp2(-0.5 * T.log2(sum_q[0] + 1e-6))
+                        inv_norm_k = T.exp2(-0.5 * T.log2(sum_k[0] + 1e-6))
                         for i in T.vectorized(vec_size):
                             q_reg[i] = q_reg[i] * inv_norm_q
                             k_reg[i] = k_reg[i] * inv_norm_k
 
                     for i in T.vectorized(vec_size):
                         q_reg[i] = q_reg[i] * scale
+
+                    # alpha multiplies the state term of BOTH reductions, so fold it
+                    # into copies of k and q once per CTA. k.q stays ungated: it scales
+                    # v_new rather than the state.
+                    for i in T.vectorized(vec_size):
+                        k_gated[i] = k_reg[i] * alpha_reg[0]
+                        q_gated[i] = q_reg[i] * alpha_reg[0]
+
+                    sum_kq[0] = 0.0
+                    for i in T.serial(vec_size):
+                        sum_kq[0] += k_reg[i] * q_reg[i]
+                    for offset in T.unroll(5):
+                        mask = 16 >> offset
+                        sum_kq[0] += T.shfl_xor(sum_kq[0], mask)
 
                     T.sync_threads()
 
@@ -343,7 +425,7 @@ def _build_decode_fp32_vk_kernel_factory(
                                     :,
                                 ],
                                 inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
-                                outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
+                                outer_cache_policy=state_tme_outer_cache_policy,
                             )
                             # Keep the CTA in step after the issuing warp commits the store.
                             T.sync_threads()
@@ -352,62 +434,150 @@ def _build_decode_fp32_vk_kernel_factory(
                             mbarrier=mbars[stage_idx_var], parity=parity
                         )
 
-                        for row_base in range(0, v_tile, 4):
-                            row_idx = row_base + warp
-                            global_row = global_v_base + row_idx
+                        if row_pair:
+                            # Both v-rows of this warp in one pass, each in its own
+                            # register set. The two chains are independent; sharing one
+                            # h_reg/sum_hk buffer made the scheduler serialise them.
+                            row0 = warp
+                            row1 = _WARPS + warp
+                            global_row0 = global_v_base + row0
+                            global_row1 = global_v_base + row1
                             sum_hk[0] = 0.0
                             sum_hq[0] = 0.0
+                            sum_hk1[0] = 0.0
+                            sum_hq1[0] = 0.0
 
                             for i in T.vectorized(vec_size):
                                 h_reg[i] = T.cast(
-                                    state_load_stage[
-                                        stage_idx_var, row_idx, k_start + i
-                                    ],
+                                    state_load_stage[stage_idx_var, row0, k_start + i],
+                                    "float32",
+                                )
+                                h_reg1[i] = T.cast(
+                                    state_load_stage[stage_idx_var, row1, k_start + i],
                                     "float32",
                                 )
 
+                            # Pull the two v scalars out of shared up front so their
+                            # latency hides behind the dot products instead of the butterfly.
+                            v_row[0] = value_tile[global_row0]
+                            v_row[1] = value_tile[global_row1]
+
+                            # The whole tile is now in registers, so the load stage can
+                            # be refilled here rather than after the row loop -- that
+                            # issues the next TMA about a whole butterfly earlier.
+                            T.sync_threads()
+                            next_local_v_tile = local_v_tile + stage
+                            if next_local_v_tile < num_v_tiles_per_block:
+                                global_next_v_tile = start_v_tile + next_local_v_tile
+                                global_next_v_base = global_next_v_tile * v_tile
+                                T.tma_copy(
+                                    state[state_slot, hid, global_next_v_base, 0],
+                                    state_load_stage[stage_idx_var, :, :],
+                                    barrier=mbars[stage_idx_var],
+                                    inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
+                                    outer_cache_policy=state_tme_outer_cache_policy,
+                                )
+                                T.mbarrier_arrive(mbarrier=mbars[stage_idx_var])
+
                             for i in T.unroll(vec_size):
-                                h_reg[i] = h_reg[i] * alpha_reg[0]
-                                sum_hk[0] += h_reg[i] * k_reg[i]
+                                sum_hk[0] += h_reg[i] * k_gated[i]
+                                sum_hq[0] += h_reg[i] * q_gated[i]
+                                sum_hk1[0] += h_reg1[i] * k_gated[i]
+                                sum_hq1[0] += h_reg1[i] * q_gated[i]
 
                             for offset in T.unroll(5):
                                 mask = 16 >> offset
                                 sum_hk[0] += T.shfl_xor(sum_hk[0], mask)
+                                sum_hq[0] += T.shfl_xor(sum_hq[0], mask)
+                                sum_hk1[0] += T.shfl_xor(sum_hk1[0], mask)
+                                sum_hq1[0] += T.shfl_xor(sum_hq1[0], mask)
 
-                            v_new = (value_tile[global_row] - sum_hk[0]) * beta_reg[0]
+                            v_new0 = (v_row[0] - sum_hk[0]) * beta_reg[0]
+                            v_new1 = (v_row[1] - sum_hk1[0]) * beta_reg[0]
 
                             for i in T.unroll(vec_size):
-                                h_reg[i] += k_reg[i] * v_new
-                                sum_hq[0] += h_reg[i] * q_reg[i]
+                                h_reg[i] = h_reg[i] * alpha_reg[0] + k_reg[i] * v_new0
+                                h_reg1[i] = h_reg1[i] * alpha_reg[0] + k_reg[i] * v_new1
 
-                            # Stage updated state for the next TME store.
                             for i in T.vectorized(vec_size):
                                 state_store_stage[
-                                    local_v_tile % 2, row_idx, k_start + i
-                                ] = h_reg[i]
+                                    local_v_tile % 2, row0, k_start + i
+                                ] = T.cast(h_reg[i], state_dtype)
+                            for i in T.vectorized(vec_size):
+                                state_store_stage[
+                                    local_v_tile % 2, row1, k_start + i
+                                ] = T.cast(h_reg1[i], state_dtype)
 
-                            for offset in T.unroll(5):
-                                mask = 16 >> offset
-                                sum_hq[0] += T.shfl_xor(sum_hq[0], mask)
+                            o_idx0 = local_v_tile * v_tile + row0
+                            o_idx1 = local_v_tile * v_tile + row1
+                            if lane == 0 and o_idx0 < num_v_tiles_per_block * v_tile:
+                                output_tile[o_idx0] = sum_hq[0] + sum_kq[0] * v_new0
+                            if lane == 0 and o_idx1 < num_v_tiles_per_block * v_tile:
+                                output_tile[o_idx1] = sum_hq1[0] + sum_kq[0] * v_new1
+                        else:
+                            for row_base in range(0, v_tile, _WARPS):
+                                row_idx = row_base + warp
+                                global_row = global_v_base + row_idx
+                                sum_hk[0] = 0.0
+                                sum_hq[0] = 0.0
 
-                            o_idx = local_v_tile * v_tile + row_idx
-                            if lane == 0 and o_idx < num_v_tiles_per_block * v_tile:
-                                output_tile[o_idx] = sum_hq[0]
+                                for i in T.vectorized(vec_size):
+                                    h_reg[i] = T.cast(
+                                        state_load_stage[
+                                            stage_idx_var, row_idx, k_start + i
+                                        ],
+                                        "float32",
+                                    )
 
-                        # Ensure state_load_stage[stage_idx_var] is consumed before refill.
+                                # Both reductions read the pre-update row, so they share one
+                                # pass over h_reg and reduce in parallel. The alpha scale is
+                                # already folded into k_gated/q_gated.
+                                for i in T.unroll(vec_size):
+                                    sum_hk[0] += h_reg[i] * k_gated[i]
+                                    sum_hq[0] += h_reg[i] * q_gated[i]
+
+                                for offset in T.unroll(5):
+                                    mask = 16 >> offset
+                                    sum_hk[0] += T.shfl_xor(sum_hk[0], mask)
+                                    sum_hq[0] += T.shfl_xor(sum_hq[0], mask)
+
+                                v_new = (value_tile[global_row] - sum_hk[0]) * beta_reg[
+                                    0
+                                ]
+
+                                for i in T.unroll(vec_size):
+                                    h_reg[i] = (
+                                        h_reg[i] * alpha_reg[0] + k_reg[i] * v_new
+                                    )
+
+                                # Stage updated state for the next TME store.
+                                for i in T.vectorized(vec_size):
+                                    state_store_stage[
+                                        local_v_tile % 2, row_idx, k_start + i
+                                    ] = T.cast(h_reg[i], state_dtype)
+
+                                o_idx = local_v_tile * v_tile + row_idx
+                                if lane == 0 and o_idx < num_v_tiles_per_block * v_tile:
+                                    # alpha*(H.q) + (k.q)*v_new == H_new.q over the old row.
+                                    output_tile[o_idx] = sum_hq[0] + sum_kq[0] * v_new
+
+                        # Order the row loop's store-buffer writes before the next
+                        # tile's TMA store. The load refill already happened inside
+                        # the interleaved branch above.
                         T.sync_threads()
-                        next_local_v_tile = local_v_tile + stage
-                        if next_local_v_tile < num_v_tiles_per_block:
-                            global_next_v_tile = start_v_tile + next_local_v_tile
-                            global_next_v_base = global_next_v_tile * v_tile
-                            T.tma_copy(
-                                state[state_slot, hid, global_next_v_base, 0],
-                                state_load_stage[stage_idx_var, :, :],
-                                barrier=mbars[stage_idx_var],
-                                inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
-                                outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
-                            )
-                            T.mbarrier_arrive(mbarrier=mbars[stage_idx_var])
+                        if not row_pair:
+                            next_local_v_tile = local_v_tile + stage
+                            if next_local_v_tile < num_v_tiles_per_block:
+                                global_next_v_tile = start_v_tile + next_local_v_tile
+                                global_next_v_base = global_next_v_tile * v_tile
+                                T.tma_copy(
+                                    state[state_slot, hid, global_next_v_base, 0],
+                                    state_load_stage[stage_idx_var, :, :],
+                                    barrier=mbars[stage_idx_var],
+                                    inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
+                                    outer_cache_policy=state_tme_outer_cache_policy,
+                                )
+                                T.mbarrier_arrive(mbarrier=mbars[stage_idx_var])
 
                     # Epilogue: store the last updated state tile.
                     global_prev_v_base_epi = (
@@ -422,7 +592,7 @@ def _build_decode_fp32_vk_kernel_factory(
                             :,
                         ],
                         inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
-                        outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
+                        outer_cache_policy=state_tme_outer_cache_policy,
                     )
 
                     if tid < num_v_tiles_per_block * v_tile:
@@ -450,11 +620,13 @@ def _get_decode_fp32_vk_kernel(
     gate_batch_dtype: str,
     dt_bias_dtype: str,
     output_dtype: str,
+    state_dtype: str,
     use_qk_l2norm: bool,
     v_tile: int,
     num_blocks_per_state: int,
     stage: int,
     use_identity_state_indices: bool,
+    arch: Arch,
 ):
     return _build_decode_fp32_vk_kernel_factory(
         qk_head=qk_head,
@@ -465,11 +637,13 @@ def _get_decode_fp32_vk_kernel(
         gate_batch_dtype=gate_batch_dtype,
         dt_bias_dtype=dt_bias_dtype,
         output_dtype=output_dtype,
+        state_dtype=state_dtype,
         use_qk_l2norm=use_qk_l2norm,
         v_tile=v_tile,
         num_blocks_per_state=num_blocks_per_state,
         stage=stage,
         use_identity_state_indices=use_identity_state_indices,
+        arch=arch,
     )()
 
 
@@ -488,14 +662,15 @@ def run_gated_delta_rule_decode_vk_fp32(
     scale: float,
     use_qk_l2norm: bool,
 ):
-    """Run the active VK-layout FP32-state decode backend.
+    """Run the active VK-layout FP32-accumulation decode backend.
 
     Inputs are expected to be validated by ``mate.gdn_decode.gated_delta_rule_decode``.
     Writes final output dtype in-kernel while updating ``state`` in-place.
     """
     B, _, Hq, K = q.shape
     _, _, HV, V = v.shape
-    kernel_config = _resolve_autotuned_kernel_config(B, HV)
+    arch = get_arch(q.device)
+    kernel_config = _resolve_autotuned_kernel_config(B, HV, arch)
     use_identity_state_indices = state_indices is None
 
     q_arg = q.squeeze(1)
@@ -508,6 +683,7 @@ def run_gated_delta_rule_decode_vk_fp32(
     gate_batch_dtype = str(a.dtype).split(".")[-1]
     dt_bias_dtype = str(dt_bias.dtype).split(".")[-1]
     output_dtype = str(output_arg.dtype).split(".")[-1]
+    state_dtype = str(state.dtype).split(".")[-1]
     state_indices_arg = (
         torch.empty((B,), dtype=torch.int32, device=q.device)
         if use_identity_state_indices
@@ -523,23 +699,26 @@ def run_gated_delta_rule_decode_vk_fp32(
         gate_batch_dtype=gate_batch_dtype,
         dt_bias_dtype=dt_bias_dtype,
         output_dtype=output_dtype,
+        state_dtype=state_dtype,
         use_qk_l2norm=bool(use_qk_l2norm),
         v_tile=kernel_config["v_tile"],
         num_blocks_per_state=kernel_config["num_blocks_per_state"],
         stage=kernel_config["stage"],
         use_identity_state_indices=use_identity_state_indices,
+        arch=arch,
     )
 
-    kernel_fn(
-        q_arg,
-        k_arg,
-        v_arg,
-        A_log,
-        a_arg,
-        dt_bias,
-        b_arg,
-        float(scale),
-        state_indices_arg,
-        state,
-        output_arg,
-    )
+    if not skip_kernel_launch_if_dry_run():
+        kernel_fn(
+            q_arg,
+            k_arg,
+            v_arg,
+            A_log,
+            a_arg,
+            dt_bias,
+            b_arg,
+            float(scale),
+            state_indices_arg,
+            state,
+            output_arg,
+        )

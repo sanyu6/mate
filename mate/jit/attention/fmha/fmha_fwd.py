@@ -1,39 +1,51 @@
 import functools
-from pathlib import Path
-import torch
-from typing import Optional, Dict, Any, Mapping, Sequence, cast
-import math
-
 import hashlib
 import json
+import math
+import os
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Sequence, cast
 
+import torch
 from packaging.version import Version
 
-from ... import env as jit_env
-from ...cpp_ext import get_mcc_version
-from ...core import JitSpec, gen_jit_spec
+from mate._jit_dependencies import JitSourceTemplate
+
+from ....execution_context import is_fake_mode, skip_kernel_launch_if_dry_run
+from ....mate_runtime import get_musa_arch
 from ....utils import ceil_div
+from ... import env as jit_env
+from ...configs import KernelConfigGraph, ParamSpec, domain_by_case
+from ...core import JitSpec, gen_jit_spec
+from ...cpp_ext import get_mcc_version
+from ...utils import (
+    EXPORT_FUNC_SOURCE,
+    TVM_HEADER,
+    dtype_torch2mutlass_map,
+    maybe_contiguous,
+)
+from .fmha_combine import _fmha_fwd_combine
 from .fmha_utils import (
     _FP8_DTYPES,
     _get_fwd_kernel_config,
-    fmha_extra_include_paths,
-    get_fmha_template,
     _resolve_mask,
+    _select_lsu_load_kv,
+    fmha_extra_include_paths,
     round_multiple,
 )
-from .fmha_combine import _fmha_fwd_combine
-from ...utils import (
-    dtype_torch2mutlass_map,
-    maybe_contiguous,
-    TVM_HEADER,
-    EXPORT_FUNC,
-)
-from ...configs import KernelConfigGraph, ParamSpec, domain_by_case
-from ....execution_context import is_fake_mode, skip_kernel_launch_if_dry_run
+
+if TYPE_CHECKING:
+    from ...env import MusaArch
 
 
-kern_fwd = get_fmha_template("fwd_kern.j2")
+_JIT_DUMP_CONTEXT = None
+if os.environ.get("MATE_JIT_DUMP_DIR"):
+    from ...dump import get_jit_dump_context, wrap_ffi_module_for_dump
 
+    _JIT_DUMP_CONTEXT = get_jit_dump_context()
+    assert _JIT_DUMP_CONTEXT is not None
+_JIT_DUMP_CONFIG_CC = _JIT_DUMP_CONTEXT.dump_arch.cc if _JIT_DUMP_CONTEXT else None
+_MUSA_ARCH = get_musa_arch()
 FMHA_FWD_EXTRA_CUDA_CFLAGS = [
     "-Od3",
     "-O2",
@@ -47,23 +59,21 @@ FMHA_FWD_EXTRA_CUDA_CFLAGS = [
     "--num-dwords-of-load-in-mutation=64",
 ]
 
-_MCC_FMHA_WORKAROUND_CUTOFF = Version("5.2.0")
-_MCC_FMHA_FP16_CVT_WORKAROUND_CUTOFF = Version("5.3.0")
+_MCC_FMHA_BST_OVERLAP_WORKAROUND_CUTOFF = Version("5.3.0")
+_MCC_FMHA_BST_OVERLAP_WORKAROUND_ELEMENTS = frozenset(
+    ("mutlass::half_t", "mutlass::float_e4m3_t", "mutlass::float_e5m2_t")
+)
 
 
 def _get_fmha_fwd_extra_cuda_cflags(config: Mapping[str, object]) -> list[str]:
     flags = list(FMHA_FWD_EXTRA_CUDA_CFLAGS)
     mcc_version = get_mcc_version()
-    if mcc_version is not None and mcc_version < _MCC_FMHA_WORKAROUND_CUTOFF:
-        flags.extend(("-fno-slp-vectorize", "-DMATE_FMHA_USE_SCALAR_EXP2"))
     if (
         mcc_version is not None
-        and _MCC_FMHA_WORKAROUND_CUTOFF
-        <= mcc_version
-        < _MCC_FMHA_FP16_CVT_WORKAROUND_CUTOFF
-        and config.get("element") == "mutlass::half_t"
+        and mcc_version < _MCC_FMHA_BST_OVERLAP_WORKAROUND_CUTOFF
+        and config.get("element") in _MCC_FMHA_BST_OVERLAP_WORKAROUND_ELEMENTS
     ):
-        flags.append("-DMATE_FMHA_USE_SCALAR_FP16_CVT")
+        flags.extend(("-fno-slp-vectorize", "-DMATE_FMHA_WORKAROUND_BST_OVERLAP"))
     return flags
 
 
@@ -72,19 +82,30 @@ def _fmha_fwd_encode(config: Mapping[str, object]) -> str:
     return f"fmha_fwd_{uri}"
 
 
-def _render_fmha_fwd_source(config: Mapping[str, object]) -> str:
+def _fmha_fwd_render_config(config: Mapping[str, object]) -> dict[str, object]:
     render_config = dict(config)
     render_config["func_name"] = str(
         render_config.get("func_name") or _fmha_fwd_encode(render_config)
     )
-    return (
-        TVM_HEADER + kern_fwd.render(render_config) + EXPORT_FUNC.render(render_config)
-    )
+    render_config.setdefault("has_max_logits", False)
+    return render_config
 
 
 @functools.cache
 def _load_fmha_fwd_module(frozen_config: tuple[tuple[str, object], ...]):
-    return gen_fmha_fwd_spec(dict(frozen_config)).build_and_load()
+    config = dict(frozen_config)
+    target_arch = _JIT_DUMP_CONTEXT.dump_arch if _JIT_DUMP_CONTEXT else None
+    spec = gen_fmha_fwd_spec(config, target_arch=target_arch)
+    module = spec.build_and_load()
+    if _JIT_DUMP_CONTEXT is None:
+        return module
+    assert spec.target_arch is not None
+    return wrap_ffi_module_for_dump(
+        module,
+        spec.get_library_path(),
+        config_arch=_JIT_DUMP_CONTEXT.dump_arch,
+        binary_arch=spec.target_arch,
+    )
 
 
 def _fmha_fwd_module(config: Mapping[str, object]):
@@ -96,32 +117,6 @@ def config_selector(cfg):
     return cfg["config_level"]
 
 
-@functools.cache
-def _dtype_bits(dtype: torch.dtype) -> int:
-    return dtype.itemsize * 8
-
-
-@functools.cache
-def _paged_kv_tme_page_size(dtype: torch.dtype) -> int:
-    return 128 if _dtype_bits(dtype) == 8 else 64
-
-
-@functools.cache
-def _select_lsu_load_kv(
-    *,
-    paged_kv: bool,
-    page_size: int,
-    has_leftpad_k: bool,
-    has_qv: bool,
-    dtype: torch.dtype,
-) -> tuple[bool, bool]:
-    tme_page_size = _paged_kv_tme_page_size(dtype)
-    paged_tme_ok = paged_kv and page_size == tme_page_size and not has_leftpad_k
-    use_lsu_load_k = not paged_tme_ok
-    use_lsu_load_v = (paged_kv and not paged_tme_ok) or (has_qv and not paged_kv)
-    return use_lsu_load_k, use_lsu_load_v
-
-
 def _dtype_from_config(cfg: Mapping[str, object]) -> torch.dtype:
     dtype = cfg["dtype"]
     assert isinstance(dtype, torch.dtype)
@@ -130,12 +125,17 @@ def _dtype_from_config(cfg: Mapping[str, object]) -> torch.dtype:
 
 def _select_lsu_load_kv_for_config(cfg: Mapping[str, object]) -> tuple[bool, bool]:
     dtype = _dtype_from_config(cfg)
+    cc = cfg["cc"]
+    assert isinstance(cc, int)
     use_lsu_load_k, use_lsu_load_v = _select_lsu_load_kv(
         paged_kv=bool(cfg["paged_kv"]),
-        page_size=_paged_kv_tme_page_size(dtype),
+        page_size=cast(int, cfg["page_size"]),
+        tile_n=cast(int, cfg["tile_n"]),
+        has_cu_seqlens_k=bool(cfg["has_cu_seqlens_k"]),
         has_leftpad_k=bool(cfg["has_leftpad_k"]),
         has_qv=bool(cfg["has_qv"]),
         dtype=dtype,
+        override_cc=cc,
     )
     if cast(int, cfg["tile_head_dim"]) > 0 and not cast(bool, cfg["has_qv"]):
         use_lsu_load_k = use_lsu_load_v = use_lsu_load_k or use_lsu_load_v
@@ -236,14 +236,26 @@ mode_k = [
         depends_on=("has_seqused_k",),
     ),
     ParamSpec(
+        name="page_size",
+        domain=[64, 128],
+        default=64,
+        meaningful_if=lambda cfg: bool(cfg["paged_kv"]),
+        depends_on=("paged_kv",),
+        export=False,  # Not exported because page_size is retrieved from dynamic tensor shapes
+    ),
+    ParamSpec(
         name="use_lsu_load_k",
         compute=lambda cfg: _select_lsu_load_kv_for_config(cfg)[0],
         depends_on=(
             "dtype",
             "paged_kv",
+            "page_size",
+            "tile_n",
+            "has_cu_seqlens_k",
             "has_leftpad_k",
             "has_qv",
             "tile_head_dim",
+            "cc",
         ),
         sweep=False,
     ),
@@ -253,9 +265,13 @@ mode_k = [
         depends_on=(
             "dtype",
             "paged_kv",
+            "page_size",
+            "tile_n",
+            "has_cu_seqlens_k",
             "has_leftpad_k",
             "has_qv",
             "tile_head_dim",
+            "cc",
         ),
         sweep=False,
     ),
@@ -414,6 +430,15 @@ specs_attn = [
         name="enable_cp",
         domain=[False],
         default=False,
+    ),
+    ParamSpec(
+        name="mma_pv_rs",
+        domain=[False],
+        default=False,
+    ),
+    ParamSpec(
+        name="cc",
+        domain=[_MUSA_ARCH.major * 10 + _MUSA_ARCH.minor],
     ),
 ]
 
@@ -604,15 +629,35 @@ def get_fmha_fwd_aot_configs(config_level: int) -> list[dict[str, object]]:
     return _gen_specs_from_config(config_level)
 
 
-def gen_fmha_fwd_spec(config: Mapping[str, object]) -> JitSpec:
+def gen_fmha_fwd_spec(
+    config: Mapping[str, object],
+    *,
+    target_arch: Optional["MusaArch"] = None,
+) -> JitSpec:
     dispatch_name = _fmha_fwd_encode(config)
-    source_file = Path(jit_env.MATE_GEN_SRC_DIR / f"{dispatch_name}.mu")
+    generated_dir = (
+        jit_env.resolve_musa_generated_dir(target_arch)
+        if target_arch is not None
+        else jit_env.MATE_GEN_SRC_DIR
+    )
+    source_file = Path(generated_dir / f"{dispatch_name}.mu")
+    render_config = _fmha_fwd_render_config(config)
     return gen_jit_spec(
         name=dispatch_name,
         sources=[source_file],
-        generated_sources={source_file: _render_fmha_fwd_source(config)},
+        generated_sources={
+            source_file: JitSourceTemplate(
+                template=(
+                    jit_env.MATE_TEMPLATE_DIR / "attention" / "fmha" / "fwd_kern.j2"
+                ),
+                context=render_config,
+                prefix=TVM_HEADER,
+                suffix=EXPORT_FUNC_SOURCE,
+            )
+        },
         extra_cuda_cflags=_get_fmha_fwd_extra_cuda_cflags(config),
         extra_include_paths=fmha_extra_include_paths(),
+        target_arch=target_arch,
     )
 
 
@@ -663,6 +708,7 @@ def _fmha_fwd(
     cp_rank: int = 0,
     cp_tot_seqused_k: Optional[torch.Tensor] = None,
     only_qv: bool = False,
+    return_max_logits: bool = False,
 ):
     # Feature gates.
     assert not ((k_new is None) ^ (v_new is None)), (
@@ -934,6 +980,10 @@ def _fmha_fwd(
         softmax_scale = 1.0 / math.sqrt(
             head_dim_v if only_qv else head_dim + (head_dim_v if q_v is not None else 0)
         )
+    if return_max_logits and softmax_scale < 0 and softcap == 0:
+        raise ValueError(
+            "max logits requires non-negative softmax_scale without softcap"
+        )
 
     qhead_per_kvhead = num_head // num_head_kv
     if attention_chunk > 0:
@@ -1014,6 +1064,14 @@ def _fmha_fwd(
         assert lse.dtype == torch.float32
         assert lse.device == q.device
 
+    if return_max_logits and not lse.is_contiguous():
+        raise ValueError("max logits requires a contiguous lse output")
+    max_logits = (
+        torch.empty(lse_shape, dtype=torch.float32, device=q.device)
+        if return_max_logits
+        else None
+    )
+
     batch_rounded = round_multiple(batch_size, 4)
     # Metadata
     # If not provided, fallback to SingleTileScheduler.
@@ -1033,6 +1091,8 @@ def _fmha_fwd(
         consumers_pv,
         tile_head_dim,
         enable_packgqa,
+        mma_pv_rs,
+        cc,
     ) = _get_fwd_kernel_config(
         max_seqlen_q,
         qhead_per_kvhead,
@@ -1043,6 +1103,7 @@ def _fmha_fwd(
         q_v is not None,
         q.dtype in _FP8_DTYPES,
         is_local and attention_chunk != 0,
+        override_cc=_JIT_DUMP_CONFIG_CC,
     )
     multi_chunk = tile_head_dim > 0
     # print(
@@ -1052,9 +1113,12 @@ def _fmha_fwd(
     use_lsu_load_k, use_lsu_load_v = _select_lsu_load_kv(
         paged_kv=page_table is not None,
         page_size=page_size,
+        tile_n=tile_n,
+        has_cu_seqlens_k=cu_seqlens_k is not None,
         has_leftpad_k=leftpad_k is not None,
         has_qv=q_v is not None,
         dtype=q.dtype,
+        override_cc=_JIT_DUMP_CONFIG_CC,
     )
     if multi_chunk and q_v is None:
         use_lsu_load_k = use_lsu_load_v = use_lsu_load_k or use_lsu_load_v
@@ -1098,13 +1162,17 @@ def _fmha_fwd(
         "has_attention_chunk": attention_chunk > 0,
         "has_qv": q_v is not None,
         "only_qv": only_qv,
+        "mma_pv_rs": mma_pv_rs,
+        "cc": cc,
     }
+    if return_max_logits:
+        constexpr_dict["has_max_logits"] = True
     # print(f"tile_m: {tile_m}, tile_n: {tile_n}")
 
     dispatch_name, mod = _fmha_fwd_module(constexpr_dict)
     fmha_fwd_impl = mod.get_function(dispatch_name)
 
-    accums, num_splits = fmha_fwd_impl(
+    ffi_arguments: tuple[Any, ...] = (
         q,
         k,
         v,
@@ -1146,7 +1214,20 @@ def _fmha_fwd(
         cp_tot_seqused_k,
         skip_kernel_launch_if_dry_run(),
     )
-    o_accum, lse_accum = accums
+    if return_max_logits:
+        ffi_arguments += (max_logits,)
+    if _JIT_DUMP_CONTEXT is not None:
+        dump_outputs = {"out": out, "lse": lse}
+        if max_logits is not None:
+            dump_outputs["max_logits"] = max_logits
+        accums, num_splits = fmha_fwd_impl(
+            *ffi_arguments,
+            _dump_outputs=dump_outputs,
+        )
+    else:
+        accums, num_splits = fmha_fwd_impl(*ffi_arguments)
+    o_accum, lse_accum = accums[:2]
+    max_logits_accum = accums[2] if return_max_logits else None
 
     _fmha_fwd_combine(
         out,
@@ -1159,9 +1240,12 @@ def _fmha_fwd(
         max_seqlen_q,
         num_split=num_splits,
         metadata=scheduler_metadata,
+        max_logits=max_logits,
+        max_logits_accum=max_logits_accum,
     )
 
-    return (out, lse, o_accum, lse_accum) if return_lse else (out, o_accum)
+    result = (out, lse, o_accum, lse_accum) if return_lse else (out, o_accum)
+    return (*result, max_logits) if return_max_logits else result
 
 
 def gen_fmha_fwd_aot(config_level: int = 0) -> list[JitSpec]:

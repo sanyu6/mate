@@ -10,7 +10,16 @@ from mate.jit.attention.fmha import gen_fmha_aot
 from mate.jit.gemm.deep_gemm.gemm import gen_deep_gemm_gemm_aot
 from mate.jit.gemm.deep_gemm.hyperconnection import gen_hyperconnection_aot
 from mate.jit.gemm.deep_gemm.mqa_logits import gen_mqa_logits_aot
+from mate.jit.gemm.deep_gemm.mqa_logits_blockscale import (
+    gen_mqa_logits_blockscale_aot,
+)
 from mate.jit.gemm.deep_gemm.paged_mqa_logits import gen_paged_mqa_logits_aot
+from mate.jit.gemm.deep_gemm.paged_mqa_logits_blockscale import (
+    gen_paged_mqa_logits_blockscale_aot,
+)
+from mate.jit.gemm.deep_gemm.paged_mqa_logits_blockscale_metadata import (
+    gen_paged_mqa_logits_blockscale_metadata_aot,
+)
 from mate.jit.gemm.masked_moe_gemm_mixed_dtype import (
     gen_masked_moe_gemm_mixed_dtype_aot,
 )
@@ -107,6 +116,10 @@ def gen_all_modules(config: dict[str, object] | None = None):
         specs.extend(gen_gemm_ops_aot())
         specs.extend(gen_deep_gemm_gemm_aot())
         specs.extend(gen_mqa_logits_aot())
+        if "mp32" in jit_env.MATE_MUSA_ARCH_LIST:
+            specs.extend(gen_mqa_logits_blockscale_aot())
+            specs.extend(gen_paged_mqa_logits_blockscale_aot())
+            specs.extend(gen_paged_mqa_logits_blockscale_metadata_aot())
         specs.extend(gen_paged_mqa_logits_aot())
         specs.extend(gen_hyperconnection_aot())
     if add_moe:

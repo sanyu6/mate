@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Mapping, Optional, cast
 
 import torch
-
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from mate.execution_context import skip_kernel_launch_if_dry_run
@@ -111,6 +110,7 @@ def _maxscore_k_tiles(max_seqlen_k: int, page_size: int = 128) -> int:
 
 @lru_cache(maxsize=256)
 def _msa_maxscore_encode(
+    arch_tag: str,
     dtype_name: str,
     is_paged_kv: bool,
     page_table_kind: str,
@@ -128,7 +128,7 @@ def _msa_maxscore_encode(
     has_metadata: bool,
 ) -> str:
     return (
-        f"msa_maxscore_dtype_{dtype_name}"
+        f"msa_maxscore_{arch_tag}_dtype_{dtype_name}"
         f"_paged_{int(is_paged_kv)}"
         f"_pt_{page_table_kind}"
         f"_ps_{int(page_size)}"
@@ -148,6 +148,7 @@ def _msa_maxscore_encode(
 
 def _msa_maxscore_encode_config(config: Mapping[str, object]) -> str:
     return _msa_maxscore_encode(
+        str(config["arch_tag"]),
         str(config["dtype_name"]),
         bool(config["is_paged_kv"]),
         str(config["page_table_kind"]),
@@ -177,9 +178,24 @@ def _maxscore_tile_q(
     # Match the original FP8 MSA TileLang prefill geometry: one 128-row Q
     # tile feeds four consumer warp-squads (512 consumer threads). Keep the
     # small decode geometry because a one-row request cannot amortize that
-    # tile. BF16 retains its tested 64-row generic geometry below.
+    # tile.
     if (
         dtype == _FP8_E4M3_DTYPE
+        and parallel_k_tiles
+        and int(head_ratio) == 1
+        and max_seqlen_q is not None
+        and int(max_seqlen_q) > 512
+    ):
+        return 128
+    # BF16 prefill takes the same 128-row tile, with K prefetch (see
+    # make_msa_maxscore_config). A 64-row BF16 tile carries only 64 FLOP per
+    # byte of K, so the kernel streams K at about HBM rate. Each score is the
+    # same reduction over the same inputs with either tile, so the scores are
+    # bit-identical; MiniMax-M3 prefill on MP31 ran 1.4x (32K-query chunks)
+    # to 4.8x (4K queries at a 496K prefix) faster. Up to 512 query tokens
+    # (short extends, decode) BF16 keeps its tested 64- and 16-row tiles.
+    if (
+        dtype == torch.bfloat16
         and parallel_k_tiles
         and int(head_ratio) == 1
         and max_seqlen_q is not None
@@ -214,7 +230,6 @@ def _maxscore_tile_q(
     return tile_q
 
 
-@lru_cache(maxsize=256)
 def make_msa_maxscore_config(
     dtype: torch.dtype,
     *,
@@ -264,12 +279,27 @@ def make_msa_maxscore_config(
     # contract holds so short-Q and tail waves expose enough independent work.
     # The scheduler chooses the partition count from the actual Q-work capacity.
     parallel_k_tiles = int(head_ratio) == 1
+    arch_tag = "mp31"
+    if jit_env.resolve_musa_arch_list() == ("mp32",):
+        arch_tag = "mp32_ss"
     selected_tile_q = _maxscore_tile_q(
         int(head_ratio),
         bool(parallel_k_tiles),
         dtype=dtype,
         max_seqlen_q=int(max_seqlen_q),
     )
+    if arch_tag == "mp32_ss":
+        selected_tile_q = max(32, selected_tile_q)
+    native_m64 = (
+        arch_tag == "mp32_ss"
+        and dtype == _FP8_E4M3_DTYPE
+        and int(head_dim) == 128
+        and int(head_ratio) == 1
+        and selected_tile_q == 128
+    )
+    if arch_tag == "mp32_ss":
+        alignment = math.lcm(64 if native_m64 else 32, int(head_ratio))
+        selected_tile_q = ((selected_tile_q + alignment - 1) // alignment) * alignment
     if (
         selected_tile_q <= 0
         or selected_tile_q % 4 != 0
@@ -285,12 +315,18 @@ def make_msa_maxscore_config(
     # barrier/shared-state traffic. The MUTLASS builder still uses its
     # required dispatch-policy stage count internally.
     k_stages = 1
-    enable_k_prefetch = bool(selected_tile_q > 16 and dtype != torch.bfloat16)
-    # Keep the tested generic geometry for production. MmaTileQ remains an
-    # explicit option for A/Bs; the current long-tile path uses M32, while
-    # the small decode tile uses M16.
+    # BF16 prefetches K only with the 128-row prefill tile; its 64-row tile
+    # keeps the tested no-prefetch configuration.
+    enable_k_prefetch = bool(
+        selected_tile_q > 16 and (dtype != torch.bfloat16 or selected_tile_q >= 128)
+    )
+    # MP31 uses M16 for short queries and M32 for larger tiles.
     mma_tile_q = 32 if selected_tile_q >= 32 else 16
+    if native_m64:
+        mma_tile_q = 64
+        k_stages = 2
     return {
+        "arch_tag": arch_tag,
         "element": MSA_DTYPE_MUTLASS[dtype],
         "element_dtype": MSA_DTYPE_FFI[dtype],
         "dtype_name": MSA_DTYPE_NAMES[dtype],
@@ -317,14 +353,30 @@ def _render_msa_maxscore_kernel_source(config: Mapping[str, object]) -> str:
     return MSA_MAXSCORE_KERN_TEMPLATE.render(render_config)
 
 
+def _msa_maxscore_ctas_per_mp(config: Mapping[str, object]) -> int:
+    if not config["parallel_k_tiles"]:
+        return 1
+    native_m64 = (
+        config.get("arch_tag") == "mp32_ss"
+        and config.get("dtype_name") == "fp8e4m3"
+        and config.get("mma_tile_q") == 64
+        and config.get("k_stages") == 2
+        and config.get("head_dim") == 128
+        and config.get("head_ratio") == 1
+        and config.get("tile_q") == 128
+    )
+    return 4 if native_m64 else 3
+
+
 def _msa_k_partitions_for_mps(
     *,
     num_mps: int,
     q_work_count: int,
     max_k_tiles: int,
     parallel_k_tiles: bool,
+    ctas_per_mp: int = 3,
 ) -> int:
-    ctas_per_mp = 3 if parallel_k_tiles else 1
+    ctas_per_mp = int(ctas_per_mp) if parallel_k_tiles else 1
     target_ctas = max(1, int(num_mps)) * ctas_per_mp
     q_works = max(1, int(q_work_count))
     return min(
@@ -339,6 +391,7 @@ def _msa_schedule_num_mps(
     q_work_count: int,
     max_k_tiles: int,
     parallel_k_tiles: bool,
+    ctas_per_mp: int = 3,
 ) -> int:
     """Choose the active MP-slot count for the per-MP persistent schedule.
 
@@ -346,7 +399,7 @@ def _msa_schedule_num_mps(
     slot count close to the amount of Q/K work avoids launching a full-device
     grid for decode-sized inputs while retaining one Q range per active slot.
     """
-    ctas_per_mp = 3 if parallel_k_tiles else 1
+    ctas_per_mp = int(ctas_per_mp) if parallel_k_tiles else 1
     mps = max(1, int(hardware_mps))
     q_work_count = max(1, int(q_work_count))
     max_k_tiles = max(1, int(max_k_tiles))
@@ -356,6 +409,7 @@ def _msa_schedule_num_mps(
             q_work_count=q_work_count,
             max_k_tiles=max_k_tiles,
             parallel_k_tiles=parallel_k_tiles,
+            ctas_per_mp=ctas_per_mp,
         )
         partition_groups = (partitions + ctas_per_mp - 1) // ctas_per_mp
         next_mps = min(mps, max(1, q_work_count * partition_groups))
@@ -444,6 +498,10 @@ def gen_msa_maxscore_spec(
         is_varlen=is_varlen,
         has_metadata=has_metadata,
     )
+    return _gen_msa_maxscore_spec_from_config(config)
+
+
+def _gen_msa_maxscore_spec_from_config(config: Mapping[str, object]) -> JitSpec:
     dispatch_name = _msa_maxscore_encode_config(config)
     source_file = Path(jit_env.MATE_GEN_SRC_DIR / "msa" / f"{dispatch_name}.mu")
     return gen_jit_spec(
@@ -456,7 +514,10 @@ def gen_msa_maxscore_spec(
     )
 
 
-@functools.cache
+# Loaded maxscore modules, keyed by dispatch name (the kernel configuration).
+_MSA_MAXSCORE_MODULES: dict[str, object] = {}
+
+
 def get_msa_maxscore_module(
     dtype: torch.dtype,
     is_paged_kv: bool,
@@ -469,7 +530,13 @@ def get_msa_maxscore_module(
     is_varlen: bool = True,
     has_metadata: bool | None = None,
 ):
-    return gen_msa_maxscore_spec(
+    # max_seqlen_q only selects the tile geometry (_maxscore_tile_q), so cache
+    # the loaded module by the kernel configuration it resolves to. Caching by
+    # max_seqlen_q itself sent every new query length back through
+    # JitSpec.build_and_load: a file lock shared by every rank on the host, a
+    # no-op ninja run and a reload, about 0.5 s per new prefill length at 8
+    # ranks per node.
+    config = make_msa_maxscore_config(
         dtype,
         is_paged_kv=is_paged_kv,
         causal=causal,
@@ -480,7 +547,13 @@ def get_msa_maxscore_module(
         page_size=page_size,
         is_varlen=is_varlen,
         has_metadata=has_metadata,
-    ).build_and_load()
+    )
+    dispatch_name = _msa_maxscore_encode_config(config)
+    module = _MSA_MAXSCORE_MODULES.get(dispatch_name)
+    if module is None:
+        module = _gen_msa_maxscore_spec_from_config(config).build_and_load()
+        _MSA_MAXSCORE_MODULES[dispatch_name] = module
+    return module
 
 
 def _msa_maxscore(
@@ -661,6 +734,7 @@ def _msa_maxscore(
             q_work_count=q_work_count,
             max_k_tiles=valid_k_tiles,
             parallel_k_tiles=bool(config["parallel_k_tiles"]),
+            ctas_per_mp=_msa_maxscore_ctas_per_mp(config),
         )
         if schedule_metadata is None:
             schedule_metadata = torch.empty(
@@ -686,12 +760,14 @@ def _msa_maxscore(
                 q_work_count=q_work_count,
                 max_k_tiles=valid_k_tiles,
                 parallel_k_tiles=bool(config["parallel_k_tiles"]),
+                ctas_per_mp=_msa_maxscore_ctas_per_mp(config),
             )
             schedule_k_partitions = _msa_k_partitions_for_mps(
                 num_mps=schedule_rows,
                 q_work_count=q_work_count,
                 max_k_tiles=valid_k_tiles,
                 parallel_k_tiles=bool(config["parallel_k_tiles"]),
+                ctas_per_mp=_msa_maxscore_ctas_per_mp(config),
             )
             if schedule_k_partitions != kernel_k_partitions:
                 valid_row_counts = " or ".join(
@@ -820,6 +896,10 @@ def make_msa_fwd_config(
     output_dtype = _resolve_fwd_output_dtype(dtype, output_dtype)
     input_config = MSA_FWD_DTYPE_CONFIG[dtype]
     output_config = MSA_FWD_DTYPE_CONFIG[output_dtype]
+    architectures = jit_env.resolve_musa_arch_list()
+    if architectures not in (("mp31",), ("mp32",)):
+        raise ValueError("MSA forward requires one MP31 or MP32 JIT architecture")
+    mma_arch = 320 if architectures == ("mp32",) else 310
     return {
         **input_config,
         "output_name": output_config["name"],
@@ -833,6 +913,7 @@ def make_msa_fwd_config(
         "head_dim": 128,
         "tile_kv": 128,
         "topk": 16,
+        "mma_arch": mma_arch,
     }
 
 

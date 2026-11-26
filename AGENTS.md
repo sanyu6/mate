@@ -86,6 +86,41 @@ When working with MATE's dependencies and tools, refer to these official documen
 - **Working on kernel bindings** → Check the TVM-FFI kernel library guide for output-allocation patterns and `TensorView` usage
 
 
+## Operator Development
+
+- All concrete operator classes must inherit `mate.ops.Op`, and all concrete
+  implementations must inherit `mate.ops.Impl`. Place concrete operators and
+  their implementations under `mate.ops`.
+- Before developing or migrating an operator, read the
+  [operator design guide](mate/ops/README.md)
+  ([中文对照](mate/ops/README_cn.md)).
+- Use the same Op for implementations with the same computation, outputs, and
+  rules for modifying caller tensors. Algorithms, backends, and target
+  architectures may differ. Forward and backward use separate Ops.
+- Export callable Op classes such as `mate.ops.attention.FaFwd`. The base
+  metaclass forwards `FaFwd(...)` to its `run(...)` class method without
+  creating an Op instance. List all public parameters, defaults, and types on
+  `run`, with parameter docstrings. Explain the computation on the class. Set
+  up package exports so users can call the Op after `import mate`.
+- Each `run(...)` creates a new internal `_XxxInput` from `_input.py`, selects
+  an Impl, and calls it. Users pass ordinary arguments. Impl instances hold
+  reusable resources such as compiled modules and caches.
+- Each Op owns implementation selection in `resolve_backend`; preserve
+  `override_backend: str | None = None` where supported. Each Impl owns its
+  complete checks and input normalization in `sanitize`, building in `build`,
+  and execution through `__call__`, invoked as `impl(inputs)`. Document
+  compatibility for implementation-specific prepared data such as metadata.
+- Keep Python imports at module scope. Existing API modules can adapt arguments
+  and call the corresponding Op. They can call `FaFwd.run(...)` to retain
+  argument and return type checking.
+- Migrate existing operators incrementally within the requested scope and
+  preserve their behavior. Shared kernel and build helpers do not each need a
+  public Op.
+- Shared AOT, trace, profiling, and build artifact APIs are still being designed.
+  Operator development and migration do not need to implement them. Preserve
+  existing build and loading behavior.
+
+
 ## Repository Skills
 
 Public repository skills live under `skills/<skill-name>/SKILL.md`.
@@ -102,6 +137,9 @@ Public repository skills live under `skills/<skill-name>/SKILL.md`.
 
 
 ## Behavior Rules
+
+- For TileLang kernels, follow the
+  [TileLang development rules](docs/tilelang_development_rules.md).
 
 - Always read relevant files before modifying code
 - For non-trivial tasks, create a plan first

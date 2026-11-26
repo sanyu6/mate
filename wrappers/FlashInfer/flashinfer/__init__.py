@@ -2,9 +2,11 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from . import decode as decode
+from . import gated_act_mxfp8 as gated_act_mxfp8
 from . import gemm as gemm
-from . import mamba as mamba
+from . import mla as mla
 from . import norm as norm
+from . import quantization as quantization
 from . import rope as rope
 from .gemm import bmm_bf16 as bmm_bf16
 from .gemm import bmm_fp8 as bmm_fp8
@@ -30,6 +32,15 @@ from .norm import layernorm as layernorm
 from .norm import layernorm_quant as layernorm_quant
 from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
+from .quantization import (
+    SfLayout as SfLayout,
+    fp4_quantize as fp4_quantize,
+    mxfp4_dequantize as mxfp4_dequantize,
+    mxfp4_quantize as mxfp4_quantize,
+    mxfp8_quantize as mxfp8_quantize,
+    packbits as packbits,
+    segment_packbits as segment_packbits,
+)
 
 try:
     from ._build_meta import __git_version__ as __git_version__
@@ -63,11 +74,13 @@ def _load_version() -> str:
 __version__ = _load_version()
 
 __all__ = [
+    "SfLayout",
     "__git_version__",
     "__version__",
     "bmm_bf16",
     "bmm_fp8",
     "decode",
+    "fp4_quantize",
     "fused_add_rmsnorm",
     "fused_add_rmsnorm_fp8_block_quant",
     "fused_add_rmsnorm_quant",
@@ -76,13 +89,21 @@ __all__ = [
     "fused_dit_residual_layernorm_scale_shift",
     "fused_qk_rmsnorm_rope",
     "fused_rmsnorm_silu",
+    "gated_act_mxfp8",
     "gemm",
     "gemma_fused_add_rmsnorm",
     "gemma_rmsnorm",
     "layernorm",
     "layernorm_quant",
+    "mla",
+    "mxfp4_dequantize",
+    "mxfp4_quantize",
+    "mxfp8_quantize",
     "norm",
+    "packbits",
+    "quantization",
     "rope",
     "rmsnorm",
     "rmsnorm_quant",
+    "segment_packbits",
 ]

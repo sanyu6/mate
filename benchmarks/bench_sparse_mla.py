@@ -28,12 +28,22 @@ FLASHMLA_ROOT = REPO_ROOT / "wrappers" / "FlashMLA"
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(FLASHMLA_ROOT))
 
-import flash_mla  # noqa: E402
-from mate.mate_runtime import resolve_num_mps  # noqa: E402
+try:
+    import flash_mla  # noqa: E402
+except ModuleNotFoundError:
+    flash_mla = None
+from mate.flashmla import get_mla_metadata as mate_get_mla_metadata  # noqa: E402
+from mate.mate_runtime import (  # noqa: E402
+    MP32_ARCH,
+    get_musa_arch,
+    resolve_num_mps,
+)
+from mate.sparse_mla.flashmla_checks import V4_KV_BYTES_PER_TOKEN  # noqa: E402
 from mate.sparse_mla_interface import (  # noqa: E402
     get_batch_decode_metadata_mla,
     sparse_mla_fp8_decode,
 )
+from mate.utils import cosize  # noqa: E402
 from mate.testing.sparse_mla import quantize_sparse_mla_cache  # noqa: E402
 
 
@@ -169,6 +179,7 @@ def _bench_graph_us(
     fn: Callable[[], object],
     repeat: int,
     num_iters_within_graph: int,
+    samples_us: list[float] | None = None,
 ) -> float:
     backend = _gpu_backend()
     num_iters_within_graph = max(1, num_iters_within_graph)
@@ -200,6 +211,8 @@ def _bench_graph_us(
         start_events[idx].elapsed_time(end_events[idx]) / num_iters_within_graph
         for idx in range(repeat)
     ]
+    if samples_us is not None:
+        samples_us.extend(t * 1000.0 for t in times_ms)
     _GRAPH_KEEPALIVE.append((graph, captured_outputs))
     return statistics.median(times_ms) * 1000.0
 
@@ -453,7 +466,7 @@ def _decode_stats(
     if case.native_fp8:
         kv_token_size = 576
     elif case.d_qk == 512:
-        kv_token_size = 584
+        kv_token_size = V4_KV_BYTES_PER_TOKEN
     else:
         kv_token_size = 656
     q_element_size = 1 if case.native_fp8 else 2
@@ -479,48 +492,107 @@ def _make_v32_prefill_graph_runner(
     topk_length: torch.Tensor | None,
     attn_sink: torch.Tensor | None,
 ) -> Callable[[], object]:
-    from mate.sparse_mla.tilelang.sparse_mla_v32_fwd_pipelined import (
-        sparse_attention_fwd_kernel,
-    )
-
     seq_len, heads, dim_plus_tail_dim = q.shape
     dim = DV
     tail_dim = dim_plus_tail_dim - dim
     _, kv_group, _ = kv.shape
     topk = indices.shape[-1]
-    kernel = _compile_with_explicit_outputs(
-        sparse_attention_fwd_kernel,
-        heads,
-        dim,
-        tail_dim,
-        topk,
-        kv_group=kv_group,
-        sm_scale=None,
-        is_causal=False,
-        threads=640,
-        has_attn_sink=attn_sink is not None,
-        has_topk_length=topk_length is not None,
-        is_persistence=case.is_persistence,
-        persistent_blocks=case.persistent_blocks,
+    arch = get_musa_arch(q)
+    is_mp32 = arch == MP32_ARCH
+    persistent_blocks = (
+        resolve_num_mps(q.device, case.persistent_blocks) if case.is_persistence else 0
     )
+    if is_mp32:
+        from mate.sparse_mla.tilelang.sparse_mla_index_type import (
+            jit_for_tensor_addressing,
+        )
+        from mate.sparse_mla.tilelang.mp32.sparse_mla_v32_fwd_pipelined import (
+            sparse_mla_prefill_kernel,
+        )
+
+        kernel_factory = jit_for_tensor_addressing(
+            sparse_mla_prefill_kernel, q, kv, indices
+        )
+        kernel = _compile_with_explicit_outputs(
+            kernel_factory,
+            heads,
+            topk,
+            kv_group=kv_group,
+            sm_scale=None,
+            threads=640,
+            has_attn_sink=attn_sink is not None,
+            has_topk_length=topk_length is not None,
+            is_persistence=case.is_persistence,
+            persistent_blocks=persistent_blocks,
+            use_int64_cosize=kernel_factory is not sparse_mla_prefill_kernel,
+        )
+    else:
+        from mate.sparse_mla.tilelang.mp31.sparse_mla_v32_fwd_pipelined import (
+            sparse_attention_fwd_kernel,
+        )
+
+        kernel = _compile_with_explicit_outputs(
+            sparse_attention_fwd_kernel,
+            heads,
+            dim,
+            tail_dim,
+            topk,
+            kv_group=kv_group,
+            sm_scale=None,
+            is_causal=False,
+            threads=640,
+            has_attn_sink=attn_sink is not None,
+            has_topk_length=topk_length is not None,
+            is_persistence=case.is_persistence,
+            persistent_blocks=persistent_blocks,
+        )
     out = torch.empty((seq_len, heads, dim), dtype=q.dtype, device=q.device)
     max_logits = torch.empty((seq_len, heads), dtype=torch.float32, device=q.device)
     lse = torch.empty((seq_len, heads), dtype=torch.float32, device=q.device)
 
     def run_graph():
-        args = [q, kv, indices]
-        args.extend((out, max_logits, lse))
-        if topk_length is not None:
-            args.append(topk_length)
-        if attn_sink is not None:
-            args.append(attn_sink)
+        if is_mp32:
+            # MP32 PrimFuncs keep a fixed graph ABI.  The has_* compile-time
+            # specializations remove all loads from these allocation-free
+            # aliases when the optional input is absent.
+            topk_length_arg = (
+                topk_length
+                if topk_length is not None
+                else indices.as_strided((seq_len,), (1,))
+            )
+            attn_sink_arg = (
+                attn_sink
+                if attn_sink is not None
+                else kv.view(torch.float32).as_strided((heads,), (1,))
+            )
+            args = [
+                q,
+                kv,
+                indices,
+                topk_length_arg,
+                attn_sink_arg,
+                out,
+                max_logits,
+                lse,
+                cosize(q.shape, q.stride()),
+                cosize(kv.shape, kv.stride()),
+            ]
+        else:
+            # MP31's compiled PrimFunc ABI keeps caller-owned outputs before
+            # its conditionally present topk_length/attn_sink parameters.
+            args = [q, kv, indices]
+            args.extend((out, max_logits, lse))
+            if topk_length is not None:
+                args.append(topk_length)
+            if attn_sink is not None:
+                args.append(attn_sink)
         kernel(*args)
         return out, max_logits, lse
 
     return run_graph
 
 
-def _make_model1_prefill_graph_runner(
+def _make_v4_prefill_graph_runner(
     case: PrefillCase,
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -531,43 +603,74 @@ def _make_model1_prefill_graph_runner(
     extra_indices: torch.Tensor | None,
     extra_topk_length: torch.Tensor | None,
 ) -> Callable[[], object]:
-    from mate.sparse_mla.tilelang.sparse_mla_model1_fwd_pipelined import (
-        sparse_attention_fwd_kernel_model1,
-    )
-
     seq_len, heads, dim = q.shape
     _, kv_group, _ = kv.shape
     assert extra_kv is None and extra_indices is None and extra_topk_length is None, (
-        "MODEL1 prefill graph runner has no extra-KV ABI"
+        "V4 prefill graph runner has no extra-KV ABI"
     )
+    arch = get_musa_arch(q)
+    is_mp32 = arch == MP32_ARCH
+    persistent_blocks = (
+        resolve_num_mps(q.device, case.persistent_blocks) if case.is_persistence else 0
+    )
+    if is_mp32:
+        from mate.sparse_mla.tilelang.sparse_mla_index_type import (
+            jit_for_tensor_addressing,
+        )
+        from mate.sparse_mla.tilelang.mp32.sparse_mla_v4_mp32_fwd_pipelined import (
+            sparse_attention_fwd_kernel_v4_mp32_optimized,
+        )
 
-    kernel_kwargs = {
-        "kv_group": kv_group,
-        "sm_scale": case.d_qk**-0.5,
-        "is_causal": True,
-        "threads": 640,
-        "has_attn_sink": attn_sink is not None,
-        "has_topk_length": topk_length is not None,
-        "is_persistence": case.is_persistence,
-        "persistent_blocks": case.persistent_blocks,
-    }
-    kernel = _compile_with_explicit_outputs(
-        sparse_attention_fwd_kernel_model1,
-        heads,
-        dim,
-        **kernel_kwargs,
-    )
+        kernel_factory = jit_for_tensor_addressing(
+            sparse_attention_fwd_kernel_v4_mp32_optimized, q, kv, indices
+        )
+        kernel = _compile_with_explicit_outputs(
+            kernel_factory,
+            heads,
+            dim,
+            kv_group=kv_group,
+            is_causal=True,
+            block_i=128 if heads == 64 and indices.shape[-1] >= 4096 else 64,
+            threads=640,
+            has_attn_sink=attn_sink is not None,
+            has_topk_length=topk_length is not None,
+            is_persistence=case.is_persistence,
+            use_kv_source_precompute=False,
+        )
+    else:
+        from mate.sparse_mla.tilelang.mp31.sparse_mla_v4_fwd_generic import (
+            sparse_attention_fwd_kernel_v4,
+        )
+
+        kernel = _compile_with_explicit_outputs(
+            sparse_attention_fwd_kernel_v4,
+            heads,
+            dim,
+            kv_group=kv_group,
+            sm_scale=case.d_qk**-0.5,
+            is_causal=True,
+            threads=640,
+            has_attn_sink=attn_sink is not None,
+            has_topk_length=topk_length is not None,
+            is_persistence=case.is_persistence,
+            persistent_blocks=persistent_blocks,
+        )
     out = torch.empty((seq_len, heads, dim), dtype=q.dtype, device=q.device)
     max_logits = torch.empty((seq_len, heads), dtype=torch.float32, device=q.device)
     lse = torch.empty((seq_len, heads), dtype=torch.float32, device=q.device)
 
     def run_graph():
-        args = [q, kv, indices]
-        args.extend((out, max_logits, lse))
+        # Both PrimFunc ABIs place caller-owned outputs before optional inputs.
+        args = [q, kv, indices, out, max_logits, lse]
         if topk_length is not None:
             args.append(topk_length)
         if attn_sink is not None:
             args.append(attn_sink)
+        if is_mp32:
+            # The pipelined MP32 kernel takes the log2 scale and CTA count at
+            # runtime, after the conditionally present length/sink tensors.
+            args.extend((case.d_qk**-0.5 * 1.44269504, int(persistent_blocks)))
+            args.extend((cosize(q.shape, q.stride()), cosize(kv.shape, kv.stride())))
         kernel(*args)
         return out, max_logits, lse
 
@@ -623,15 +726,18 @@ def _run_prefill_case(
     if case.direct_tilelang:
         if case.d_qk == 512:
             if extra_kv is not None:
-                raise AssertionError(
-                    "MODEL1 direct prefill no longer has an extra-KV ABI"
+                raise AssertionError("V4 direct prefill no longer has an extra-KV ABI")
+            if get_musa_arch(q) == MP32_ARCH:
+                from mate.sparse_mla.tilelang.mp32.sparse_mla_v4_mp32_fwd_pipelined import (
+                    sparse_mla_fwd_interface_v4_mp32_optimized as sparse_mla_fwd_interface_v4,
                 )
-            from mate.sparse_mla.tilelang.sparse_mla_model1_fwd_pipelined import (
-                sparse_mla_fwd_interface_model1,
-            )
+            else:
+                from mate.sparse_mla.tilelang.mp31.sparse_mla_v4_fwd_generic import (
+                    sparse_mla_fwd_interface_v4_generic as sparse_mla_fwd_interface_v4,
+                )
 
             def run():
-                return sparse_mla_fwd_interface_model1(
+                return sparse_mla_fwd_interface_v4(
                     q=q,
                     kv=kv,
                     indices=indices,
@@ -645,9 +751,14 @@ def _run_prefill_case(
         elif case.d_qk == 576:
             if extra_kv is not None:
                 raise AssertionError("V3.2 direct prefill has no extra-KV ABI")
-            from mate.sparse_mla.tilelang.sparse_mla_v32_fwd_pipelined import (
-                tilelang_sparse_mla_prefill_fwd_interface,
-            )
+            if get_musa_arch(q) == MP32_ARCH:
+                from mate.sparse_mla.tilelang.mp32.sparse_mla_v32_fwd_pipelined import (
+                    tilelang_sparse_mla_prefill_fwd_interface,
+                )
+            else:
+                from mate.sparse_mla.tilelang.mp31.sparse_mla_v32_fwd_pipelined import (
+                    tilelang_sparse_mla_prefill_fwd_interface,
+                )
 
             def run():
                 return tilelang_sparse_mla_prefill_fwd_interface(
@@ -691,7 +802,7 @@ def _run_prefill_case(
             case, q, kv, indices, topk_length, attn_sink
         )
     elif use_graph and case.d_qk == 512:
-        run_graph = _make_model1_prefill_graph_runner(
+        run_graph = _make_v4_prefill_graph_runner(
             case,
             q,
             kv,
@@ -845,13 +956,37 @@ def _make_native_fp8_decode_inputs(case: DecodeCase, use_graph: bool):
     return q, kv_cache, indices, topk_length, out
 
 
+def _get_decode_metadata(
+    cache_seqlens: torch.Tensor,
+    *,
+    num_q_tokens_per_head_k: int,
+    num_heads_k: int,
+    num_heads_q: int,
+    topk: int,
+    topk_length: torch.Tensor | None = None,
+    extra_topk: int | None = None,
+    extra_topk_length: torch.Tensor | None = None,
+):
+    """Build direct-decode metadata with the production scheduler."""
+    return mate_get_mla_metadata(
+        cache_seqlens=cache_seqlens,
+        num_q_tokens_per_head_k=num_q_tokens_per_head_k,
+        num_heads_k=num_heads_k,
+        num_heads_q=num_heads_q,
+        is_fp8_kvcache=True,
+        topk=topk,
+        extra_topk=extra_topk,
+        bs=int(cache_seqlens.numel()),
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
+    )
+
+
 def _make_v32_temp_decode_inputs(case: DecodeCase):
     if case.d_qk != 576:
         raise AssertionError("temp-aligned direct decode is V3.2-only")
-    if case.extra_topk > 0 or case.attn_sink or case.topk_length:
-        raise AssertionError(
-            "temp-aligned V3.2 decode disables extra/topk_length/attn_sink"
-        )
+    if case.extra_topk > 0 or case.attn_sink:
+        raise AssertionError("temp-aligned V3.2 decode disables extra KV and attn_sink")
 
     device = _device()
     torch.manual_seed(20260503 + case.d_qk + case.batch_size)
@@ -880,6 +1015,12 @@ def _make_v32_temp_decode_inputs(case: DecodeCase):
         cu_seqlens,
         device,
     )
+    topk_length = None
+    if case.topk_length:
+        topk_length = torch.full(
+            (case.batch_size,), case.topk, dtype=torch.int32, device=device
+        )
+        topk_length[::5] = max(1, case.topk // 2)
 
     quant_scales = torch.tensor(
         [0.6, 0.7, 0.8, 0.9], dtype=torch.float32, device=device
@@ -896,20 +1037,14 @@ def _make_v32_temp_decode_inputs(case: DecodeCase):
         dim=-1,
     ).contiguous()
 
-    from mate.sparse_mla.tilelang.temp.sparse_mla_v32_decode_fwd_scheduled import (
-        get_mla_metadata_pytorch,
-    )
-
-    sched_meta, num_splits = get_mla_metadata_pytorch(
+    sched_meta, num_splits = _get_decode_metadata(
         cache_seqlens,
         num_q_tokens_per_head_k=case.seq_len_q * case.num_heads,
         num_heads_k=1,
         num_heads_q=case.num_heads,
         topk=case.topk,
-        mp_count=case.mp_count,
-        TILE_M=case.tile_m,
+        topk_length=topk_length,
     )
-    topk_length = None
     return q, k_cache, indices, sched_meta, num_splits, topk_length
 
 
@@ -923,9 +1058,6 @@ def _make_v32_decode_graph_runner(
     sched_meta: torch.Tensor,
     num_splits: torch.Tensor,
 ) -> Callable[[], object]:
-    from mate.sparse_mla.tilelang.sparse_mla_v32_decode_fwd_scheduled import (
-        sparse_attention_fwd_kernel,
-    )
     from mate.sparse_mla.tilelang.sparse_mla_decode_scheduled_common import (
         prepare_scheduled_decode_runtime,
     )
@@ -936,6 +1068,8 @@ def _make_v32_decode_graph_runner(
     kv_flat = k_cache.view(-1, k_cache.shape[-2], k_cache.shape[-1])
     kv_group = kv_flat.shape[1]
     support_split = int(sched_meta.shape[0]) != 1
+    arch = get_musa_arch(q)
+    is_mp32 = arch == MP32_ARCH
     runtime = prepare_scheduled_decode_runtime(
         batch=batch,
         seq_len=seq_len,
@@ -948,43 +1082,86 @@ def _make_v32_decode_graph_runner(
         out_dtype=q.dtype,
         device=q.device,
         variant_name="V3.2",
-        support_split=support_split,
-    )
-    kernel = sparse_attention_fwd_kernel(
-        heads,
-        dim,
-        tail_dim,
-        indices.shape[-1],
-        kv_group=kv_group,
-        sm_scale=case.d_qk**-0.5,
-        threads=640,
-        max_nums_splits=runtime.max_nums_splits,
-        has_attn_sink=runtime.has_attn_sink,
-        has_topk_length=runtime.topk_length is not None,
-        support_split=support_split,
+        support_split=True if is_mp32 else support_split,
     )
     kv_latent_f8 = kv_flat.view(torch.float8_e4m3fn)
     k_rope = kv_flat.view(torch.bfloat16)
     scales = kv_flat.view(torch.float32)
+    if is_mp32:
+        from mate.sparse_mla.tilelang.sparse_mla_index_type import (
+            jit_for_tensor_addressing,
+        )
+        from mate.sparse_mla.tilelang.mp32.sparse_mla_v32_decode_fwd_scheduled import (
+            sparse_mla_decode_kernel,
+        )
+
+        assert runtime.glse is not None and runtime.out_partial is not None
+        kernel_factory = jit_for_tensor_addressing(
+            sparse_mla_decode_kernel, q, kv_flat, indices, runtime.out_partial
+        )
+        kernel = _compile_with_explicit_outputs(
+            kernel_factory,
+            heads,
+            indices.shape[-1],
+            kv_group=kv_group,
+            sm_scale=case.d_qk**-0.5,
+            threads=640,
+            max_nums_splits=runtime.max_nums_splits,
+            has_attn_sink=runtime.has_attn_sink,
+            has_topk_length=runtime.topk_length is not None,
+        )
+    else:
+        from mate.sparse_mla.tilelang.mp31.sparse_mla_v32_decode_fwd_scheduled import (
+            sparse_attention_fwd_kernel,
+        )
+
+        kernel = sparse_attention_fwd_kernel(
+            heads,
+            dim,
+            tail_dim,
+            kv_group=kv_group,
+            threads=640,
+            max_nums_splits=runtime.max_nums_splits,
+            has_attn_sink=runtime.has_attn_sink,
+            has_topk_length=runtime.topk_length is not None,
+            support_split=support_split,
+        )
 
     def run_graph():
         args = [q, kv_latent_f8, k_rope, scales, indices]
-        if runtime.topk_length is not None:
-            args.append(runtime.topk_length)
-        if runtime.attn_sink is not None:
-            args.append(runtime.attn_sink)
+        if is_mp32:
+            args.append(
+                runtime.topk_length
+                if runtime.topk_length is not None
+                else indices.as_strided((batch,), (1,))
+            )
+            args.append(
+                runtime.attn_sink
+                if runtime.attn_sink is not None
+                else kv_flat.view(torch.float32).as_strided((heads,), (1,))
+            )
+        else:
+            if runtime.topk_length is not None:
+                args.append(runtime.topk_length)
+            if runtime.attn_sink is not None:
+                args.append(runtime.attn_sink)
         args.extend((sched_meta, num_splits))
-        if support_split:
+        if is_mp32 or support_split:
             assert runtime.glse is not None and runtime.out_partial is not None
             args.extend((runtime.glse, runtime.out_partial))
         args.extend((runtime.out, runtime.lse))
+        if is_mp32:
+            args.append(cosize(q.shape, q.stride()))
+        else:
+            args.append(case.d_qk**-0.5 * 1.44269504)
+            args.append(cosize(kv_flat.shape, kv_flat.stride()))
         kernel(*args)
         return runtime.out, runtime.lse
 
     return run_graph
 
 
-def _make_model1_decode_graph_runner(
+def _make_v4_decode_graph_runner(
     case: DecodeCase,
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -997,21 +1174,20 @@ def _make_model1_decode_graph_runner(
     sched_meta: torch.Tensor,
     num_splits: torch.Tensor,
 ) -> Callable[[], object]:
-    from mate.sparse_mla.flashmla_checks import model1_cache_page_views
+    from mate.sparse_mla.flashmla_checks import v4_cache_page_views
     from mate.sparse_mla.tilelang.sparse_mla_decode_scheduled_common import (
         prepare_scheduled_decode_runtime,
     )
-    from mate.sparse_mla.tilelang.sparse_mla_model1_decode_fwd_scheduled import (
-        sparse_attention_decode_fwd_scheduled_kernel_model1,
-    )
 
     batch, seq_len, heads, _ = q.shape
-    kv_nope, kv_rope, kv_scales = model1_cache_page_views(k_cache)
+    arch = get_musa_arch(q)
+    is_mp32 = arch == MP32_ARCH
+    kv_nope, kv_rope, kv_scales = v4_cache_page_views(k_cache)
     has_extra = extra_k_cache is not None
     assert (extra_indices is not None) == has_extra
     assert has_extra or extra_topk_length is None
     if has_extra:
-        extra_kv_nope, extra_kv_rope, extra_kv_scales = model1_cache_page_views(
+        extra_kv_nope, extra_kv_rope, extra_kv_scales = v4_cache_page_views(
             extra_k_cache
         )
     else:
@@ -1030,46 +1206,195 @@ def _make_model1_decode_graph_runner(
         num_splits=num_splits,
         out_dtype=q.dtype,
         device=q.device,
-        variant_name="MODEL1",
-        support_split=support_split,
+        variant_name="V4",
+        support_split=True if is_mp32 else support_split,
     )
-    kernel = sparse_attention_decode_fwd_scheduled_kernel_model1(
-        heads,
-        DV,
-        has_extra=has_extra,
-        kv_group=1,
-        sm_scale=case.d_qk**-0.5,
-        threads=640,
-        max_nums_splits=runtime.max_nums_splits,
-        has_attn_sink=runtime.has_attn_sink,
-        has_topk_length=runtime.topk_length is not None,
-        has_extra_topk_length=extra_topk_length is not None,
-        page_block_size=k_cache.shape[1],
-        extra_page_block_size=(
-            extra_k_cache.shape[1] if extra_k_cache is not None else None
-        ),
-        use_8byte_kv_loads=(
-            kv_rope.stride(0) % 8 != 0
-            or (extra_kv_rope is not None and extra_kv_rope.stride(0) % 8 != 0)
-        ),
-        support_split=support_split,
+    page_block_size = k_cache.shape[1]
+    extra_page_block_size = (
+        extra_k_cache.shape[1] if extra_k_cache is not None else page_block_size
     )
+    if is_mp32:
+        from mate.sparse_mla.tilelang.sparse_mla_index_type import (
+            jit_for_tensor_addressing,
+        )
+        from mate.sparse_mla.tilelang.mp32.sparse_mla_v4_mp32_decode_fwd_scheduled import (
+            sparse_attention_decode_fwd_scheduled_kernel_v4,
+        )
+
+        page_block_bytes = page_block_size * 584
+        kv_nope = kv_nope[:, :page_block_bytes]
+        kv_rope = kv_rope[:, : page_block_bytes // 2]
+        kv_scales = kv_scales[:, :page_block_bytes]
+        if not has_extra:
+            extra_kv_nope = kv_nope
+            extra_kv_rope = kv_rope
+            extra_kv_scales = kv_scales
+            extra_indices = indices[:, :, :, :0]
+        else:
+            extra_page_block_bytes = extra_page_block_size * 584
+            extra_kv_nope = extra_kv_nope[:, :extra_page_block_bytes]
+            extra_kv_rope = extra_kv_rope[:, : extra_page_block_bytes // 2]
+            extra_kv_scales = extra_kv_scales[:, :extra_page_block_bytes]
+        assert runtime.glse is not None and runtime.out_partial is not None
+        address_tensors = [
+            q,
+            kv_nope,
+            kv_rope,
+            kv_scales,
+            indices,
+            extra_kv_nope,
+            extra_kv_rope,
+            extra_kv_scales,
+            extra_indices,
+            runtime.out_partial,
+        ]
+        kernel_factory = jit_for_tensor_addressing(
+            sparse_attention_decode_fwd_scheduled_kernel_v4, *address_tensors
+        )
+        kernel = _compile_with_explicit_outputs(
+            kernel_factory,
+            heads,
+            DV,
+            has_extra=has_extra,
+            kv_group=1,
+            sm_scale=case.d_qk**-0.5,
+            threads=640,
+            max_nums_splits=runtime.max_nums_splits,
+            has_attn_sink=runtime.has_attn_sink,
+            has_topk_length=runtime.topk_length is not None,
+            has_extra_topk_length=extra_topk_length is not None,
+            page_block_size=page_block_size,
+            extra_page_block_size=extra_page_block_size,
+            use_int64_cosize=(
+                kernel_factory is not sparse_attention_decode_fwd_scheduled_kernel_v4
+            ),
+            use_8byte_kv_loads=(
+                kv_rope.stride(0) % 8 != 0 or extra_kv_rope.stride(0) % 8 != 0
+            ),
+        )
+    else:
+        from mate.sparse_mla.tilelang.mp31.sparse_mla_v4_decode_fwd_scheduled import (
+            sparse_attention_decode_fwd_scheduled_kernel_v4,
+        )
+
+        kernel = sparse_attention_decode_fwd_scheduled_kernel_v4(
+            heads,
+            DV,
+            has_extra=has_extra,
+            kv_group=1,
+            threads=640,
+            max_nums_splits=runtime.max_nums_splits,
+            has_attn_sink=runtime.has_attn_sink,
+            has_topk_length=runtime.topk_length is not None,
+            has_extra_topk_length=extra_topk_length is not None,
+            use_8byte_kv_loads=(
+                kv_rope.stride(0) % 8 != 0
+                or (extra_kv_rope is not None and extra_kv_rope.stride(0) % 8 != 0)
+            ),
+            support_split=support_split,
+        )
 
     def run_graph():
         args = [q, kv_nope, kv_rope, kv_scales, indices]
-        if runtime.topk_length is not None:
-            args.append(runtime.topk_length)
-        if has_extra:
+        if is_mp32:
+            args.append(
+                runtime.topk_length
+                if runtime.topk_length is not None
+                else indices.as_strided((batch,), (1,))
+            )
             args.extend((extra_kv_nope, extra_kv_rope, extra_kv_scales, extra_indices))
-            if extra_topk_length is not None:
-                args.append(extra_topk_length)
-        if runtime.attn_sink is not None:
-            args.append(runtime.attn_sink)
+            args.append(
+                extra_topk_length
+                if extra_topk_length is not None
+                else indices.as_strided((batch,), (1,))
+            )
+            args.append(
+                runtime.attn_sink
+                if runtime.attn_sink is not None
+                else q.view(torch.float32).as_strided((heads,), (1,))
+            )
+        else:
+            topk_length_arg = (
+                runtime.topk_length
+                if runtime.topk_length is not None
+                else indices.as_strided((batch,), (1,))
+            )
+            attn_sink_arg = (
+                runtime.attn_sink
+                if runtime.attn_sink is not None
+                else q.view(torch.float32).as_strided((heads,), (1,))
+            )
+            if has_extra:
+                args.extend(
+                    (extra_kv_nope, extra_kv_rope, extra_kv_scales, extra_indices)
+                )
+                args.append(
+                    extra_topk_length
+                    if extra_topk_length is not None
+                    else indices.as_strided((batch,), (1,))
+                )
+            args.append(attn_sink_arg)
+            args.insert(5, topk_length_arg)
         args.extend((sched_meta, num_splits))
-        if support_split:
+        if is_mp32 or support_split:
             assert runtime.glse is not None and runtime.out_partial is not None
             args.extend((runtime.glse, runtime.out_partial))
         args.extend((runtime.out, runtime.lse))
+        if is_mp32:
+            args.extend(
+                (
+                    cosize(q.shape, q.stride()),
+                    cosize(kv_nope.shape, kv_nope.stride()),
+                    cosize(kv_rope.shape, kv_rope.stride()),
+                    cosize(kv_scales.shape, kv_scales.stride()),
+                    cosize(extra_kv_nope.shape, extra_kv_nope.stride()),
+                    cosize(extra_kv_rope.shape, extra_kv_rope.stride()),
+                    cosize(extra_kv_scales.shape, extra_kv_scales.stride()),
+                )
+            )
+        else:
+            page_block_bytes = page_block_size * 584
+            num_blocks = kv_rope.shape[0]
+            kv_rope_span_bytes = (
+                0
+                if num_blocks == 0
+                else ((num_blocks - 1) * kv_rope.stride(0) + page_block_bytes // 2) * 2
+            )
+            kv_scales_span_bytes = (
+                0
+                if num_blocks == 0
+                else (num_blocks - 1) * kv_scales.stride(0) + page_block_bytes
+            )
+            from mate.sparse_mla.tilelang.mp31.sparse_mla_v4_decode_fwd_scheduled import (
+                _fast_divmod_magic,
+            )
+
+            page_mult, page_shift = _fast_divmod_magic(page_block_size)
+            args.append(case.d_qk**-0.5 * 1.44269504)
+            args.extend((int(page_mult), int(page_shift)))
+            args.extend((int(kv_rope_span_bytes), int(kv_scales_span_bytes)))
+            if has_extra:
+                extra_page_block_bytes = extra_page_block_size * 584
+                extra_num_blocks = extra_kv_rope.shape[0]
+                extra_rope_span = (
+                    0
+                    if extra_num_blocks == 0
+                    else (
+                        (extra_num_blocks - 1) * extra_kv_rope.stride(0)
+                        + extra_page_block_bytes // 2
+                    )
+                    * 2
+                )
+                extra_scales_span = (
+                    0
+                    if extra_num_blocks == 0
+                    else (extra_num_blocks - 1) * extra_kv_scales.stride(0)
+                    + extra_page_block_bytes
+                )
+                extra_mult, extra_shift = _fast_divmod_magic(extra_page_block_size)
+                args.extend((int(extra_rope_span), int(extra_scales_span)))
+                args.extend((int(page_mult), int(page_shift)))
+                args.extend((int(extra_mult), int(extra_shift)))
         kernel(*args)
         return runtime.out, runtime.lse
 
@@ -1083,6 +1408,66 @@ def _run_decode_case(
     use_graph: bool,
     graph_iters: int,
 ) -> None:
+    if case.direct_tilelang and case.d_qk == 512:
+        inputs = _make_decode_inputs(case)
+        (
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            extra_k_cache,
+            extra_indices,
+            extra_topk_length,
+        ) = inputs
+        stats = _decode_stats(
+            case, indices, topk_length, extra_indices, extra_topk_length
+        )
+        cache_seqlens = torch.full(
+            (case.batch_size,),
+            case.seq_len_kv,
+            dtype=torch.int32,
+            device=q.device,
+        )
+        sched_meta, num_splits = _get_decode_metadata(
+            cache_seqlens,
+            num_q_tokens_per_head_k=case.seq_len_q * case.num_heads,
+            num_heads_k=1,
+            num_heads_q=case.num_heads,
+            topk=case.topk,
+            topk_length=topk_length,
+            extra_topk=case.extra_topk or None,
+            extra_topk_length=extra_topk_length,
+        )
+        run_graph = _make_v4_decode_graph_runner(
+            case,
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            extra_k_cache,
+            extra_indices,
+            extra_topk_length,
+            sched_meta,
+            num_splits,
+        )
+        run_graph()
+        _sync()
+        impl_kernel_us, impl_kernel_rows = _bench_impl_kernel_us(run_graph, repeat)
+        kernel_path_us, used_graph = _bench_kernel_path_us(
+            run_graph, repeat, use_graph=False, graph_iters=graph_iters
+        )
+        max_splits = (
+            int(torch.diff(num_splits).max().item()) if num_splits.numel() > 1 else 0
+        )
+        print(
+            f"decode-direct {case.name}: {_kernel_path_name(used_graph)}={kernel_path_us:.1f} us, "
+            f"impl_kernel_us={impl_kernel_us:.1f} us, "
+            f"mp_parts={sched_meta.shape[0]}, max_splits={max_splits}, "
+            f"{_format_perf(stats, kernel_path_us, kernel_path_us, impl_kernel_us)}"
+        )
+        return
     if case.native_fp8:
         q, kv_cache, indices, topk_length, out = _make_native_fp8_decode_inputs(
             case, use_graph
@@ -1170,9 +1555,14 @@ def _run_decode_case(
         )
         stats = _decode_stats(case, indices, topk_length, None, None)
 
-        from mate.sparse_mla.tilelang.sparse_mla_v32_decode_fwd_scheduled import (
-            tilelang_flashmla_interface,
-        )
+        if get_musa_arch(q) == MP32_ARCH:
+            from mate.sparse_mla.tilelang.mp32.sparse_mla_v32_decode_fwd_scheduled import (
+                tilelang_flashmla_interface,
+            )
+        else:
+            from mate.sparse_mla.tilelang.mp31.sparse_mla_v32_decode_fwd_scheduled import (
+                tilelang_flashmla_interface,
+            )
 
         def run_direct_kernel_path():
             return tilelang_flashmla_interface(
@@ -1185,7 +1575,7 @@ def _run_decode_case(
                 topk_length=topk_length,
                 attn_sink=None,
                 d_v=DV,
-                threads=512,
+                threads=640,
             )
 
         run_graph = (
@@ -1288,7 +1678,7 @@ def _run_decode_case(
     reused_metadata_us = _bench_event_us(run_kernel_path, repeat)
     run_graph = None
     if use_graph and case.d_qk == 512:
-        run_graph = _make_model1_decode_graph_runner(
+        run_graph = _make_v4_decode_graph_runner(
             case,
             q,
             k_cache,
@@ -1382,6 +1772,7 @@ def _decode_cases(
     heads: Iterable[int] | None = None,
     topks: Iterable[int] | None = None,
     full_topk: bool = False,
+    skv: int = 8192,
 ) -> Iterable[DecodeCase]:
     batches = list(batches) if batches is not None else [128]
     heads = list(heads) if heads is not None else [64]
@@ -1395,7 +1786,7 @@ def _decode_cases(
                     num_heads,
                     bsz,
                     1,
-                    8192,
+                    skv,
                     topk,
                     64,
                     topk_length=not full_topk,
@@ -1406,7 +1797,7 @@ def _decode_cases(
                     num_heads,
                     bsz,
                     1,
-                    8192,
+                    skv,
                     topk,
                     64,
                     topk_length=not full_topk,
@@ -1427,9 +1818,284 @@ def _decode_cases(
                 )
 
 
+def _run_cache_format_matrix(args):
+    """Compare real packed formats with effective (unmasked) attention FLOPs."""
+    import json
+    from mate.execution_context import dry_run_context
+    from mate.testing.sparse_mla import (
+        SparseMlaCase,
+        make_decode_data,
+        assert_sparse_mla_close,
+    )
+    from mate.sparse_mla.glm_nope import sparse_mla_nope_decode
+    from mate.flashmla import flash_mla_with_kvcache, get_mla_metadata
+
+    def prepare(case, *, with_control=True):
+        scale = 0.0625 if case.variant == "glm53" else case.head_dim**-0.5
+        data = make_decode_data(case, softmax_scale=scale)
+        if args.formats_empty:
+            data.indices.fill_(-1)
+            data.topk_length.zero_()
+            if data.extra_indices is not None:
+                data.extra_indices.fill_(-1)
+                data.extra_topk_length.zero_()
+            data.ref_out.zero_()
+            data.ref_lse.fill_(float("inf"))
+        metadata, splits = get_mla_metadata(
+            None,
+            case.heads * case.q_len,
+            1,
+            case.heads,
+            True,
+            topk=case.topk,
+            extra_topk=case.extra_topk or None,
+            q=data.q,
+            bs=case.batch,
+            topk_length=data.topk_length,
+            extra_topk_length=data.extra_topk_length,
+        )
+
+        def run(q=data.q, cache=data.k_cache, glm=case.variant == "glm53"):
+            if glm:
+                return sparse_mla_nope_decode(
+                    q,
+                    cache,
+                    data.indices,
+                    softmax_scale=scale,
+                    topk_length=data.topk_length,
+                    tile_scheduler_metadata=metadata,
+                    num_splits=splits,
+                )
+            return flash_mla_with_kvcache(
+                q,
+                cache,
+                None,
+                None,
+                512,
+                metadata,
+                splits,
+                softmax_scale=scale,
+                is_fp8_kvcache=True,
+                indices=data.indices,
+                topk_length=data.topk_length,
+                extra_k_cache=data.extra_k_cache,
+                extra_indices_in_kvcache=data.extra_indices,
+                extra_topk_length=data.extra_topk_length,
+            )
+
+        control = control_data = None
+        if case.variant == "glm53":
+            q_pad = torch.nn.functional.pad(data.q, (0, 64))
+            cache_pad = torch.nn.functional.pad(data.k_cache, (0, 128))
+            control = lambda: run(q_pad, cache_pad, False)
+            control_data = data
+        elif with_control and case.variant == "v41":
+            control_case = dataclasses.replace(
+                case,
+                variant="v41" if case.extra_variant == "v41_fp4" else "v4",
+                extra_variant="v41" if case.extra_variant == "v41_fp4" else None,
+            )
+            control_data, control, _, _ = prepare(control_case, with_control=False)
+        return data, run, control, control_data
+
+    records = Path(args.formats_output)
+    records.parent.mkdir(parents=True, exist_ok=True)
+    for variant in args.cache_formats.split(","):
+        if variant not in ("v32", "v4", "glm53", "v41", "v41_extra", "v41_fp4"):
+            raise ValueError(f"unknown packed format: {variant}")
+        heads = args.decode_heads or (
+            [8, 16, 32, 64] if variant == "glm53" else [64, 128]
+        )
+        for batch in args.decode_batches or [1, 60, 120]:
+            for head in heads:
+                for queries in (1, 3):
+                    for topk in args.decode_topks or [2048, 2112, 2176]:
+                        case = SparseMlaCase(
+                            f"{variant}_b{batch}_q{queries}_h{head}_k{topk}",
+                            "v41" if variant in ("v41_fp4", "v41_extra") else variant,
+                            queries,
+                            4096,
+                            head,
+                            topk,
+                            batch=batch,
+                            topk_length=True,
+                            extra_kv_len=1024
+                            if variant in ("v41_fp4", "v41_extra")
+                            else 0,
+                            extra_topk=512
+                            if variant in ("v41_fp4", "v41_extra")
+                            else 0,
+                            extra_variant="v41_fp4" if variant == "v41_fp4" else None,
+                        )
+                        row = dict(
+                            case=dataclasses.asdict(case),
+                            format=variant,
+                            mp_count=resolve_num_mps(),
+                            device=torch.musa.get_device_name(0),
+                            timing="graph split+combine; metadata prepared",
+                            flop_convention="2*heads*valid_candidates*(Dqk+Dv); GLM control uses 512+512",
+                            empty_candidates=args.formats_empty,
+                            softmax_scale=0.0625
+                            if case.variant == "glm53"
+                            else case.head_dim**-0.5,
+                        )
+                        try:
+                            with dry_run_context():
+                                _, dry, control, _ = prepare(case)
+                                dry()
+                                if control is not None:
+                                    control()
+                            if args.formats_dry_run:
+                                row["status"] = "dry-run-passed"
+                            else:
+                                data, fn, control, control_data = prepare(case)
+                                out, lse = fn()
+                                assert_sparse_mla_close(
+                                    out, data.ref_out, lse, data.ref_lse
+                                )
+                                if control is not None:
+                                    old_out, old_lse = control()
+                                    assert_sparse_mla_close(
+                                        old_out,
+                                        control_data.ref_out,
+                                        old_lse,
+                                        control_data.ref_lse,
+                                    )
+
+                                def count(indices, cache, lengths):
+                                    width = indices.shape[-1]
+                                    valid = (indices >= 0) & (
+                                        indices < cache.shape[0] * cache.shape[1]
+                                    )
+                                    if lengths is not None:
+                                        valid &= (
+                                            torch.arange(width, device=indices.device)
+                                            < lengths[:, None, None, None]
+                                        )
+                                    return int(valid.sum().item())
+
+                                candidates = count(
+                                    data.indices, data.k_cache, data.topk_length
+                                )
+                                if data.extra_indices is not None:
+                                    candidates += count(
+                                        data.extra_indices,
+                                        data.extra_k_cache,
+                                        data.extra_topk_length,
+                                    )
+                                flop = 2 * head * candidates * (case.head_dim + 512)
+                                # Repeat A/B rounds, retaining all median samples. Both
+                                # paths include split+combine under the same graph policy.
+                                samples, controls = [], []
+                                raw_samples, raw_controls = [], []
+                                for repeat_round in range(3):
+                                    if control is not None and repeat_round % 2 == 0:
+                                        controls.append(
+                                            _bench_graph_us(
+                                                control,
+                                                args.repeat,
+                                                args.graph_iters,
+                                                raw_controls,
+                                            )
+                                        )
+                                    samples.append(
+                                        _bench_graph_us(
+                                            fn,
+                                            args.repeat,
+                                            args.graph_iters,
+                                            raw_samples,
+                                        )
+                                    )
+                                    if control is not None and repeat_round % 2:
+                                        controls.append(
+                                            _bench_graph_us(
+                                                control,
+                                                args.repeat,
+                                                args.graph_iters,
+                                                raw_controls,
+                                            )
+                                        )
+                                    _GRAPH_KEEPALIVE.clear()
+                                latency = statistics.median(samples)
+                                row.update(
+                                    status="passed",
+                                    effective_flops=flop,
+                                    valid_candidates=candidates,
+                                    us=latency,
+                                    samples_us=samples,
+                                    raw_samples_us=raw_samples,
+                                    p90_us=sorted(raw_samples)[
+                                        int(0.9 * (len(raw_samples) - 1))
+                                    ],
+                                    tflops=flop / latency / 1e6,
+                                    cache_bytes=data.k_cache.untyped_storage().nbytes(),
+                                    extra_cache_bytes=0
+                                    if data.extra_k_cache is None
+                                    else data.extra_k_cache.untyped_storage().nbytes(),
+                                    output_max_abs_error=float(
+                                        (out.float() - data.ref_out.float())
+                                        .abs()
+                                        .max()
+                                        .item()
+                                    ),
+                                )
+                                if controls:
+                                    baseline = statistics.median(controls)
+                                    quant_delta = (
+                                        data.ref_out.float()
+                                        - control_data.ref_out.float()
+                                    )
+                                    row.update(
+                                        control_us=baseline,
+                                        control_samples_us=controls,
+                                        control_raw_samples_us=raw_controls,
+                                        control_p90_us=sorted(raw_controls)[
+                                            int(0.9 * (len(raw_controls) - 1))
+                                        ],
+                                        control_tflops=flop / baseline / 1e6,
+                                        control_format="v32_zero_rope"
+                                        if variant == "glm53"
+                                        else "v41_extra"
+                                        if variant == "v41_fp4"
+                                        else "v4",
+                                        control_cache_bytes=data.k_cache.shape[0]
+                                        * data.k_cache.shape[1]
+                                        * 656
+                                        if variant == "glm53"
+                                        else control_data.k_cache.untyped_storage().nbytes(),
+                                        control_extra_cache_bytes=0
+                                        if control_data.extra_k_cache is None
+                                        else control_data.extra_k_cache.untyped_storage().nbytes(),
+                                        quantization_delta_max_abs=float(
+                                            quant_delta.abs().max().item()
+                                        ),
+                                        quantization_delta_relative_rms=float(
+                                            (
+                                                quant_delta.square().mean().sqrt()
+                                                / control_data.ref_out.float()
+                                                .square()
+                                                .mean()
+                                                .sqrt()
+                                                .clamp_min(1e-12)
+                                            ).item()
+                                        ),
+                                        tflops_change_pct=(baseline / latency - 1) * 100
+                                        if flop
+                                        else None,
+                                        latency_change_pct=(latency / baseline - 1)
+                                        * 100,
+                                    )
+                        except Exception as exc:
+                            row.update(status="failed", error=str(exc))
+                        with records.open("a") as stream:
+                            stream.write(json.dumps(row) + "\n")
+                        print(json.dumps(row), flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("prefill", "decode", "both"), default="both")
+    parser.add_argument("--case-set", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--repeat", type=_positive_int, default=20)
     parser.add_argument(
         "--quick", action="store_true", help="Run one size per family for smoke checks"
@@ -1494,6 +2160,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--direct-tilelang",
+        action="store_true",
+        help=(
+            "Run decode through the direct TileLang path; by default decode uses "
+            "the FlashMLA-compatible wrapper"
+        ),
+    )
+    parser.add_argument(
         "--decode-batches",
         type=_parse_int_list,
         default=None,
@@ -1512,6 +2186,13 @@ def main() -> None:
         help="Comma-separated decode topk values; default: 2048,512",
     )
     parser.add_argument(
+        "--decode-d-qk",
+        type=int,
+        choices=(512, 576),
+        default=None,
+        help="Filter decode cases by D_QK; useful for MP32 V4 (512) vs MP31 V4 (576)",
+    )
+    parser.add_argument(
         "--decode-full-topk",
         action="store_true",
         help="Use the full decode topk for every batch row",
@@ -1523,34 +2204,49 @@ def main() -> None:
         help="Function calls captured inside one graph replay",
     )
     parser.add_argument(
-        "--model1-prefill-persistent-blocks",
+        "--v4-prefill-persistent-blocks",
         type=int,
         default=(
-            int(os.environ["MATE_MODEL1_PREFILL_PERSISTENT_BLOCKS"])
-            if "MATE_MODEL1_PREFILL_PERSISTENT_BLOCKS" in os.environ
+            int(os.environ["MATE_V4_PREFILL_PERSISTENT_BLOCKS"])
+            if "MATE_V4_PREFILL_PERSISTENT_BLOCKS" in os.environ
             else None
         ),
-        help="Override physical CTA count for MODEL1 persistent prefill paths",
+        help="Override physical CTA count for V4 persistent prefill paths",
     )
     parser.add_argument(
-        "--no-model1-prefill-persistence",
+        "--no-v4-prefill-persistence",
         action="store_true",
-        help="Disable MODEL1 persistent prefill in benchmark direct/graph paths",
+        help="Disable V4 persistent prefill in benchmark direct/graph paths",
+    )
+    parser.add_argument(
+        "--cache-formats",
+        default=None,
+        help="Packed format matrix: v32,v4,glm53,v41,v41_extra,v41_fp4",
+    )
+    parser.add_argument("--formats-output", default="/tmp/sparse-mla-formats.jsonl")
+    parser.add_argument("--formats-dry-run", action="store_true")
+    parser.add_argument(
+        "--formats-empty",
+        action="store_true",
+        help="Measure all-empty candidate rows in the packed format matrix",
     )
     args = parser.parse_args()
+    if args.cache_formats:
+        _run_cache_format_matrix(args)
+        return
 
     device = _device()
     torch.set_default_device(device)
     torch.set_float32_matmul_precision("high")
     use_graph = not args.no_graph
-    model1_prefill_persistent_blocks = resolve_num_mps(
-        device, args.model1_prefill_persistent_blocks
+    v4_prefill_persistent_blocks = resolve_num_mps(
+        torch.device(device), args.v4_prefill_persistent_blocks
     )
     print(
         f"device={device}, repeat={args.repeat}, quick={args.quick}, "
-        f"graph={use_graph}, graph_iters={args.graph_iters}, "
-        f"model1_prefill_persistence={not args.no_model1_prefill_persistence}, "
-        f"model1_prefill_persistent_blocks={model1_prefill_persistent_blocks}"
+        f"case_set={args.case_set}, graph={use_graph}, graph_iters={args.graph_iters}, "
+        f"v4_prefill_persistence={not args.no_v4_prefill_persistence}, "
+        f"v4_prefill_persistent_blocks={v4_prefill_persistent_blocks}"
     )
 
     if args.mode in ("prefill", "both"):
@@ -1572,14 +2268,14 @@ def main() -> None:
                 prefill_case = dataclasses.replace(
                     prefill_case,
                     direct_tilelang=True,
-                    is_persistence=not args.no_model1_prefill_persistence,
-                    persistent_blocks=model1_prefill_persistent_blocks,
+                    is_persistence=not args.no_v4_prefill_persistence,
+                    persistent_blocks=v4_prefill_persistent_blocks,
                 )
             elif prefill_case.d_qk == 576:
                 prefill_case = dataclasses.replace(
                     prefill_case,
-                    is_persistence=not args.no_model1_prefill_persistence,
-                    persistent_blocks=model1_prefill_persistent_blocks,
+                    is_persistence=not args.no_v4_prefill_persistence,
+                    persistent_blocks=v4_prefill_persistent_blocks,
                 )
             _run_prefill_case(
                 prefill_case,
@@ -1589,8 +2285,12 @@ def main() -> None:
                 args.graph_iters,
             )
     if args.mode in ("decode", "both"):
+        direct_tilelang = args.direct_tilelang or flash_mla is None
+        if flash_mla is None and not args.direct_tilelang:
+            print("flash_mla is unavailable; falling back to direct TileLang decode")
         for decode_case in _decode_cases(
             args.quick,
+            skv=int(__import__("os").environ.get("DECODE_SKV", "8192")),
             batches=args.decode_batches,
             heads=args.decode_heads,
             topks=args.decode_topks,
@@ -1602,6 +2302,12 @@ def main() -> None:
                 continue
             if args.decode_layout == "v32-compare" and decode_case.d_qk != 576:
                 continue
+            if args.decode_d_qk is not None and decode_case.d_qk != args.decode_d_qk:
+                continue
+            decode_case = dataclasses.replace(
+                decode_case,
+                direct_tilelang=direct_tilelang and not decode_case.native_fp8,
+            )
             _run_decode_case(
                 decode_case,
                 args.repeat,

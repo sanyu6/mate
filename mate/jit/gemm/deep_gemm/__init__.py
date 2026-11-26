@@ -30,6 +30,20 @@ from .mqa_logits import (
     gen_mqa_logits_spec,
     get_mqa_logits_module,
 )
+from .mqa_logits_blockscale import (
+    MQALogitsBlockScaleJITConfig,
+    MQA_LOGITS_BLOCKSCALE_CONFIGS,
+    gen_mqa_logits_blockscale_aot,
+    gen_mqa_logits_blockscale_spec,
+    get_mqa_logits_blockscale_module,
+)
+from .mqa_logits_blockscale_metadata import (
+    MQA_LOGITS_BLOCKSCALE_METADATA_CONFIGS,
+    MQALogitsBlockScaleMetadataJITConfig,
+    gen_mqa_logits_blockscale_metadata_aot,
+    gen_mqa_logits_blockscale_metadata_spec,
+    get_mqa_logits_blockscale_metadata_module,
+)
 from .paged_mqa_logits import (
     PagedMqaLogitsJitConfig,
     PAGED_MQA_LOGITS_CONFIGS,
@@ -38,6 +52,20 @@ from .paged_mqa_logits import (
     gen_paged_mqa_logits_spec,
     get_paged_mqa_logits_metadata_module,
     get_paged_mqa_logits_module,
+)
+from .paged_mqa_logits_blockscale import (
+    PAGED_MQA_LOGITS_BLOCKSCALE_CONFIGS,
+    PagedMQALogitsBlockScaleJITConfig,
+    gen_paged_mqa_logits_blockscale_aot,
+    gen_paged_mqa_logits_blockscale_spec,
+    get_paged_mqa_logits_blockscale_module,
+)
+from .paged_mqa_logits_blockscale_metadata import (
+    PAGED_MQA_LOGITS_BLOCKSCALE_METADATA_CONFIGS,
+    PagedMQALogitsBlockScaleMetadataJITConfig,
+    gen_paged_mqa_logits_blockscale_metadata_aot,
+    gen_paged_mqa_logits_blockscale_metadata_spec,
+    get_paged_mqa_logits_blockscale_metadata_module,
 )
 
 __all__ = [
@@ -63,9 +91,19 @@ __all__ = [
     "gen_hyperconnection_aot",
     "gen_hyperconnection_spec",
     "MqaLogitsJitConfig",
+    "MQALogitsBlockScaleJITConfig",
+    "MQA_LOGITS_BLOCKSCALE_CONFIGS",
     "MQA_LOGITS_CONFIGS",
+    "gen_mqa_logits_blockscale_aot",
+    "gen_mqa_logits_blockscale_spec",
     "gen_mqa_logits_aot",
     "gen_mqa_logits_spec",
+    "get_mqa_logits_blockscale_module",
+    "MQALogitsBlockScaleMetadataJITConfig",
+    "MQA_LOGITS_BLOCKSCALE_METADATA_CONFIGS",
+    "gen_mqa_logits_blockscale_metadata_aot",
+    "gen_mqa_logits_blockscale_metadata_spec",
+    "get_mqa_logits_blockscale_metadata_module",
     "get_mqa_logits_module",
     "PagedMqaLogitsJitConfig",
     "PAGED_MQA_LOGITS_CONFIGS",
@@ -74,4 +112,14 @@ __all__ = [
     "gen_paged_mqa_logits_spec",
     "get_paged_mqa_logits_metadata_module",
     "get_paged_mqa_logits_module",
+    "PagedMQALogitsBlockScaleJITConfig",
+    "PAGED_MQA_LOGITS_BLOCKSCALE_CONFIGS",
+    "gen_paged_mqa_logits_blockscale_aot",
+    "gen_paged_mqa_logits_blockscale_spec",
+    "get_paged_mqa_logits_blockscale_module",
+    "PagedMQALogitsBlockScaleMetadataJITConfig",
+    "PAGED_MQA_LOGITS_BLOCKSCALE_METADATA_CONFIGS",
+    "gen_paged_mqa_logits_blockscale_metadata_aot",
+    "gen_paged_mqa_logits_blockscale_metadata_spec",
+    "get_paged_mqa_logits_blockscale_metadata_module",
 ]

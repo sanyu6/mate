@@ -7,6 +7,8 @@ from collections.abc import Callable
 
 import torch
 
+from .arch import Arch, MP31_ARCH, MP32_ARCH
+
 
 def tensor_cache(
     fn: Callable[..., torch.Tensor],
@@ -94,4 +96,42 @@ def round_up(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 
-__all__ = ["ceil_div", "cosize", "round_up", "tensor_cache"]
+def cc_switch():
+    """Dispatch to a registered implementation for the selected compute capability."""
+
+    def decorator(default):
+        implementations = {}
+
+        @functools.wraps(default)
+        def wrapper(*args, **kwargs):
+            cc = kwargs.pop("override_cc", None)
+            if cc is None:
+                from .mate_runtime import get_musa_arch
+
+                arch = get_musa_arch()
+                cc = arch.major * 10 + arch.minor
+            return implementations.get(cc, default)(*args, **kwargs)
+
+        def register(cc):
+            def register_implementation(implementation):
+                implementations[cc] = implementation
+                return implementation
+
+            return register_implementation
+
+        wrapper.register = register
+        return wrapper
+
+    return decorator
+
+
+__all__ = [
+    "Arch",
+    "MP31_ARCH",
+    "MP32_ARCH",
+    "cc_switch",
+    "ceil_div",
+    "cosize",
+    "round_up",
+    "tensor_cache",
+]

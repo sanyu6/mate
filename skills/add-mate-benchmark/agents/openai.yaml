@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add Mate Benchmark"
+  short_description: "Add and validate unified MATE benchmark routines"
+  default_prompt: "Use this skill when adding or porting a MATE benchmark routine under benchmarks/routines."

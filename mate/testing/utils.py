@@ -394,43 +394,37 @@ def bench_kineto(
 
                     profiler.step()
 
-    # Parse the profiling table
+    # Read numeric profiler fields directly. Parsing the formatted table loses
+    # timings when the profiler switches units (for example, from ms to s).
     assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
     is_tuple = isinstance(kernel_names, tuple)
-    prof_lines = (
-        profiler.key_averages()
-        .table(sort_by="cuda_time_total", max_name_column_width=100)
-        .split("\n")
-    )
+    profiler_events = profiler.key_averages()
     kernel_names = (kernel_names,) if isinstance(kernel_names, str) else kernel_names
-    if not with_multiple_kernels:
-        for name in kernel_names:
-            assert sum([name in line for line in prof_lines]) <= 1, (
-                f"Errors of the kernel {name} in the profiling table"
-            )
 
     # Save chrome traces
     if trace_path is not None:
         profiler.export_chrome_trace(trace_path)
 
     # Return average kernel times
-    units = {"ms": 1e3, "us": 1e6}
     kernel_times = []
     for name in kernel_names:
-        total_time: float = 0
-        total_num: int = 0
-        for line in prof_lines:
-            if name in line:
-                time_str = line.split()[-2]
-                num_str = line.split()[-1]
-                for unit, scale in units.items():
-                    if unit in time_str:
-                        total_time += (
-                            float(time_str.replace(unit, "")) / scale * int(num_str)
-                        )
-                        total_num += int(num_str)
-                        break
-        kernel_times.append(total_time / total_num if total_num > 0 else 0)
+        matched_events = [event for event in profiler_events if name in event.key]
+        if not matched_events:
+            available_events = sorted({event.key for event in profiler_events})
+            raise RuntimeError(
+                f"Profiler did not find kernel name {name!r}. "
+                f"Available events: {available_events[:64]}"
+            )
+        if not with_multiple_kernels:
+            assert len(matched_events) == 1, (
+                f"Found multiple profiler events for kernel {name!r}"
+            )
+
+        total_time_us = sum(event.device_time_total for event in matched_events)
+        total_num = sum(event.count for event in matched_events)
+        if total_num <= 0:
+            raise RuntimeError(f"Profiler reported no calls for kernel {name!r}")
+        kernel_times.append(total_time_us / total_num / 1e6)
 
     return tuple(kernel_times) if is_tuple else kernel_times[0]
 

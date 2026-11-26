@@ -76,6 +76,10 @@ def noncontiguous_tensor_init(tensor: torch.Tensor) -> torch.Tensor:
             storage_shape,
             dtype=tensor.dtype,
             device=tensor.device,
+        ).nan_to_num_(
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
         )
         slices = [slice(None)] * tensor.dim()
         slices[dim] = slice(None, None, 2)
@@ -173,8 +177,10 @@ class FmhaWorkload(OperatorWorkload):
         for name in ("batch_size", "seqlen_q", "num_heads_q", "head_dim_v"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
-        if self.backend not in ("auto", "mutlass", "mubin"):
-            raise ValueError("backend must be 'auto', 'mutlass', or 'mubin'")
+        if self.backend not in ("auto", "mutlass", "mubin", "tilelang"):
+            raise ValueError(
+                "backend must be 'auto', 'mutlass', 'mubin', or 'tilelang'"
+            )
         if self.cp_world_size <= 0:
             raise ValueError("cp_world_size must be positive")
         if self.only_qv and self.api is not FmhaApi.KVCACHE:
@@ -929,20 +935,16 @@ class FmhaOperator(Operator):
             raise ValueError("append-KV verification requires expected caches")
         k_actual = self._logical_cache(
             inputs.k_cache.to(inputs.workload.reference_dtype), inputs.page_table
-        )
+        )[:, : inputs.workload.seqlen_k]
         v_actual = self._logical_cache(
             inputs.v_cache.to(inputs.workload.reference_dtype), inputs.page_table
-        )
+        )[:, : inputs.workload.seqlen_k]
+        # Match reference construction: trim unused pages before selecting batches.
+        # This also avoids retaining a large padded batch stride in comparisons.
         if inputs.cache_batch_idx is not None:
             indices = inputs.cache_batch_idx.long()
             k_actual = k_actual[indices]
             v_actual = v_actual[indices]
-        k_actual = k_actual[:, : inputs.workload.seqlen_k].to(
-            inputs.workload.reference_dtype
-        )
-        v_actual = v_actual[:, : inputs.workload.seqlen_k].to(
-            inputs.workload.reference_dtype
-        )
         if inputs.workload.dtype in _FP8_DTYPES:
             torch.testing.assert_close(
                 v_actual, reference.expected_v_cache, atol=1e-3, rtol=1e-3
@@ -1015,8 +1017,6 @@ class FmhaOperator(Operator):
         if workload.dtype in _FP8_DTYPES and workload.qv is not None:
             if dimensions not in ((64, 256), (64, 512)):
                 return "float8 QV only supports d64x256 and d64x512"
-            if workload.appends_kv or workload.rotary_fraction > 0:
-                return "float8 QV does not support append KV or rotary"
         return None
 
     def _generate_attention(self, workload: FmhaWorkload) -> FmhaInputs:

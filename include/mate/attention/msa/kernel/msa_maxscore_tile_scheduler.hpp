@@ -8,7 +8,12 @@
 
 namespace mate::attention::msa {
 
-template <class TileShape_, int HeadRatio_, bool ParallelKTiles_, bool IsVarlen_ = true, bool HasMetadata_ = false>
+template <class TileShape_,
+          int  HeadRatio_,
+          bool ParallelKTiles_,
+          bool IsVarlen_    = true,
+          bool HasMetadata_ = false,
+          int  CtasPerMp_   = 3>
 struct MsaMaxScoreTileScheduler {
   using TileShape = TileShape_;
 
@@ -19,7 +24,8 @@ struct MsaMaxScoreTileScheduler {
   static constexpr bool ParallelKTiles = ParallelKTiles_;
   static constexpr bool IsVarlen       = IsVarlen_;
   static constexpr bool HasMetadata    = HasMetadata_;
-  static constexpr int  CtasPerMp      = ParallelKTiles ? 3 : 1;
+  static constexpr int  CtasPerMp      = ParallelKTiles ? CtasPerMp_ : 1;
+  static_assert(CtasPerMp > 0);
 
   struct Arguments {
     int32_t const* ptr_cu_seqlens_q  = nullptr;

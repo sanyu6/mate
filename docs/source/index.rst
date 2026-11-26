@@ -81,7 +81,6 @@ comprehensive logging, and environment inspection tools.
    HyperConnection <api/hyperconnection>
    KDA <api/kda>
    MSA <api/msa>
-   Mamba <api/mamba>
 
 .. toctree::
    :maxdepth: 1

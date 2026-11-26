@@ -17,6 +17,7 @@ MATE_BENCH_FMHA_FLUSH_L2 = True
 
 def gen_bench_config() -> List[dict]:
     cases = [
+        # MP31
         {
             "name": "Prefill",
             "batch_size": 56,
@@ -31,6 +32,30 @@ def gen_bench_config() -> List[dict]:
             "window_size": (None, None),
             "page_size": None,
             "num_splits": 0,
+            "backend": "mutlass",
+            "dtype": MATE_BENCH_FMHA_DTYPE,
+            "device": MATE_BENCH_FMHA_DEVICE,
+            "force_flash_attn_with_kvcache": False,
+            "seqused_q": None,
+            "seqused_kv": None,
+        },
+        # MP32
+        {
+            "name": "Prefill",
+            "batch_size": 46,
+            # "seqlen_q": [1024 * 32] * 46,
+            "seqlen_q": 1024 * 32,
+            # "seqlen_kv": [1024 * 32] * 46,
+            "seqlen_kv": 1024 * 32,
+            "head_q": 1,
+            "head_kv": 1,
+            "headdim_qk": 128,
+            "headdim_vo": 128,
+            "is_packgqa": False,
+            "is_causal": False,
+            "window_size": (None, None),
+            "page_size": None,
+            "num_splits": 1,
             "backend": "mutlass",
             "dtype": MATE_BENCH_FMHA_DTYPE,
             "device": MATE_BENCH_FMHA_DEVICE,
@@ -127,7 +152,7 @@ def run_bench(
             pack_gqa=cfg.is_packgqa,
             mp_margin=0,
         )
-        print(metadata.view(4, -1))
+        # print(metadata.view(4, -1))
 
     def fn():
         if cfg.is_paged_kv or force_flash_attn_with_kvcache:

@@ -27,3 +27,13 @@ scheduler metadata once while the query shape, sparse lengths, and top-k remain
 unchanged, then pass it to subsequent decode calls.
 
 .. autofunction:: sparse_mla_fp8_decode
+
+GLM NoPE sparse decode
+----------------------
+
+``sparse_mla_nope_decode`` handles GLM's BF16 Q512 contract and its inline
+528-byte cache rows containing 512 E4M3 values and four arbitrary FP32 scales.
+The cache layout is distinct from FlashMLA V4.1 pages; legacy 656-byte padded
+rows are also accepted.
+
+.. autofunction:: mate.sparse_mla.glm_nope.sparse_mla_nope_decode

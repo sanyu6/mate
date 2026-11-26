@@ -13,10 +13,11 @@ using namespace mute;
 
 template <bool IsPagedKV,
           class Element,
-          int  NumThreads,
-          int  TileN,
-          int  HeadDimQK,
-          int  HeadDimVO,
+          int NumThreads,
+          int TileN,
+          int HeadDimQK,
+          int HeadDimVO,
+          class LsuRowPermutation,
           bool IsKVSameIter   = false,
           int  LoadsPerRow_LB = 1,
           int  VectorBits     = 128>
@@ -68,14 +69,7 @@ struct PagedKVManager {
   using TensorKVPtr                       = decltype(make_tensor<Element*>(Shape<Int<PageEntryPerThread>>{}));
 
   using TensorPageOffset = decltype(make_tensor<mute::tuple<int32_t, int32_t>>(Shape<Int<PageEntryPerThread>>{}));
-
-  // Permutation traits
-  static constexpr int MmaAtomN = 8;
-  static constexpr int Fragment = ElementsPerLoad;  // Sts vector width
-  static constexpr int Repeats  = TileN / (MmaAtomN * Fragment);
-  static_assert(TileN % 64 == 0);
-  using PermuteTile =
-      decltype(filter(make_ordered_layout(Shape<Int<MmaAtomN>, Int<Fragment>, Int<Repeats>>{}, Step<_2, _1, _3>{})));
+  using TensorRowValid   = decltype(make_tensor<int32_t>(Shape<Int<PageEntryPerThread>>{}));
 
   int32_t const* const ptr_page_table;
   TensorPageTable      mPageTable;
@@ -86,6 +80,7 @@ struct PagedKVManager {
   TensorKV               mK, mV;
   RobustDescriptor       desc_K, desc_V, desc_page_table;
   TensorPageOffset       tPrPageOffsetK, tPrPageOffsetV;
+  TensorRowValid         tPrRowValidK, tPrRowValidV, tPrRowValidVNext;
   ThrGmemTiledCopy const gmem_thr_copy_kv;
 
   TensorKVPtr tPrVPtr;
@@ -158,7 +153,11 @@ struct PagedKVManager {
 
   // K page offsets must use the same lane grouping as the later K pointer broadcast. Rotary store may use
   // GmemThreadsPerRow=4 for qk=64, while V keeps the default grouping used by load_V/store_V.
-  template <bool FirstIter = false, bool PermuteK = true, bool PermuteV = false, int KThreadsPerRow = GmemThreadsPerRow>
+  template <bool SeqlenkMask    = false,
+            bool FirstIter      = false,
+            bool PermuteK       = true,
+            bool PermuteV       = false,
+            int  KThreadsPerRow = GmemThreadsPerRow>
   MUTLASS_DEVICE void load_page_table_for_lsu(int const n_block) {
     static_assert(NumThreads % KThreadsPerRow == 0);
     if constexpr (IsPagedKV) {
@@ -168,8 +167,8 @@ struct PagedKVManager {
                               (thread_idx / KThreadsPerRow);
         int32_t const v_row = i * NumThreads + (NumThreads / GmemThreadsPerRow) * (thread_idx % GmemThreadsPerRow) +
                               (thread_idx / GmemThreadsPerRow);
-        int32_t const k_permute_row = PermuteTile{}(k_row);
-        int32_t const v_permute_row = PermuteTile{}(v_row);
+        int32_t const k_permute_row = LsuRowPermutation{}(k_row);
+        int32_t const v_permute_row = LsuRowPermutation{}(v_row);
 
         int32_t const k_row_idx         = n_block * TileN + k_row;
         int32_t const k_permute_row_idx = n_block * TileN + k_permute_row;
@@ -178,28 +177,28 @@ struct PagedKVManager {
 
         // K
         {
-          int32_t page_idx, page_offset;
-          if constexpr (PermuteK) {
-            page_idx = page_size_divmod.divmod(page_offset, k_permute_row_idx + leftpad_k);
-          } else {
-            page_idx = page_size_divmod.divmod(page_offset, k_row_idx + leftpad_k);
+          int32_t const source_row_idx = PermuteK ? k_permute_row_idx : k_row_idx;
+          bool const    row_valid      = k_row < TileN && (!SeqlenkMask || source_row_idx < seqlen_k);
+          int32_t       page = 0, page_offset = 0;
+          if (row_valid) {
+            int32_t const page_idx = page_size_divmod.divmod(page_offset, source_row_idx + leftpad_k);
+            mute::MP31_ROBUST_LOAD<int32_t>::copy(mPageTable(page_idx), page, true, desc_page_table);
           }
-          int32_t page;
-          mute::MP31_ROBUST_LOAD<int32_t>::copy(mPageTable(page_idx), page, true, desc_page_table);
           tPrPageOffsetK(i) = {page, page_offset};
+          tPrRowValidK(i)   = row_valid;
         }
 
         // V
         {
-          int32_t page_idx, page_offset;
-          if constexpr (PermuteV) {
-            page_idx = page_size_divmod.divmod(page_offset, v_permute_row_idx + leftpad_k);
-          } else {
-            page_idx = page_size_divmod.divmod(page_offset, v_row_idx + leftpad_k);
+          int32_t const source_row_idx = PermuteV ? v_permute_row_idx : v_row_idx;
+          bool const    row_valid      = v_row < TileN && (!SeqlenkMask || source_row_idx < seqlen_k);
+          int32_t       page = 0, page_offset = 0;
+          if (row_valid) {
+            int32_t const page_idx = page_size_divmod.divmod(page_offset, source_row_idx + leftpad_k);
+            mute::MP31_ROBUST_LOAD<int32_t>::copy(mPageTable(page_idx), page, true, desc_page_table);
           }
-          int32_t page;
-          mute::MP31_ROBUST_LOAD<int32_t>::copy(mPageTable(page_idx), page, true, desc_page_table);
-          tPrPageOffsetV(i) = {page, page_offset};
+          tPrPageOffsetV(i)   = {page, page_offset};
+          tPrRowValidVNext(i) = row_valid;
         }
       }
       if constexpr (FirstIter && !IsKVSameIter) {
@@ -226,6 +225,7 @@ struct PagedKVManager {
     for (int i = 0; i < PageEntryPerThread; ++i) {
       auto [page_idx, page_offset] = tPrPageOffsetV(i);
       tPrVPtr(i)                   = &mV(page_offset, _0{}, page_idx);
+      tPrRowValidV(i)              = tPrRowValidVNext(i);
     }
   }
 
@@ -239,6 +239,8 @@ struct PagedKVManager {
 
     MUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size<1>(tKsK); ++i) {
+      bool const should_load =
+          __shfl_sync(0xffffffff, tPrRowValidK(i / GmemThreadsPerRow), i % GmemThreadsPerRow, GmemThreadsPerRow);
       // TODO: check use mutlass address space
       Element const* k_ptr = (Element const*)__musa_ptr_gen_to_global(
           (void*)(__shfl_sync(0xffffffff,
@@ -252,7 +254,7 @@ struct PagedKVManager {
       MUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < size<2>(tKsK); ++j) {
         int const j_idx = get<1>(tKcK(_0{}, _0{}, j)) / ElementsPerLoad;
-        mute::copy(GmemTiledCopy{}.with(desc_K).with(true), mK_paged_cur_copy(_, j_idx), tKsK(_, i, j));
+        mute::copy(GmemTiledCopy{}.with(desc_K).with(should_load), mK_paged_cur_copy(_, j_idx), tKsK(_, i, j));
       }
     }
   }
@@ -265,6 +267,8 @@ struct PagedKVManager {
 
     MUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size<1>(tVsV); ++i) {
+      bool const should_load =
+          __shfl_sync(0xffffffff, tPrRowValidV(i / GmemThreadsPerRow), i % GmemThreadsPerRow, GmemThreadsPerRow);
       // TODO: check use mutlass address space
       Element const* v_ptr = (Element const*)__musa_ptr_gen_to_global(
           (void*)(__shfl_sync(0xffffffff,
@@ -275,11 +279,10 @@ struct PagedKVManager {
       Tensor mV_paged_cur      = make_tensor(make_gmem_ptr(v_ptr), Shape<Int<HeadDimVO>>{});
       Tensor mV_paged_cur_copy = mute::tiled_divide(mV_paged_cur, Shape<Int<ElementsPerLoad>>{});
 
-      // TODO: clear oob if needed
       MUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < size<2>(tVsV); ++j) {
         int const j_idx = get<1>(tVcV(_0{}, _0{}, j)) / ElementsPerLoad;
-        mute::copy(GmemTiledCopy{}.with(desc_V).with(true), mV_paged_cur_copy(_, j_idx), tVsV(_, i, j));
+        mute::copy(GmemTiledCopy{}.with(desc_V).with(should_load), mV_paged_cur_copy(_, j_idx), tVsV(_, i, j));
       }
     }
   }

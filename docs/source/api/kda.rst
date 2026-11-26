@@ -44,6 +44,8 @@ Chunk KDA at a glance
   - Varlen: ``[S, H, 128]`` or ``[1, S, H, 128]`` with ``cu_seqlens``
 - Optional recurrent state input/output
 - Optional preallocated ``output`` and ``final_state``
+- Optional state checkpoints via ``checkpoint_every_n_tokens=C`` on MP31 and
+  MP32
 
 Chunk KDA toolchain requirements
 --------------------------------
@@ -100,6 +102,46 @@ Chunk KDA outputs
 
 - default return: ``output``
 - if ``output_final_state=True``: returns ``(output, final_state)``
+- if ``checkpoint_every_n_tokens > 0``: returns
+  ``(output, final_state, checkpoints)``, where ``final_state`` is a zero-size
+  tensor if it was not requested
+
+Chunk KDA state checkpoints
+---------------------------
+
+``checkpoint_every_n_tokens=C`` makes ``chunk_kda`` return the recurrent state
+every ``C`` tokens instead of only at the end of a sequence, so a serving
+framework can cache prefix states and restore one later. The operator allocates
+the pool itself and returns it as the third element of the result; the layout
+matches the cuDNN frontend GDN ``state_checkpoints`` output.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 72
+
+   * - Item
+     - Supported scope
+   * - Architecture
+     - MP31 and MP32
+   * - Cadence
+     - ``C`` is ``0`` (disabled) or a positive multiple of the kernel chunk,
+       ``16``
+   * - Checkpoint meaning
+     - Entry ``j`` of sequence ``b`` holds the state entering token ``j * C``.
+       Entry ``0`` is the incoming state; the state after the final token is
+       ``final_state``, never a checkpoint
+   * - Packing
+     - Entries are packed per sequence in ``cu_seqlens`` order, so the valid
+       rows are ``sum_b ((len_b - 1) // C + 1)`` and empty sequences contribute
+       none
+   * - Pool shape
+     - Allocated by the operator as ``[capacity, Hv, 128, 128]`` with
+       ``capacity = max(total_tokens // C + num_seqs, 1)``
+   * - Pool dtype
+     - The activation dtype (``torch.float16`` or ``torch.bfloat16``), even
+       when the recurrent state is ``torch.float32``
+   * - Not combinable with
+     - ``chunk_states`` and ``initial_state_indices``
 
 Decode support
 --------------

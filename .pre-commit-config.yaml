@@ -12,6 +12,9 @@
 #
 # See https://github.com/pre-commit/pre-commit
 
+# Preserve byte-exact upstream snapshots and their hashes; do not format these files.
+exclude: \.s$|^internal/knowledge/ph1s_fd/(raw|source_html|pages|attachment_text)/
+
 repos:
   # Standard hooks
   - repo: https://github.com/pre-commit/pre-commit-hooks.git
