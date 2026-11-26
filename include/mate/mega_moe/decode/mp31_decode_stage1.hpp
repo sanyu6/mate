@@ -169,7 +169,7 @@ __global__ __launch_bounds__(kNumThreads,
   using PipelineAB          = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<kNumStages, 2>;
   using PipelineABParams    = typename PipelineAB::Params;
   using PipelineABState     = typename PipelineAB::PipelineState;
-  using PipelineSeq         = mutlass::OrderedSequenceBarrier<1, NumMmaWarpSquads>;
+  using PipelineSeq         = mutlass::Mp31OrderedSequenceBarrier<1, NumMmaWarpSquads>;
   using PipelineSeqParams   = typename PipelineSeq::Params;
   using ConsumerSyncBarrier = mutlass::arch::AsyncBarrier;
 

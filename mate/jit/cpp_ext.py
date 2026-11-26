@@ -141,10 +141,15 @@ def build_cflags(
 def build_cuda_cflags(
     extra_cuda_cflags: Optional[List[str]],
     extra_include_dirs: Optional[Sequence[Path]],
+    musa_target_flags: Optional[Sequence[str]] = None,
 ) -> List[str]:
     cuda_cflags = _flatten_flags(
         ["-fPIC", "-std=c++17", "-O2"],
-        jit_env.MATE_MUSA_TARGET_FLAGS,
+        (
+            jit_env.MATE_MUSA_TARGET_FLAGS
+            if musa_target_flags is None
+            else musa_target_flags
+        ),
         extra_cuda_cflags,
         parse_env_flags("MATE_EXTRA_MUSAFLAGS"),
     )
@@ -227,10 +232,14 @@ def generate_compile_commands_for_op(
     extra_cflags: Optional[List[str]],
     extra_cuda_cflags: Optional[List[str]],
     extra_include_dirs: Optional[List[Path]],
+    output_dir: Optional[Path] = None,
+    musa_target_flags: Optional[Sequence[str]] = None,
 ) -> List[dict]:
-    output_dir = (jit_env.MATE_JIT_DIR / name).resolve()
+    output_dir = (output_dir or (jit_env.MATE_JIT_DIR / name)).resolve()
     cflags = build_cflags(extra_cflags, extra_include_dirs)
-    cuda_cflags = build_cuda_cflags(extra_cuda_cflags, extra_include_dirs)
+    cuda_cflags = build_cuda_cflags(
+        extra_cuda_cflags, extra_include_dirs, musa_target_flags
+    )
     cxx = get_cxx()
     mcc = get_mcc()
 
@@ -269,12 +278,16 @@ def generate_ninja_build_for_op(
     extra_cuda_cflags: Optional[List[str]],
     extra_ldflags: Optional[List[str]],
     extra_include_dirs: Optional[List[Path]],
+    output_dir: Optional[Path] = None,
+    musa_target_flags: Optional[Sequence[str]] = None,
 ) -> str:
     if tvm_ffi_ext.IS_WINDOWS:
         raise RuntimeError("MATE JIT ninja build is only supported on Unix platforms.")
 
     cflags = build_cflags(extra_cflags, extra_include_dirs)
-    cuda_cflags = build_cuda_cflags(extra_cuda_cflags, extra_include_dirs)
+    cuda_cflags = build_cuda_cflags(
+        extra_cuda_cflags, extra_include_dirs, musa_target_flags
+    )
     ldflags = build_ldflags(extra_ldflags)
 
     lines = [
@@ -300,7 +313,7 @@ def generate_ninja_build_for_op(
         "",
     ]
 
-    output_dir = jit_env.MATE_JIT_DIR / name
+    output_dir = output_dir or (jit_env.MATE_JIT_DIR / name)
 
     objects = []
     for source in sources:

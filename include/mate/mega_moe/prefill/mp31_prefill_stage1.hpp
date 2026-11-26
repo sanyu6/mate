@@ -398,6 +398,10 @@ __global__ __launch_bounds__(kNumThreads,
       }
       dispatch_setup_sync();
 
+      if (mp_idx == 0 && thread_idx < kNumRanks) {
+        auto* remote_active_count = sym_buffer.map(workspace.get_src_active_count_ptr(sym_buffer.rank_idx), thread_idx);
+        st_relaxed_sys_global(remote_active_count, 0u);
+      }
       __threadfence_system_noflush();
       grid_sync<kNumMPs, 0>(workspace, mp_idx, thread_idx, dispatch_setup_sync);
 

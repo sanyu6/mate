@@ -51,6 +51,8 @@ def flashmla_sparse_decode(
     tile_scheduler_metadata: Optional[torch.Tensor],
     num_splits: Optional[torch.Tensor],
     metadata_getter: MetadataGetter,
+    q_rope_positions: Optional[torch.Tensor] = None,
+    q_rope_cos_sin: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Single FlashMLA sparse-decode dispatcher for MODEL1 and V3.2."""
     return sparse_mla_decode_fwd(
@@ -67,4 +69,6 @@ def flashmla_sparse_decode(
         tile_scheduler_metadata=tile_scheduler_metadata,
         num_splits=num_splits,
         metadata_getter=metadata_getter,
+        q_rope_positions=q_rope_positions,
+        q_rope_cos_sin=q_rope_cos_sin,
     )

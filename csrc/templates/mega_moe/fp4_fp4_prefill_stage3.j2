@@ -1,0 +1,21 @@
+#include "mate/mega_moe/prefill/fp4_fp4/mp32_prefill_stage3.hpp"
+#include "mate/mega_moe/prefill/fp4_fp4/prefill_host.hpp"
+using Fp4Layout=::mega_moe::prefill::mp32::fp4_fp4::SymmetricLayout<{{ ranks }},{{ tokens }},{{ hidden }},{{ intermediate }},{{ experts }},{{ topk }}>;
+
+void {{ func_name }}(ffi::TensorView out,ffi::TensorView buffer,int tokens,int num_mps) {
+  namespace host=mate::fp4_prefill_host;
+  using L=Fp4Layout;
+  ffi::MUSADeviceGuard guard(buffer.device().device_id);
+  host::tensor(buffer,dl_uint8,buffer.device(),{buffer.numel()},"buffer");
+  TVM_FFI_ICHECK_GE(buffer.numel(),L::allocation_bytes());
+  host::tensor(out,dl_bfloat16,buffer.device(),{tokens,L::kHidden},"out");
+  check_mp32(buffer.device(),"FP4 combine");
+  host::mps(num_mps,buffer.device());
+  TVM_FFI_ICHECK_GT(tokens,0); TVM_FFI_ICHECK_LE(tokens,L::kTokens);
+  using Launch = ::mega_moe::prefill::mp32::fp4_fp4::Stage3Config;
+  ::mega_moe::prefill::mp32::fp4_fp4::stage3_kernel<L><<<num_mps*Launch::kBlocksPerMP,Launch::kNumThreads,0,get_stream(out.device())>>>(
+    static_cast<char*>(buffer.data_ptr()),tokens,static_cast<mutlass::bfloat16_t*>(out.data_ptr()));
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }},{{ func_name }});

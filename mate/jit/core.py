@@ -34,8 +34,8 @@ def write_if_different(path: Path, content: str) -> bool:
     return True
 
 
-def get_tmpdir() -> Path:
-    tmpdir = jit_env.MATE_JIT_DIR / "tmp"
+def get_tmpdir(jit_dir: Optional[Path] = None) -> Path:
+    tmpdir = (jit_dir or jit_env.MATE_JIT_DIR) / "tmp"
     tmpdir.mkdir(parents=True, exist_ok=True)
     return tmpdir
 
@@ -164,6 +164,19 @@ class JitSpec:
         default_factory=dict
     )
     aot_path: Optional[Path] = None
+    target_arch: Optional[jit_env.MusaArch] = None
+
+    @property
+    def jit_dir(self) -> Path:
+        if self.target_arch is None:
+            return jit_env.MATE_JIT_DIR
+        return jit_env.resolve_musa_jit_dir(self.target_arch)
+
+    @property
+    def musa_target_flags(self) -> tuple[str, ...]:
+        if self.target_arch is None:
+            return jit_env.MATE_MUSA_TARGET_FLAGS
+        return jit_env.resolve_musa_target_flags(self.target_arch)
 
     def resolve_dependencies(self, repository: Path) -> ResolvedJitDependencies:
         """Return source dependencies without materializing or compiling the spec."""
@@ -189,7 +202,7 @@ class JitSpec:
 
     @property
     def build_dir(self) -> Path:
-        return jit_env.MATE_JIT_DIR / self.name
+        return self.jit_dir / self.name
 
     @property
     def ninja_path(self) -> Path:
@@ -201,7 +214,7 @@ class JitSpec:
 
     @property
     def lock_path(self) -> Path:
-        return get_tmpdir() / f"{self.name}.lock"
+        return get_tmpdir(self.jit_dir) / f"{self.name}.lock"
 
     @property
     def is_aot(self) -> bool:
@@ -241,6 +254,8 @@ class JitSpec:
             extra_cuda_cflags=self.extra_cuda_cflags,
             extra_ldflags=self.extra_ldflags,
             extra_include_dirs=self.extra_include_dirs,
+            output_dir=self.build_dir,
+            musa_target_flags=self.musa_target_flags,
         )
         write_if_different(self.ninja_path, content)
 
@@ -254,6 +269,8 @@ class JitSpec:
             extra_cflags=self.extra_cflags,
             extra_cuda_cflags=self.extra_cuda_cflags,
             extra_include_dirs=self.extra_include_dirs,
+            output_dir=self.build_dir,
+            musa_target_flags=self.musa_target_flags,
         )
 
     def build(self, verbose: bool = False, need_lock: bool = True) -> Path:
@@ -292,6 +309,7 @@ def gen_jit_spec(
     extra_include_paths: Optional[Sequence[Path | str]] = None,
     generated_sources: Optional[Mapping[Path | str, GeneratedSource]] = None,
     aot_path: Optional[Path | str] = None,
+    target_arch: Optional[jit_env.MusaArch | str] = None,
 ) -> JitSpec:
     normalized_sources = [Path(path) for path in sources]
     normalized_generated_sources = (
@@ -316,6 +334,11 @@ def gen_jit_spec(
         ),
         generated_sources=normalized_generated_sources,
         aot_path=Path(aot_path) if aot_path is not None else default_aot_path(name),
+        target_arch=(
+            jit_env.MusaArch.parse(target_arch)
+            if isinstance(target_arch, str)
+            else target_arch
+        ),
     )
     jit_spec_registry.register(spec)
     return spec

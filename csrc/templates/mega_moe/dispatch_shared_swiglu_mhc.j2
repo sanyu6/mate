@@ -1,0 +1,140 @@
+#define DISPATCH_TACTIC {{ dispatch_tactic }}
+#define SHARED_EPILOGUE_TACTIC {{ epilogue_tactic }}
+#define MHC_KPARTS {{ k_parts }}
+#define MHC_TACTIC {{ tactic }}
+#include <array>
+
+#include <map>
+#include "mate/mega_moe/decode/fp4_fp4/mhc_tce_horizontal.hpp"
+#include "mate/mega_moe/decode/fp4_fp4/dispatch_shared_swiglu.hpp"
+#include "mate/mega_moe/prefill/fp4_fp4/prefill_host.hpp"
+template<class Stage, class Compute, int MhcCTAs, bool MhcOnly>
+__global__ __launch_bounds__(Stage::kNumThreads) void horizontal_kernel(
+    ::mega_moe::layout::SymBuffer<Stage::R> sym, typename Stage::Params params,
+    uint8_t* payload, uint8_t* scales, uint4* metadata, int* counts, int* offsets, int* status,
+    int tokens, mutlass::bfloat16_t* out, const mutlass::bfloat16_t* residual,
+    const float* weight, const float* scale, const float* base, float* mhc_out,
+    float rms_eps, float hc_eps, MUTLASS_GRID_CONSTANT MUtensorDescriptor const wd, MUTLASS_GRID_CONSTANT MUtensorDescriptor const xd, float* pm, float* ps, int* completion, uint8_t* output_q, uint8_t* output_sf, float limit, int4* tile_schedule) {
+  extern __shared__ __align__(4096) char smem[];
+  if constexpr(DISPATCH_TACTIC==3 && !MhcOnly) {
+    if(blockIdx.x<Stage::kDispatchCTAs) {
+      __musa_async_bar_record(2);
+      if(threadIdx.x==0)__musa_async_init_arrival(1,4,0);
+      __syncthreads();
+      if(threadIdx.x<128) {
+        uint32_t phase=0;
+        auto sync=[&](){__musa_async_arrive(1);__musa_async_wait(1,phase++&1u);};
+        Stage::Dispatch::template run<decltype(sync),true>(sym,payload,scales,metadata,counts,offsets,status,tokens,
+          *reinterpret_cast<typename Stage::Dispatch::SharedStorage*>(smem),sync,tile_schedule,{{ schedule_tiles }});
+      }
+    } else if(blockIdx.x<Stage::kDispatchCTAs+Stage::kGemmCTAs) {
+      Compute::run(sym,params,payload,scales,metadata,counts,offsets,status,tokens,out,smem,output_q,output_sf,limit,
+                   int(blockIdx.x)-Stage::kDispatchCTAs);
+    }else {
+      int local=int(blockIdx.x)-Stage::kDispatchCTAs-Stage::kGemmCTAs;
+      mate::mhc_tce_horizontal::run<Stage::kNumThreads,{{ mhc_ctas }}>(local,pm,ps,completion,wd,xd,
+          scale,base,mhc_out,rms_eps,hc_eps,smem);
+    }
+    return;
+  }
+  if (!MhcOnly && blockIdx.x < Stage::kNumCTAs) {
+    Stage::run(sym,params,payload,scales,metadata,counts,offsets,status,tokens,out,smem,output_q,output_sf,limit,-1,tile_schedule,{{ schedule_tiles }});
+  } else {
+    int local = int(blockIdx.x) - (MhcOnly ? 0 : Stage::kNumCTAs);
+    mate::mhc_tce_horizontal::run<(MhcOnly ? 256 : Stage::kNumThreads),{{ mhc_ctas }}>(local,pm,ps,completion,wd,xd,
+      scale,base,mhc_out,rms_eps,hc_eps,smem);
+  }
+}
+void {{ func_name }}(ffi::TensorView buffer,ffi::TensorView ptrs,ffi::TensorView payload,ffi::TensorView scales,
+    ffi::TensorView metadata,ffi::TensorView counts,ffi::TensorView offsets,ffi::TensorView status,
+    ffi::TensorView x,ffi::TensorView xs,ffi::TensorView w,ffi::TensorView ws,int rank,int tokens, ffi::TensorView residual, ffi::TensorView mhc_w, ffi::TensorView mhc_scale, ffi::TensorView mhc_base, ffi::TensorView mhc_out, double rms_eps, double hc_eps, int mode, ffi::TensorView packed, ffi::TensorView pm, ffi::TensorView ps, ffi::TensorView completion, ffi::TensorView output_q, ffi::TensorView output_sf, double limit{% if schedule_tiles %}, ffi::TensorView tile_schedule_tensor{% endif %}) {
+  namespace dev=::mega_moe::decode::mp32::fp4_fp4;namespace host=mate::fp4_prefill_host;
+  using L=dev::DecodeLayout<{{ ranks }},{{ tokens }},{{ hidden }},{{ intermediate }},{{ experts }},{{ topk }}>;
+  using Stage=dev::DispatchSharedSwiGlu<L,{{ shared_features }},{{ num_ctas }},{{ "true" if padded else "false" }},{{ "true" if fused else "false" }},{{ feature_tile }},{{ token_tile }},{{ stages }},{{ gemm_ctas }}>;
+  using Compute=dev::DispatchSharedSwiGlu<L,{{ shared_features }},{{ num_ctas }},{{ "true" if padded else "false" }},false,{{ feature_tile }},{{ token_tile }},{{ stages }},{{ gemm_ctas }}>;
+  ffi::MUSADeviceGuard guard(buffer.device().device_id);auto d=buffer.device();
+  host::tensor(buffer,dl_uint8,d,{buffer.numel()},"buffer");
+  TVM_FFI_ICHECK_GE(buffer.numel(),L::allocation_bytes());
+  auto sym=mate::mega_moe::make_sym_buffer<L::kRanks>(ptrs,rank);
+  TVM_FFI_ICHECK_EQ(sym.base,reinterpret_cast<int64_t>(buffer.data_ptr()));
+  TVM_FFI_ICHECK(tokens>0 && tokens<=128);
+  host::tensor(payload,dl_uint8,d,{L::kPoolTokens,L::kHidden/2},"payload");
+  host::tensor(scales,dl_uint8,d,{L::kHidden/32,{{ 4 if padded else 1 }}*L::kPoolTokens},"scales");
+  host::tensor(metadata,dl_int32,d,{L::kPoolTokens,4},"metadata");host::tensor(counts,dl_int32,d,{L::kGroups},"counts");
+  host::tensor(offsets,dl_int32,d,{L::kGroups+1},"offsets");host::tensor(status,dl_int32,d,{1},"status");
+  host::tensor(x,dl_uint8,d,{tokens,L::kHidden},"shared_x");host::tensor(xs,dl_uint8,d,{L::kHidden/32,tokens},"shared_x_scale");
+  host::tensor(w,dl_uint8,d,{ {{ shared_features }},L::kHidden},"shared_w");host::tensor(ws,dl_uint8,d,{L::kHidden/32,{{ shared_features }}},"shared_w_scale");
+  host::tensor(residual,dl_bfloat16,d,{24,20480},"residual");
+  host::tensor(mhc_w,dl_float32,d,{24,20480},"mhc_weight");
+  host::tensor(mhc_scale,dl_float32,d,{3},"mhc_scale");
+  host::tensor(mhc_base,dl_float32,d,{24},"mhc_base");
+  host::tensor(mhc_out,dl_float32,d,{tokens*24},"mhc_output");
+  TVM_FFI_ICHECK(mode>=0 && mode<=3);
+  TVM_FFI_ICHECK_EQ(tokens,24);
+  int4* tile_schedule = nullptr;
+{% if schedule_tiles %}
+  TVM_FFI_ICHECK_EQ(mode,0);
+  host::tensor(tile_schedule_tensor,dl_int32,d,{L::kGroups*{{ schedule_tiles }},4},"routed_tile_schedule");
+  tile_schedule = static_cast<int4*>(tile_schedule_tensor.data_ptr());
+{% endif %}
+  host::tensor(packed,dl_bfloat16,d,{3,32,20480},"mhc_packed_weight");
+  host::tensor(pm,dl_float32,d,{MHC_KPARTS,24,24},"partial_mix");
+  host::tensor(ps,dl_float32,d,{MHC_KPARTS,24,3},"partial_sq");
+  host::tensor(completion,dl_int32,d,{1},"completion");
+  host::tensor(output_q,dl_uint8,d,{tokens,{{ shared_features//2 }}},"shared_swiglu_fp8");
+  host::tensor(output_sf,dl_uint8,d,{ {{ shared_features//64 }},tokens},"shared_swiglu_scale");
+  using DescKey=std::array<uintptr_t,3>;
+  static thread_local std::map<DescKey,std::pair<TmeDesc,TmeDesc>> desc_cache;
+  DescKey dk{uintptr_t(packed.data_ptr()),uintptr_t(residual.data_ptr()),uintptr_t(d.device_id)};
+  auto dit=desc_cache.find(dk);
+  if(dit==desc_cache.end()) {
+    if(desc_cache.size()>=32)desc_cache.clear();
+    TmeDesc wd(std::vector<uint64_t>{20480,{{ 24 if tactic else 32 }},3},std::vector<uint64_t>{20480,32*20480},packed.data_ptr(),MU_TENSOR_DESCRIPTOR_DATA_TYPE_BFLOAT16);
+    TmeDesc xd(std::vector<uint64_t>{20480,24},std::vector<uint64_t>{20480},residual.data_ptr(),MU_TENSOR_DESCRIPTOR_DATA_TYPE_BFLOAT16);
+    dit=desc_cache.emplace(dk,std::make_pair(wd,xd)).first;
+  }
+  constexpr int Smem=Stage::SmemSize>65664?Stage::SmemSize:65664;
+  using Key=std::array<uintptr_t,6>;
+  static thread_local std::map<Key,typename Stage::Params> params_cache;
+  Key key{reinterpret_cast<uintptr_t>(w.data_ptr()),reinterpret_cast<uintptr_t>(ws.data_ptr()),
+      reinterpret_cast<uintptr_t>(x.data_ptr()),reinterpret_cast<uintptr_t>(xs.data_ptr()),uintptr_t(tokens),uintptr_t(d.device_id)};
+  auto it=params_cache.find(key);
+  if(it==params_cache.end()) {
+    if(params_cache.size()>=32)params_cache.clear();
+    it=params_cache.emplace(key,Stage::Gemm::params(tokens,w.data_ptr(),ws.data_ptr(),x.data_ptr(),xs.data_ptr())).first;
+  }
+  auto const& params=it->second;
+  auto kernel=dev::dispatch_shared_swiglu_kernel<Stage>;
+  auto fused_kernel=horizontal_kernel<Stage,Compute,{{ mhc_ctas }},false>;
+  auto mhc_kernel=horizontal_kernel<Stage,Compute,{{ mhc_ctas }},true>;
+  static thread_local int checked_device=-1;
+  if(checked_device!=d.device_id) {
+    check_mp32(d,"dispatch shared GEMM1");host::mps(Stage::kNumCTAs,d);
+    MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(kernel,musaFuncAttributeMaxDynamicSharedMemorySize,Stage::SmemSize));
+    MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(fused_kernel,musaFuncAttributeMaxDynamicSharedMemorySize,Smem));
+    MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(mhc_kernel,musaFuncAttributeMaxDynamicSharedMemorySize,65664));
+    int resident=0;MATE_MUSA_RUNTIME_CHECK(musaOccupancyMaxActiveBlocksPerMultiprocessor(&resident,kernel,Stage::kNumThreads,Stage::SmemSize));
+    TVM_FFI_ICHECK_GE(resident,1);
+    musaFuncAttributes fa{};int fr=0;
+    MATE_MUSA_RUNTIME_CHECK(musaFuncGetAttributes(&fa,fused_kernel));
+    MATE_MUSA_RUNTIME_CHECK(musaOccupancyMaxActiveBlocksPerMultiprocessor(&fr,fused_kernel,Stage::kNumThreads,Smem));
+    fprintf(stderr,"CTA_RESOURCE dc={{ num_ctas }} gc={{ gemm_ctas }} mc={{ mhc_ctas }} dt={{ dispatch_tactic }} threads=%d smem=%d regs=%d local=%zu resident=%d\n",Stage::kNumThreads,Smem,fa.numRegs,fa.localSizeBytes,fr);
+    checked_device=d.device_id;
+  }
+  if(mode==1 || mode==3) kernel<<<Stage::kNumCTAs,Stage::kNumThreads,Stage::SmemSize,get_stream(d)>>>(sym,params,
+    static_cast<uint8_t*>(payload.data_ptr()),static_cast<uint8_t*>(scales.data_ptr()),reinterpret_cast<uint4*>(metadata.data_ptr()),
+    static_cast<int*>(counts.data_ptr()),static_cast<int*>(offsets.data_ptr()),static_cast<int*>(status.data_ptr()),tokens,nullptr,static_cast<uint8_t*>(output_q.data_ptr()),static_cast<uint8_t*>(output_sf.data_ptr()),float(limit));
+  constexpr int TotalCTAs=DISPATCH_TACTIC==3?{{ num_ctas+gemm_ctas+mhc_ctas }}:Stage::kNumCTAs+{{ mhc_ctas }};
+  if(mode==0) fused_kernel<<<TotalCTAs,Stage::kNumThreads,Smem,get_stream(d)>>>(sym,params,static_cast<uint8_t*>(payload.data_ptr()),static_cast<uint8_t*>(scales.data_ptr()),
+      reinterpret_cast<uint4*>(metadata.data_ptr()),static_cast<int*>(counts.data_ptr()),static_cast<int*>(offsets.data_ptr()),static_cast<int*>(status.data_ptr()),
+      tokens,nullptr,static_cast<const mutlass::bfloat16_t*>(residual.data_ptr()),
+      static_cast<const float*>(mhc_w.data_ptr()),static_cast<const float*>(mhc_scale.data_ptr()),static_cast<const float*>(mhc_base.data_ptr()),
+      static_cast<float*>(mhc_out.data_ptr()),float(rms_eps),float(hc_eps),dit->second.first.desc,dit->second.second.desc,static_cast<float*>(pm.data_ptr()),static_cast<float*>(ps.data_ptr()),static_cast<int*>(completion.data_ptr()),static_cast<uint8_t*>(output_q.data_ptr()),static_cast<uint8_t*>(output_sf.data_ptr()),float(limit),tile_schedule);
+  if(mode==1 || mode==2) mhc_kernel<<<{{ mhc_ctas }},256,65664,get_stream(d)>>>(sym,params,static_cast<uint8_t*>(payload.data_ptr()),static_cast<uint8_t*>(scales.data_ptr()),
+      reinterpret_cast<uint4*>(metadata.data_ptr()),static_cast<int*>(counts.data_ptr()),static_cast<int*>(offsets.data_ptr()),static_cast<int*>(status.data_ptr()),
+      tokens,nullptr,static_cast<const mutlass::bfloat16_t*>(residual.data_ptr()),
+      static_cast<const float*>(mhc_w.data_ptr()),static_cast<const float*>(mhc_scale.data_ptr()),static_cast<const float*>(mhc_base.data_ptr()),
+      static_cast<float*>(mhc_out.data_ptr()),float(rms_eps),float(hc_eps),dit->second.first.desc,dit->second.second.desc,static_cast<float*>(pm.data_ptr()),static_cast<float*>(ps.data_ptr()),static_cast<int*>(completion.data_ptr()),static_cast<uint8_t*>(output_q.data_ptr()),static_cast<uint8_t*>(output_sf.data_ptr()),float(limit),tile_schedule);
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }},{{ func_name }});

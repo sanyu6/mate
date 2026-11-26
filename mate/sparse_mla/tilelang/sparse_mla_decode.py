@@ -14,6 +14,11 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
+from ...mate_runtime import MP32_ARCH, get_musa_arch
+from .mp32.sparse_mla_v4_mp32_decode_fwd_scheduled import (
+    sparse_mla_decode_fwd_scheduled_interface_v4 as _decode_model1_mp32,
+)
+
 from ..flashmla_checks import (
     MODEL1_KV_BYTES_PER_TOKEN,
     check_model1_k_cache,
@@ -67,6 +72,8 @@ def sparse_mla_decode_fwd(
     num_splits: Optional[torch.Tensor],
     metadata_getter: MetadataGetter,
     _fused_output=None,
+    q_rope_positions: Optional[torch.Tensor] = None,
+    q_rope_cos_sin: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Dispatch sparse decode by compile-time layout variant."""
 
@@ -119,6 +126,8 @@ def sparse_mla_decode_fwd(
             num_splits=num_splits,
             metadata_getter=metadata_getter,
             _fused_output=_fused_output,
+            q_rope_positions=q_rope_positions,
+            q_rope_cos_sin=q_rope_cos_sin,
         )
 
     raise AssertionError(f"Unsupported sparse decode q.shape[-1]: {head_dim_q}")
@@ -198,6 +207,8 @@ def _sparse_decode_model1(
     num_splits: Optional[torch.Tensor],
     metadata_getter: MetadataGetter,
     _fused_output=None,
+    q_rope_positions: Optional[torch.Tensor] = None,
+    q_rope_cos_sin: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert head_dim_v == 512, "MODEL1 sparse decode only supports head_dim_v == 512"
     assert q.shape[-1] == 512, "MODEL1 sparse decode requires q.shape[-1] == 512"
@@ -287,7 +298,7 @@ def _sparse_decode_model1(
         threads,
     ) = _model1_decode_schedule(num_heads_q)
 
-    return _decode_model1(
+    args = (
         q,
         k_cache_nope,
         k_cache_rope,
@@ -295,6 +306,8 @@ def _sparse_decode_model1(
         indices,
         tile_scheduler_metadata,
         num_splits,
+    )
+    kwargs = dict(
         extra_kv_nope=extra_k_cache_nope,
         extra_kv_rope=extra_k_cache_rope,
         extra_kv_scales=extra_k_cache_scales,
@@ -319,3 +332,26 @@ def _sparse_decode_model1(
         extra_cache_format=extra_cache_format,
         _fused_output=_fused_output,
     )
+    use_mp32_v41 = os.getenv("MATE_DSV4_DECODE_MP32_V41", "1").lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    if (
+        _fused_output is None
+        and get_musa_arch(q) == MP32_ARCH
+        and (cache_format == "v4" or (cache_format == "v41" and use_mp32_v41))
+    ):
+        mp32_kwargs = dict(kwargs)
+        del mp32_kwargs["_cache_strides_prepared"]
+        del mp32_kwargs["_fused_output"]
+        return _decode_model1_mp32(
+            *args,
+            q_rope_positions=q_rope_positions,
+            q_rope_cos_sin=q_rope_cos_sin,
+            **mp32_kwargs,
+        )
+    assert q_rope_positions is None and q_rope_cos_sin is None, (
+        "Q RoPE fusion in core requires the MP32 V4/V4.1 decode kernel"
+    )
+    return _decode_model1(*args, **kwargs)

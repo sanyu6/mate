@@ -32,6 +32,9 @@ _LAZY_SUBMODULES = {
     "kda",
     "mamba",
     "mega_moe",
+    "mega_moe_fp8_fp4",
+    "mega_moe_fp4_fp4",
+    "ops",
     "norm",
     "mha_interface",
     "msa_interface",
@@ -44,6 +47,7 @@ _LAZY_SUBMODULES = {
 }
 
 _LAZY_ATTR_MODULES = {
+    "fp8_fp4_mega_moe": "mega_moe_fp8_fp4",
     "flash_attn_combine": "mha_interface",
     "flash_attn_varlen_func": "mha_interface",
     "fmha_backward": "mha_interface",
@@ -78,6 +82,7 @@ _LAZY_ATTR_MODULES = {
 }
 
 __all__ = [
+    "fp8_fp4_mega_moe",
     "aot",
     "artifacts",
     "api_logging",
@@ -101,6 +106,9 @@ __all__ = [
     "kda",
     "mamba",
     "mega_moe",
+    "mega_moe_fp8_fp4",
+    "mega_moe_fp4_fp4",
+    "ops",
     "norm",
     "chunk_kda",
     "mate_api",

@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import pathlib
+from dataclasses import dataclass
 
 from packaging.version import InvalidVersion, Version
 
@@ -85,6 +86,29 @@ def _parse_arch_token(arch: str) -> tuple[int, int]:
     return major, minor
 
 
+@dataclass(frozen=True, order=True)
+class MusaArch:
+    major: int
+    minor: int
+
+    @classmethod
+    def parse(cls, value: str) -> "MusaArch":
+        major, minor = _parse_arch_token(value.strip())
+        return cls(major=major, minor=minor)
+
+    @property
+    def cc(self) -> int:
+        return self.major * 10 + self.minor
+
+    @property
+    def name(self) -> str:
+        return f"mp{self.major}{self.minor}"
+
+    @property
+    def target_flag(self) -> str:
+        return f"--offload-arch=mp_{self.major}{self.minor}"
+
+
 def _normalize_arch_pairs(arch_pairs: list[tuple[int, int]]) -> tuple[str, ...]:
     unique_arch_pairs = sorted(set(arch_pairs))
     if not unique_arch_pairs:
@@ -131,8 +155,10 @@ def resolve_musa_arch_list() -> tuple[str, ...]:
     return _detect_visible_musa_arch_list()
 
 
-def resolve_musa_target_flags() -> tuple[str, ...]:
-    return tuple(f"--offload-arch=mp_{arch[2:]}" for arch in resolve_musa_arch_list())
+def resolve_musa_target_flags(arch: MusaArch | None = None) -> tuple[str, ...]:
+    if arch is not None:
+        return (arch.target_flag,)
+    return tuple(f"--offload-arch=mp_{item[2:]}" for item in resolve_musa_arch_list())
 
 
 def resolve_musa_arch_key() -> str:
@@ -187,6 +213,18 @@ MUTHRUST_INCLUDE_DIR: pathlib.Path = _resolve_repo_or_packaged(
     "3rdparty/muThrust", "muThrust"
 )
 MATE_AOT_DIR: pathlib.Path = MATE_DATA / "aot"
+
+
+def resolve_musa_workspace_dir(arch: MusaArch) -> pathlib.Path:
+    return MATE_CACHE_DIR / MATE_BASE_VERSION / arch.name
+
+
+def resolve_musa_generated_dir(arch: MusaArch) -> pathlib.Path:
+    return resolve_musa_workspace_dir(arch) / "generated"
+
+
+def resolve_musa_jit_dir(arch: MusaArch) -> pathlib.Path:
+    return resolve_musa_workspace_dir(arch) / "cached_ops"
 
 
 def disable_jit_enabled() -> bool:

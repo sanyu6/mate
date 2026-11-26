@@ -302,6 +302,8 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    q_rope_positions: Optional[torch.Tensor] = None,
+    q_rope_cos_sin: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Mla forward with kv cache
@@ -375,6 +377,8 @@ def flash_mla_with_kvcache(
                 tile_scheduler_metadata=tile_scheduler_metadata,
                 num_splits=num_splits,
                 metadata_getter=get_mla_metadata,
+                q_rope_positions=q_rope_positions,
+                q_rope_cos_sin=q_rope_cos_sin,
             )
         else:
             assert False, "Unsupported DSA backend"

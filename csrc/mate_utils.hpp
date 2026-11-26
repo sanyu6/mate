@@ -160,6 +160,10 @@ struct Arch {
   bool is_mp31() const {
     return major == 3 && minor == 1;
   }
+
+  bool is_mp32() const {
+    return major == 3 && minor == 2;
+  }
 };
 
 enum class TensorQuantMode {

@@ -48,6 +48,12 @@ __device__ __forceinline__ void clear_prefill_split_workspace(const PrefillSplit
        local_expert_idx += kNumGlobalThreads) {
     st_relaxed_sys_global(workspace.get_expert_recv_count_sum_ptr(local_expert_idx), uint64_t{0});
   }
+  const uint64_t kNumRouteCountEntries = static_cast<uint64_t>(kNumRanks) * workspace.num_max_tokens_per_rank;
+  for (uint64_t route_idx = global_thread_idx; route_idx < kNumRouteCountEntries; route_idx += kNumGlobalThreads) {
+    const uint32_t source_rank_idx  = static_cast<uint32_t>(route_idx / workspace.num_max_tokens_per_rank);
+    const uint32_t source_token_idx = static_cast<uint32_t>(route_idx % workspace.num_max_tokens_per_rank);
+    st_relaxed_sys_global(workspace.get_src_route_count_ptr(source_rank_idx, source_token_idx), uint32_t{0});
+  }
   for (uint32_t pool_block_idx = global_thread_idx; pool_block_idx < workspace.num_max_pool_blocks;
        pool_block_idx += kNumGlobalThreads) {
     st_relaxed_sys_global(workspace.get_l1_arrival_count_ptr(pool_block_idx), uint32_t{0});

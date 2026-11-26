@@ -1,0 +1,50 @@
+#include "mate/mega_moe/decode/fp4_fp4/mp32_decode_stage2.hpp"
+#include "mate/mega_moe/prefill/fp4_fp4/prefill_host.hpp"
+
+void {{ func_name }}(ffi::TensorView out, ffi::TensorView buffer, ffi::TensorView ptrs,
+    ffi::TensorView l2, ffi::TensorView sf2, ffi::TensorView w2, ffi::TensorView sw2,
+    int rank, int tokens, int num_mps) {
+  namespace dev = ::mega_moe::decode::mp32::fp4_fp4;
+  namespace host = mate::fp4_prefill_host;
+  using L = dev::DecodeLayout<{{ ranks }}, {{ tokens }}, {{ hidden }}, {{ intermediate }}, {{ experts }}, {{ topk }}>;
+  using Stage = dev::Stage2<L, {{ num_mps }}, {{ 3 if double_buffered else 2 }}{% if sglang_numerics or double_buffered %}, {{ "true" if swap_ab else "false" }}, {{ feature_tile }}, {{ "true" if pack_b else "false" }}, {{ "true" if sglang_numerics else "false" }}, {{ "true" if double_buffered else "false" }}{% elif swap_ab %}, true, {{ feature_tile }}{% elif pack_b %}, false, 256, true{% endif %}>;
+  using Fallback = dev::Stage2<L, {{ num_mps }}, 1{% if sglang_numerics or double_buffered %}, {{ "true" if swap_ab else "false" }}, {{ feature_tile }}, {{ "true" if pack_b else "false" }}, {{ "true" if sglang_numerics else "false" }}, {{ "true" if double_buffered else "false" }}{% elif swap_ab %}, true, {{ feature_tile }}{% elif pack_b %}, false, 256, true{% endif %}>;
+{% if double_buffered %}
+  using Tier2 = dev::Stage2<L, {{ num_mps }}, 2{% if sglang_numerics or double_buffered %}, {{ "true" if swap_ab else "false" }}, {{ feature_tile }}, {{ "true" if pack_b else "false" }}, {{ "true" if sglang_numerics else "false" }}, {{ "true" if double_buffered else "false" }}{% elif swap_ab %}, true, {{ feature_tile }}{% elif pack_b %}, false, 256, true{% endif %}>;
+{% endif %}
+  ffi::MUSADeviceGuard guard(buffer.device().device_id);
+  auto sym = host::sym<L>(buffer, ptrs, rank);
+  auto d = buffer.device();
+  host::mps(num_mps, d);
+  TVM_FFI_ICHECK_EQ(num_mps, {{ num_mps }});
+  TVM_FFI_ICHECK_GT(tokens, 0); TVM_FFI_ICHECK_LE(tokens, L::kDecodeTokens);
+  host::tensor(out, dl_bfloat16, d, {tokens, L::kHidden}, "out");
+  host::tensor(l2, dl_uint8, d, {L::kPoolTokens, L::kIntermediate / 2}, "l2");
+  host::tensor(sf2, dl_uint8, d, {L::kIntermediate / 32, L::kPoolTokens}, "sf2");
+  host::tensor(w2, dl_uint8, d, {L::kGroups, L::kHidden, L::kIntermediate / 2}, "w2");
+  host::tensor(sw2, dl_uint8, d, {L::kGroups, L::kIntermediate / 32, L::kHidden}, "sw2");
+  auto params = Stage::Pool::params(L::kPoolTokens, L::kGroups, l2.data_ptr(), sf2.data_ptr(), w2.data_ptr(), sw2.data_ptr());
+  auto kernel = dev::stage2_kernel<Stage>;
+  MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(kernel, musaFuncAttributeMaxDynamicSharedMemorySize, Stage::SmemSize));
+  int resident = 0;
+  MATE_MUSA_RUNTIME_CHECK(musaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &resident, kernel, Stage::kNumThreads, Stage::SmemSize));
+  int blocks = Stage::kNumCTAs;
+{% if double_buffered %}
+  if (resident < 3) {
+    kernel = dev::stage2_kernel<Tier2>;
+    blocks = Tier2::kNumCTAs;
+    MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(kernel, musaFuncAttributeMaxDynamicSharedMemorySize, Tier2::SmemSize));
+    MATE_MUSA_RUNTIME_CHECK(musaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, Tier2::kNumThreads, Tier2::SmemSize));
+  }
+{% endif %}
+  if (resident < 2) {
+    kernel = dev::stage2_kernel<Fallback>;
+    blocks = Fallback::kNumCTAs;
+    MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(kernel, musaFuncAttributeMaxDynamicSharedMemorySize, Fallback::SmemSize));
+  }
+  kernel<<<blocks, Stage::kNumThreads, Stage::SmemSize, get_stream(d)>>>(params, sym,
+      static_cast<mutlass::bfloat16_t*>(out.data_ptr()), tokens);
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}, {{ func_name }});
