@@ -208,6 +208,7 @@ MATE includes a guarded MUSA allocator that can replace the default `torch_musa`
 | `docs/` | Markdown docs and Sphinx sources |
 | `tests/` | Correctness and integration tests |
 | `benchmarks/` | Performance and benchmarking scripts |
+| `tools/` | Developer tools, including standalone JIT dump and replay |
 
 ## Quick Links
 
@@ -215,6 +216,7 @@ MATE includes a guarded MUSA allocator that can replace the default `torch_musa`
 - Wrapper quickstarts: [docs/source/wrapper_tutorials.rst](docs/source/wrapper_tutorials.rst)
 - CLI documentation: [docs/mate_cli.md](docs/mate_cli.md)
 - Guard allocator debugging: [docs/guard_allocator.md](docs/guard_allocator.md)
+- JIT dump and replay: [tools/jit_dump/README.md](tools/jit_dump/README.md)
 - Environment variables: [docs/environment_variables.md](docs/environment_variables.md)
 - Development container: [docker/README.md](docker/README.md)
 - FlashAttention-3 compatibility summary: [docs/source/wrappers/flash_attention_forward_compatibility.md](docs/source/wrappers/flash_attention_forward_compatibility.md)

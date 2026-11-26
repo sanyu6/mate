@@ -28,9 +28,6 @@ def _make_jit_pass_configs(disable_index_type_promotion=True):
 
 
 JIT_PASS_CONFIGS = _make_jit_pass_configs(disable_index_type_promotion=True)
-JIT_PASS_CONFIGS_PROMOTE_INDEX = _make_jit_pass_configs(
-    disable_index_type_promotion=False
-)
 
 JIT_COMPILE_FLAGS = [
     # "-Od3",
@@ -45,11 +42,19 @@ JIT_COMPILE_FLAGS = [
     "-misched-recompute-slotindex=1",
     "-mllvm",
     "-mtgpu-if-convert=1",
-    # "-mllvm",
-    # "-mtgpu-combine-instr-with-burst=1",
+    "-mllvm",
+    "-mtgpu-combine-instr-with-burst=1",
     "-mllvm",
     "-mtgpu-combine-fop-instr=1",
 ]
+
+
+def _make_dq_accum_layout(buffer):
+    """Transpose each 4x4 column group for MP32 SQMMA register-order atomics."""
+    return T.Layout(
+        buffer.shape,
+        lambda b, h, i, j: (b, h, i, j // 16 * 16 + j % 4 * 4 + j % 16 // 4),
+    )
 
 
 def perm_n(n, block_N, atom_n=None):
@@ -118,13 +123,12 @@ _JIT_INDEX_PROMOTION_VARIANTS = {}
 def _jit_for_index_type_promotion(jit_impl, enable_index_type_promotion):
     if not enable_index_type_promotion:
         return jit_impl
-    promote = getattr(jit_impl, "with_index_type_promotion", None)
-    if promote is not None:
-        return promote()
     key = id(jit_impl)
     variant = _JIT_INDEX_PROMOTION_VARIANTS.get(key)
     if variant is None:
-        variant = _clone_jit_with_pass_configs(jit_impl, JIT_PASS_CONFIGS_PROMOTE_INDEX)
+        pass_configs = dict(jit_impl.pass_configs or {})
+        pass_configs[tilelang.PassConfigKey.TL_DISABLE_INDEX_TYPE_PROMOTION] = False
+        variant = _clone_jit_with_pass_configs(jit_impl, pass_configs)
         _JIT_INDEX_PROMOTION_VARIANTS[key] = variant
     return variant
 

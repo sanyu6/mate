@@ -51,6 +51,7 @@ enum class Tag {
   QStages,
   KStages,
   EnableKPrefetch,
+  MmaArch,
 };
 
 template <class Value>
@@ -109,5 +110,8 @@ using KStages = Option<Tag::KStages, std::integral_constant<int, Value>>;
 
 template <bool Value>
 using EnableKPrefetch = Option<Tag::EnableKPrefetch, std::bool_constant<Value>>;
+
+template <int Value>
+using MmaArch = Option<Tag::MmaArch, std::integral_constant<int, Value>>;
 
 }  // namespace mate::attention::msa

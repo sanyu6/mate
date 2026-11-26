@@ -1,0 +1,28 @@
+#include "mate/mega_moe/prefill/fp4_fp4/mp32_prefill_stage2.hpp"
+#include "mate/mega_moe/prefill/fp4_fp4/prefill_host.hpp"
+using Fp4Layout=::mega_moe::prefill::mp32::fp4_fp4::SymmetricLayout<{{ ranks }},{{ tokens }},{{ hidden }},{{ intermediate }},{{ experts }},{{ topk }}>;
+void {{ func_name }}(ffi::TensorView buffer,ffi::TensorView ptrs,ffi::TensorView l2,ffi::TensorView sf2,
+    ffi::TensorView counts,ffi::TensorView w2,ffi::TensorView sw2,int rank,int num_mps) {
+  namespace host=mate::fp4_prefill_host;
+  namespace dev=::mega_moe::prefill::mp32::fp4_fp4;
+  using L=Fp4Layout;
+  using Stage=dev::Stage2<L,{{ num_mps }}>;
+  ffi::MUSADeviceGuard guard(buffer.device().device_id);
+  auto sym=host::sym<L>(buffer,ptrs,rank);
+  auto d=buffer.device();
+  host::mps(num_mps,d);
+  TVM_FFI_ICHECK_EQ(num_mps,{{ num_mps }});
+  host::tensor(l2,dl_uint8,d,{Stage::P,L::kIntermediate/2},"l2");
+  host::tensor(sf2,dl_uint8,d,{L::kIntermediate/32,Stage::P},"sf2");
+  host::tensor(counts,dl_int32,d,{L::kGroups},"counts");
+  host::tensor(w2,dl_uint8,d,{L::kGroups,L::kHidden,L::kIntermediate/2},"w2");
+  host::tensor(sw2,dl_uint8,d,{L::kGroups,L::kIntermediate/32,L::kHidden},"sw2");
+  auto params=Stage::SS::params(Stage::P,L::kGroups,l2.data_ptr(),sf2.data_ptr(),w2.data_ptr(),sw2.data_ptr());
+  auto kernel=dev::stage2_kernel<Stage>;
+  MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(kernel,musaFuncAttributeMaxDynamicSharedMemorySize,Stage::SmemSize));
+  kernel<<<num_mps,Stage::kNumThreads,Stage::SmemSize,get_stream(d)>>>(sym,params,static_cast<int*>(counts.data_ptr()));
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }},{{ func_name }});
+int64_t {{ func_name }}_shared() { return ::mega_moe::prefill::mp32::fp4_fp4::Stage2<Fp4Layout,{{ num_mps }}>::SmemSize; }
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}_shared,{{ func_name }}_shared);

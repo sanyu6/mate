@@ -1,10 +1,9 @@
-from functools import lru_cache
+from functools import cache, lru_cache
 
 import torch
-from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from ... import env as jit_env
-from ....utils import ceil_div
+from ....utils import ceil_div, cc_switch
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _ELEMENT_NAME_SUFFIX = {
@@ -24,21 +23,6 @@ FMHA_EXTRA_CUDA_CFLAGS = [
     "-mllvm",
     "--num-dwords-of-load-in-mutation=64",
 ]
-
-
-@lru_cache
-def _get_fmha_template_env(template_dir: str) -> Environment:
-    return Environment(
-        loader=FileSystemLoader(template_dir),
-        undefined=StrictUndefined,
-        trim_blocks=True,
-        lstrip_blocks=True,
-    )
-
-
-def get_fmha_template(template_name: str):
-    template_dir = (jit_env.MATE_TEMPLATE_DIR / "attention" / "fmha").as_posix()
-    return _get_fmha_template_env(template_dir).get_template(template_name)
 
 
 def fmha_extra_include_paths():
@@ -145,7 +129,8 @@ def _get_tile_m(m: int, head_ratio: int, enable_packgqa: bool = None):
     return tile_m, enable_packgqa
 
 
-def _get_qv_stages_by_smem(
+@cache
+def _get_mp31_qv_stages_by_smem(
     tile_m: int, tile_n: int, headdim: int, headdim_v: int, element_size: int
 ):
     smem_limit = 192 * 1024
@@ -164,11 +149,60 @@ def _get_qv_stages_by_smem(
     return (2, 2) if estimate(2) <= smem_limit else (1, 1)
 
 
+@cache
 def round_multiple(x, m):
     return (x + m - 1) // m * m
 
 
+_MP32_SMEM_CAPACITY_BYTES = 256 * 1024
+_SMEM_ARRAY_ALIGNMENT_BYTES = 16
+
+
+@cache
+def _get_mp32_stages_by_smem(
+    tile_m: int,
+    tile_n: int,
+    headdim: int,
+    headdim_v: int,
+    element_size: int,
+    has_qv: bool,
+    mma_pv_rs: bool,
+) -> tuple[int, int]:
+    def array_aligned_size(numel: int) -> int:
+        return round_multiple(max(numel * element_size, 1), _SMEM_ARRAY_ALIGNMENT_BYTES)
+
+    def shared_storage_size(stages: int) -> int:
+        size = sum(
+            (
+                array_aligned_size(tile_m * headdim),  # smem_q
+                array_aligned_size(stages * tile_n * headdim),  # smem_k
+                array_aligned_size(stages * tile_n * headdim_v),  # smem_v
+            )
+        )
+        if has_qv:
+            size += array_aligned_size(tile_m * headdim_v)  # smem_qv
+            size += array_aligned_size(stages * tile_n * headdim_v)  # smem_vt
+        if not mma_pv_rs:
+            size += array_aligned_size(tile_m * tile_n)  # smem_p
+        return size
+
+    for stages in (2, 1):
+        if shared_storage_size(stages) <= _MP32_SMEM_CAPACITY_BYTES:
+            return stages, stages
+
+    raise ValueError(
+        "MP32 FMHA shared storage exceeds 256 KiB for "
+        f"tile_m={tile_m}, tile_n={tile_n}, "
+        f"headdim={headdim}, headdim_v={headdim_v}"
+    )
+
+
 @lru_cache
+def _dtype_bits(dtype: torch.dtype) -> int:
+    return dtype.itemsize * 8
+
+
+@cc_switch()
 def _get_fwd_kernel_config(
     m: int,
     head_ratio: int,
@@ -180,6 +214,23 @@ def _get_fwd_kernel_config(
     is_fp8: bool = False,
     is_high_regpressure: bool = False,
 ):
+    raise NotImplementedError("This function should be specialized for each CC")
+
+
+@_get_fwd_kernel_config.register(31)
+@lru_cache
+def _get_fwd_kernel_config_mp31(
+    m: int,
+    head_ratio: int,
+    headdim: int,
+    headdim_v: int,
+    element_size: int,
+    enable_packgqa: bool = None,
+    has_qv: bool = False,
+    is_fp8: bool = False,
+    is_high_regpressure: bool = False,
+):
+    mma_pv_rs = False
     packgqa_alignment = 128 // (element_size * 8)
     if headdim % packgqa_alignment != 0 or headdim_v % packgqa_alignment != 0:
         enable_packgqa = False
@@ -195,7 +246,7 @@ def _get_fwd_kernel_config(
     if is_fp8 and has_qv:
         tile_m = min(candidate_tile_m, 32)
         tile_n = 128
-        stages_k, stages_v = _get_qv_stages_by_smem(
+        stages_k, stages_v = _get_mp31_qv_stages_by_smem(
             tile_m, tile_n, headdim, headdim_v, element_size
         )
     elif not is_fp8:
@@ -296,4 +347,284 @@ def _get_fwd_kernel_config(
         consumers_pv,
         tile_head_dim,
         enable_packgqa,
+        mma_pv_rs,
+        31,  # cc
     )
+
+
+@_get_fwd_kernel_config.register(32)
+@lru_cache
+def _get_fwd_kernel_config_mp32(
+    m: int,
+    head_ratio: int,
+    headdim: int,
+    headdim_v: int,
+    element_size: int,
+    enable_packgqa: bool = None,
+    has_qv: bool = False,
+    is_fp8: bool = False,
+    is_high_regpressure: bool = False,
+):
+    headdim, headdim_v = _roundup_headdim(headdim, headdim_v)
+    if enable_packgqa is None:
+        enable_packgqa = _check_enable_packgqa(m)
+
+    candidate_tile_m, enable_packgqa = _get_tile_m(m, head_ratio, enable_packgqa)
+    if candidate_tile_m == 192 and headdim % 128 != 0:
+        candidate_tile_m = 128
+
+    match (element_size, has_qv, (headdim, headdim_v)):
+        # Qv
+        # NOTE: For Qv, tile_n must be 64. Otherwise, smem will explode.
+        case (1, True, _):  # FP8 Qv
+            tile_m, tile_n, consumer_m = 128, 64, 64
+        case (2, True, _):  # BF16 Qv
+            tile_m, tile_n, consumer_m = 32, 64, 32
+
+        # FP8 Normal Attention
+        case (1, False, (128, 128) | (256, 256)):
+            # 7 Consumers
+            tile_m, tile_n, consumer_m = 224, 128, 32
+        case (1, False, (192, 128)):
+            # 6 Consumers
+            tile_m, tile_n, consumer_m = 192, 128, 32
+        case (1, False, (384, 384) | (512, 512)):
+            tile_m, tile_n, consumer_m = 128, 128, 64
+        case (1, False, _):
+            tile_m, tile_n, consumer_m = max(candidate_tile_m, 128), 128, 64
+
+        # BF16 / FP16 Normal Attention
+        case (2, False, (256, 256)):
+            tile_m, tile_n, consumer_m = candidate_tile_m, 64, 64
+        case (2, False, (384, 384)):
+            tile_m, tile_n, consumer_m = min(candidate_tile_m, 128), 128, 64
+        case (2, False, (512, 512)):
+            tile_m, tile_n, consumer_m = min(candidate_tile_m, 64), 128, 64
+        case (2, False, _):
+            tile_m, tile_n, consumer_m = candidate_tile_m, 128, 64
+
+        case _:
+            raise ValueError(f"Unsupported dtype with {element_size}B")
+
+    # NOTE: No tile_m = 16 for MP32.
+    tile_m = max(tile_m, 32)
+    mma_pv_rs = True
+
+    stages_k, stages_v = _get_mp32_stages_by_smem(
+        tile_m,
+        tile_n,
+        headdim,
+        headdim_v,
+        element_size,
+        has_qv,
+        mma_pv_rs,
+    )
+
+    consumers_qk = consumers_pv = ceil_div(tile_m, consumer_m)
+    # TODO: TileN must be greater than AppendKVRows
+    # (NumMmaThreads / GmemThreadsPerRow). When consumers = 3, NumMmaThreads = 384,
+    # GmemThreadsPerRow = 4, AppendKVRows = 96, cannot use TileN = 64.
+
+    return (
+        tile_m,
+        tile_n,
+        stages_k,
+        stages_v,
+        headdim,
+        headdim_v,
+        consumers_qk,
+        consumers_pv,
+        0,  # tile_head_dim
+        enable_packgqa,
+        mma_pv_rs,
+        32,  # cc
+    )
+
+
+@cc_switch()
+def _select_lsu_load_kv(
+    *,
+    paged_kv: bool,
+    page_size: int,
+    tile_n: int,
+    has_cu_seqlens_k: bool,
+    has_leftpad_k: bool,
+    has_qv: bool,
+    dtype: torch.dtype,
+) -> tuple[bool, bool]:
+    raise NotImplementedError("This function should be specialized for each CC")
+
+
+@_select_lsu_load_kv.register(31)
+@lru_cache
+def _select_lsu_load_kv_mp31(
+    *,
+    paged_kv: bool,
+    page_size: int,
+    tile_n: int,
+    has_cu_seqlens_k: bool,
+    has_leftpad_k: bool,
+    has_qv: bool,
+    dtype: torch.dtype,
+) -> tuple[bool, bool]:
+    paged_tme_ok = paged_kv and page_size == tile_n and not has_leftpad_k
+    use_lsu_load_k = not paged_tme_ok
+    use_lsu_load_v = (paged_kv and not paged_tme_ok) or (has_qv and not paged_kv)
+    return use_lsu_load_k, use_lsu_load_v
+
+
+@_select_lsu_load_kv.register(32)
+@lru_cache
+def _select_lsu_load_kv_mp32(
+    *,
+    paged_kv: bool,
+    page_size: int,
+    tile_n: int,
+    has_cu_seqlens_k: bool,
+    has_leftpad_k: bool,
+    has_qv: bool,
+    dtype: torch.dtype,
+) -> tuple[bool, bool]:
+    tme_ok = not (paged_kv and (page_size != tile_n or has_leftpad_k))
+    return not tme_ok, not tme_ok
+
+
+@cc_switch()
+def _check_valid_asm_input(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    page_table,
+    seqused_q,
+    seqused_k,
+    qv,
+    window_size,
+    learnable_sink,
+    attention_chunk,
+    softcap,
+    cp_world_size=1,
+):
+    raise NotImplementedError("This function should be specialized for each CC")
+
+
+@_check_valid_asm_input.register(31)
+def _check_valid_asm_input_mp31(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    page_table,
+    seqused_q,
+    seqused_k,
+    qv,
+    window_size,
+    learnable_sink,
+    attention_chunk,
+    softcap,
+    cp_world_size=1,
+):
+    if not (q.is_musa and k.is_musa and v.is_musa):
+        return False
+
+    supported_dtypes = (torch.float16, torch.bfloat16)
+    if (
+        q.dtype not in supported_dtypes
+        or k.dtype not in supported_dtypes
+        or v.dtype not in supported_dtypes
+        or q.dtype != k.dtype
+        or q.dtype != v.dtype
+    ):
+        return False
+
+    if (
+        q.dim() not in (3, 4)
+        or k.dim() not in (3, 4)
+        or v.dim() not in (3, 4)
+        or q.dim() != k.dim()
+        or q.dim() != v.dim()
+    ):
+        return False
+
+    headdim_qk = q.shape[-1]
+    headdim_v = v.shape[-1]
+
+    is_192_128 = headdim_qk == 192 and headdim_v == 128
+    is_128_128_or_less = headdim_qk == headdim_v and headdim_qk <= 128
+
+    window_size_left, window_size_right = window_size
+    if (
+        not (is_192_128 or is_128_128_or_less)
+        or page_table is not None
+        or seqused_q is not None
+        or seqused_k is not None
+        or (window_size_left is not None and window_size_left >= 0)
+        or (window_size_right is not None and window_size_right >= 0)
+        or qv is not None
+        or softcap != 0.0
+        or learnable_sink is not None
+        or attention_chunk != 0
+        or cp_world_size != 1
+    ):
+        return False
+
+    if q.dim() == 3:
+        total_seq_q, nr_heads, headdim_qk = q.shape
+        total_seq_kv, nr_heads_kv, _ = k.shape
+        _, _, headdim_v = v.shape
+
+        if (
+            cu_seqlens_q is None
+            or cu_seqlens_k is None
+            or max_seqlen_q is None
+            or max_seqlen_k is None
+        ):
+            return False
+
+        return (
+            k.shape == (total_seq_kv, nr_heads_kv, headdim_qk)
+            and v.shape == (total_seq_kv, nr_heads_kv, headdim_v)
+            and cu_seqlens_q.is_musa
+            and cu_seqlens_k.is_musa
+            and cu_seqlens_k.numel() == cu_seqlens_q.numel()
+        )
+
+    batch, seq_q, nr_heads, headdim_qk = q.shape
+    _, seq_kv, nr_heads_kv, _ = k.shape
+    _, _, _, headdim_v = v.shape
+
+    return k.shape == (
+        batch,
+        seq_kv,
+        nr_heads_kv,
+        headdim_qk,
+    ) and v.shape == (batch, seq_kv, nr_heads_kv, headdim_v)
+
+
+@_check_valid_asm_input.register(32)
+def _check_valid_asm_input_mp32(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    page_table,
+    seqused_q,
+    seqused_k,
+    qv,
+    window_size,
+    learnable_sink,
+    attention_chunk,
+    softcap,
+    cp_world_size=1,
+):
+    # For now, no MP32 asm kernel ready.
+    return False

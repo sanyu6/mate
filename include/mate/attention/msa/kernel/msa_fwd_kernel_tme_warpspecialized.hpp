@@ -32,7 +32,7 @@ struct MsaFwdKernelTmeWarpSpecialized {
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
   static_assert(sizeof(BarrierStorage) + mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount <=
                     mutlass::arch::AsyncBarrier::HardwareMaxNumAsyncTransactionBarriers,
-                "MSA forward async barrier id exceeds the MP31 hardware limit.");
+                "MSA forward async barrier id exceeds the hardware limit.");
 
   struct Arguments {
     ProblemSize                            problem_size;

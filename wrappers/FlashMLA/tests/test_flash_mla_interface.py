@@ -10,7 +10,7 @@ import tilelang.testing
 from sparse_mla_test_utils import (
     FP8KVCacheLayout,
     _expected_flashmla_num_splits,
-    _ref_sparse_mla_decode_model1,
+    _ref_sparse_mla_decode_v4,
     _ref_sparse_mla_prefill_v3_features,
     check_is_allclose,
     dequantize_k_cache,
@@ -684,9 +684,9 @@ OFFICIAL_STYLE_PREFILL_CASES = [
     ("v32_s1", 576, 1, 128, 64, 64, False, False, False),
     ("v32_dynamic_sink", 576, 62, 592, 128, 128, True, True, False),
     ("v32_all_invalid", 576, 213, 153, 256, 64, True, True, True),
-    ("model1_s1", 512, 1, 128, 128, 64, False, False, False),
-    ("model1_dynamic_sink", 512, 213, 153, 256, 128, True, True, False),
-    ("model1_all_invalid", 512, 1, 128, 128, 64, True, True, True),
+    ("v4_s1", 512, 1, 128, 128, 64, False, False, False),
+    ("v4_dynamic_sink", 512, 213, 153, 256, 128, True, True, False),
+    ("v4_all_invalid", 512, 1, 128, 128, 64, True, True, True),
 ]
 
 
@@ -794,7 +794,7 @@ def test_sparse_mla_prefill_official_style(case):
     assert torch.isneginf(tl_max_logits[~valid_rows]).all()
 
 
-MODEL1_PREFILL_CASES = [
+V4_PREFILL_CASES = [
     # (tag, S, SKV, topk, H, topk_len, sink, mostly_invalid, all_invalid, future_indices)
     ("basic_small", 1, 128, 128, 64, False, False, False, False, False),
     ("basic_oob", 213, 95, 128, 128, False, False, False, False, False),
@@ -805,7 +805,7 @@ MODEL1_PREFILL_CASES = [
 ]
 
 
-MODEL1_DECODE_CASES = [
+V4_DECODE_CASES = [
     # (tag, B, S, SKV, topk, SKV_EXTRA, extra_topk, H, topk_len, extra_topk_len, sink)
     ("basic", 128, 1, 8192, 2048, 0, 0, 128, False, False, False),
     ("tp8_local_h8_topk512_sink", 128, 1, 8192, 512, 0, 0, 8, True, False, True),
@@ -839,7 +839,7 @@ MODEL1_DECODE_CASES = [
     ],
     ids=lambda case: case[0],
 )
-def test_model1_metadata_dynamic_topk_lengths(case):
+def test_v4_metadata_dynamic_topk_lengths(case):
     tag, batch_size, topk, topk_len_values, extra_topk, extra_len_values = case
     del tag
     device = get_test_device()
@@ -884,9 +884,9 @@ def test_model1_metadata_dynamic_topk_lengths(case):
 
 @tilelang.testing.requires_musa_compute_version_ge(3, 1)
 @pytest.mark.parametrize(
-    "case", MODEL1_PREFILL_CASES, ids=[case[0] for case in MODEL1_PREFILL_CASES]
+    "case", V4_PREFILL_CASES, ids=[case[0] for case in V4_PREFILL_CASES]
 )
-def test_model1_sparse_mla_prefill(case):
+def test_v4_sparse_mla_prefill(case):
     (
         tag,
         seq_len,
@@ -963,9 +963,9 @@ def test_model1_sparse_mla_prefill(case):
 
 @tilelang.testing.requires_musa_compute_version_ge(3, 1)
 @pytest.mark.parametrize(
-    "case", MODEL1_DECODE_CASES, ids=[case[0] for case in MODEL1_DECODE_CASES]
+    "case", V4_DECODE_CASES, ids=[case[0] for case in V4_DECODE_CASES]
 )
-def test_model1_sparse_mla_decode(case):
+def test_v4_sparse_mla_decode(case):
     (
         tag,
         batch_size,
@@ -1045,9 +1045,9 @@ def test_model1_sparse_mla_decode(case):
                 extra_topk_length = torch.randint(
                     1, extra_topk + 1, (batch_size,), dtype=torch.int32, device=device
                 )
-        extra_k_cache = quantize_k_cache(extra_kv, FP8KVCacheLayout.MODEL1_FP8Sparse)
+        extra_k_cache = quantize_k_cache(extra_kv, FP8KVCacheLayout.V4_FP8Sparse)
         extra_kv_dequant = dequantize_k_cache(
-            extra_k_cache, FP8KVCacheLayout.MODEL1_FP8Sparse
+            extra_k_cache, FP8KVCacheLayout.V4_FP8Sparse
         ).view(-1, 1, 512)
 
     attn_sink = None
@@ -1057,8 +1057,8 @@ def test_model1_sparse_mla_decode(case):
         attn_sink[inf_mask > 0.5] = float("inf")
         attn_sink[inf_mask < -0.5] = float("-inf")
 
-    k_cache = quantize_k_cache(kv, FP8KVCacheLayout.MODEL1_FP8Sparse)
-    kv_dequant = dequantize_k_cache(k_cache, FP8KVCacheLayout.MODEL1_FP8Sparse).view(
+    k_cache = quantize_k_cache(kv, FP8KVCacheLayout.V4_FP8Sparse)
+    kv_dequant = dequantize_k_cache(k_cache, FP8KVCacheLayout.V4_FP8Sparse).view(
         -1, 1, 512
     )
 
@@ -1106,7 +1106,7 @@ def test_model1_sparse_mla_decode(case):
         is_fp8_kvcache=True,
         num_splits=num_splits,
     )
-    ref_out, ref_lse = _ref_sparse_mla_decode_model1(
+    ref_out, ref_lse = _ref_sparse_mla_decode_v4(
         q_flat,
         kv_dequant,
         indices_flat,
@@ -1127,7 +1127,7 @@ def test_model1_sparse_mla_decode(case):
     torch.testing.assert_close(tl_lse, ref_lse.to(device), rtol=1e-2, atol=1e-2)
 
 
-OFFICIAL_STYLE_MODEL1_DECODE_CASES = [
+OFFICIAL_STYLE_V4_DECODE_CASES = [
     # Mirrors the official tests/lib.py decode axes that matter for the wrapper:
     # S=1/S>1, irregular page sizes, extra KV, dynamic lengths, attn_sink, and
     # mixed zero-seqlen batches represented by precomputed sparse indices.
@@ -1184,7 +1184,7 @@ OFFICIAL_STYLE_MODEL1_DECODE_CASES = [
 ]
 
 
-MODEL1_DECODE_SCHEDULED_CASES = [
+V4_DECODE_SCHEDULED_CASES = [
     ("no_extra_split", 512, 128, 0, 0, False, False, False),
     ("extra_dynamic_sink", 512, 128, 256, 64, True, True, False),
     ("all_invalid", 512, 128, 256, 64, True, True, True),
@@ -1194,10 +1194,10 @@ MODEL1_DECODE_SCHEDULED_CASES = [
 @tilelang.testing.requires_musa_compute_version_ge(3, 1)
 @pytest.mark.parametrize(
     "case",
-    MODEL1_DECODE_SCHEDULED_CASES,
-    ids=[case[0] for case in MODEL1_DECODE_SCHEDULED_CASES],
+    V4_DECODE_SCHEDULED_CASES,
+    ids=[case[0] for case in V4_DECODE_SCHEDULED_CASES],
 )
-def test_model1_sparse_mla_decode_scheduled(case):
+def test_v4_sparse_mla_decode_scheduled(case):
     (
         tag,
         seq_len_kv,
@@ -1270,9 +1270,9 @@ def test_model1_sparse_mla_decode_scheduled(case):
                 dtype=torch.int32,
                 device=device,
             )
-        extra_k_cache = quantize_k_cache(extra_kv, FP8KVCacheLayout.MODEL1_FP8Sparse)
+        extra_k_cache = quantize_k_cache(extra_kv, FP8KVCacheLayout.V4_FP8Sparse)
         extra_kv_dequant = dequantize_k_cache(
-            extra_k_cache, FP8KVCacheLayout.MODEL1_FP8Sparse
+            extra_k_cache, FP8KVCacheLayout.V4_FP8Sparse
         ).view(-1, 1, 512)
 
     attn_sink = None
@@ -1281,8 +1281,8 @@ def test_model1_sparse_mla_decode_scheduled(case):
         attn_sink[::5] = float("inf")
         attn_sink[1::7] = float("-inf")
 
-    k_cache = quantize_k_cache(kv, FP8KVCacheLayout.MODEL1_FP8Sparse)
-    kv_dequant = dequantize_k_cache(k_cache, FP8KVCacheLayout.MODEL1_FP8Sparse).view(
+    k_cache = quantize_k_cache(kv, FP8KVCacheLayout.V4_FP8Sparse)
+    kv_dequant = dequantize_k_cache(k_cache, FP8KVCacheLayout.V4_FP8Sparse).view(
         -1, 1, 512
     )
 
@@ -1318,7 +1318,7 @@ def test_model1_sparse_mla_decode_scheduled(case):
         if extra_indices is not None
         else None
     )
-    ref_out, ref_lse = _ref_sparse_mla_decode_model1(
+    ref_out, ref_lse = _ref_sparse_mla_decode_v4(
         q_flat,
         kv_dequant,
         indices_flat,
@@ -1342,10 +1342,10 @@ def test_model1_sparse_mla_decode_scheduled(case):
 @tilelang.testing.requires_musa_compute_version_ge(3, 1)
 @pytest.mark.parametrize(
     "case",
-    OFFICIAL_STYLE_MODEL1_DECODE_CASES,
-    ids=[case[0] for case in OFFICIAL_STYLE_MODEL1_DECODE_CASES],
+    OFFICIAL_STYLE_V4_DECODE_CASES,
+    ids=[case[0] for case in OFFICIAL_STYLE_V4_DECODE_CASES],
 )
-def test_model1_sparse_mla_decode_official_style(case):
+def test_v4_sparse_mla_decode_official_style(case):
     (
         tag,
         batch_size,
@@ -1445,9 +1445,9 @@ def test_model1_sparse_mla_decode_official_style(case):
                 extra_topk_length.zero_()
             elif have_zero_seqlen_k:
                 extra_topk_length[0] = 0
-        extra_k_cache = quantize_k_cache(extra_kv, FP8KVCacheLayout.MODEL1_FP8Sparse)
+        extra_k_cache = quantize_k_cache(extra_kv, FP8KVCacheLayout.V4_FP8Sparse)
         extra_kv_dequant = dequantize_k_cache(
-            extra_k_cache, FP8KVCacheLayout.MODEL1_FP8Sparse
+            extra_k_cache, FP8KVCacheLayout.V4_FP8Sparse
         ).view(-1, 1, 512)
 
     attn_sink = None
@@ -1457,8 +1457,8 @@ def test_model1_sparse_mla_decode_official_style(case):
         attn_sink[inf_mask > 0.5] = float("inf")
         attn_sink[inf_mask < -0.5] = float("-inf")
 
-    k_cache = quantize_k_cache(kv, FP8KVCacheLayout.MODEL1_FP8Sparse)
-    kv_dequant = dequantize_k_cache(k_cache, FP8KVCacheLayout.MODEL1_FP8Sparse).view(
+    k_cache = quantize_k_cache(kv, FP8KVCacheLayout.V4_FP8Sparse)
+    kv_dequant = dequantize_k_cache(k_cache, FP8KVCacheLayout.V4_FP8Sparse).view(
         -1, 1, 512
     )
 
@@ -1494,7 +1494,7 @@ def test_model1_sparse_mla_decode_official_style(case):
         num_splits=num_splits,
     )
 
-    ref_out, ref_lse = _ref_sparse_mla_decode_model1(
+    ref_out, ref_lse = _ref_sparse_mla_decode_v4(
         q.view(total_q, num_heads, 512),
         kv_dequant,
         indices.view(total_q, 1, topk),
@@ -1518,7 +1518,7 @@ def test_model1_sparse_mla_decode_official_style(case):
 
 
 @tilelang.testing.requires_musa_compute_version_ge(3, 1)
-def test_model1_sparse_mla_decode_sched_meta_reuse_official_style():
+def test_v4_sparse_mla_decode_sched_meta_reuse_official_style():
     device = get_test_device()
     torch.manual_seed(20260508)
     batch_size, seq_len_q = 2, 1
@@ -1536,13 +1536,13 @@ def test_model1_sparse_mla_decode_sched_meta_reuse_official_style():
         dtype=torch.bfloat16,
         device=device,
     )
-    k_cache = quantize_k_cache(kv, FP8KVCacheLayout.MODEL1_FP8Sparse)
-    extra_k_cache = quantize_k_cache(extra_kv, FP8KVCacheLayout.MODEL1_FP8Sparse)
-    kv_dequant = dequantize_k_cache(k_cache, FP8KVCacheLayout.MODEL1_FP8Sparse).view(
+    k_cache = quantize_k_cache(kv, FP8KVCacheLayout.V4_FP8Sparse)
+    extra_k_cache = quantize_k_cache(extra_kv, FP8KVCacheLayout.V4_FP8Sparse)
+    kv_dequant = dequantize_k_cache(k_cache, FP8KVCacheLayout.V4_FP8Sparse).view(
         -1, 1, d_qk
     )
     extra_kv_dequant = dequantize_k_cache(
-        extra_k_cache, FP8KVCacheLayout.MODEL1_FP8Sparse
+        extra_k_cache, FP8KVCacheLayout.V4_FP8Sparse
     ).view(-1, 1, d_qk)
 
     def make_decode_inputs(seed):
@@ -1617,7 +1617,7 @@ def test_model1_sparse_mla_decode_sched_meta_reuse_official_style():
     torch.musa.synchronize()
 
     total_q = batch_size * seq_len_q
-    ref_out, ref_lse = _ref_sparse_mla_decode_model1(
+    ref_out, ref_lse = _ref_sparse_mla_decode_v4(
         q2.view(total_q, num_heads, d_qk),
         kv_dequant,
         indices2.view(total_q, 1, topk),

@@ -26,4 +26,14 @@ enum class FwdNamedBarriers {
   NumFwdNamedBarriers = 6
 };
 
+// MP31 uses a pipeline for KV storage reuse instead of a named barrier.
+enum class Mp31FwdNamedBarriers {
+  PipelineWrapPhase0  = 0,
+  PipelineWrapPhase1  = 1,
+  ReuseP              = 2,
+  AppendKV            = 3,
+  RotaryQ             = 4,
+  NumFwdNamedBarriers = 5
+};
+
 }  // namespace mate::attention::fmha

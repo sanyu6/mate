@@ -1,0 +1,303 @@
+#include <musa_runtime.h>
+
+#include <cstdint>
+#include <type_traits>
+
+#include "mate/gemm/deep_gemm/mp32_paged_mqa_logits_blockscale.hpp"
+{% if clean_logits %}
+#include "mate/gemm/deep_gemm/mpxx_clean_logits.hpp"
+{% endif %}
+#include "mutlass/device_kernel.h"
+#include "op_utils.hpp"
+
+using namespace mute;
+
+{% if clean_logits %}
+namespace {
+
+template <uint32_t kNextN>
+void clean_paged_mqa_logits_blockscale(
+  ffi::TensorView logits,
+  ffi::TensorView seqlens_kv,
+  int64_t         total_q,
+  int64_t         max_seqlen_kv,
+  uint64_t        stride_logits
+) {
+  constexpr int kBlockKV  = 8192;
+  constexpr int kNumWarps = 8;
+  constexpr int kSmemSize = kBlockKV * sizeof({{ out_element_literal }});
+
+  musaDeviceProp dprops{};
+  MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&dprops, logits.device().device_id));
+  const int num_mps = dprops.multiProcessorCount;
+  TVM_FFI_ICHECK(num_mps > 0) << "No available MUSA MPs";
+
+  musaStream_t stream = get_stream(logits.device());
+  mate::deep_gemm::mpxx_clean_logits<kNextN, kBlockKV, kNumWarps, {{ out_element_literal }}>
+      <<<num_mps, kNumWarps * 32, kSmemSize, stream>>>(
+          static_cast<uint32_t>(total_q),
+          static_cast<uint32_t>(max_seqlen_kv),
+          stride_logits,
+          nullptr,
+          static_cast<uint32_t const*>(seqlens_kv.data_ptr()),
+          static_cast<{{ out_element_literal }}*>(logits.data_ptr()));
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}
+
+}  // namespace
+{% endif %}
+
+void {{ func_name }}(
+  ffi::TensorView q,
+  ffi::TensorView scale_q,
+  ffi::TensorView kv_cache_with_scale,
+  ffi::TensorView weights,
+  ffi::TensorView seqlens_kv,
+  ffi::TensorView page_table,
+  ffi::TensorView metadata,
+  ffi::Optional<ffi::TensorView> indices,
+  ffi::TensorView out
+) {
+  CHECK_INPUT(q);
+  CHECK_MUSA(scale_q);
+  CHECK_INPUT(kv_cache_with_scale);
+  CHECK_INPUT(weights);
+  CHECK_INPUT(seqlens_kv);
+  CHECK_INPUT(page_table);
+  CHECK_INPUT(metadata);
+  CHECK_MUSA(out);
+  CHECK_DIM(4, q);
+  CHECK_DIM(4, scale_q);
+  CHECK_DIM(4, kv_cache_with_scale);
+  CHECK_DIM(2, weights);
+  CHECK_DIM(2, page_table);
+  CHECK_DIM(2, metadata);
+  CHECK_DIM(2, out);
+  CHECK_INPUT_TYPE(q, {{ qkv_input_dtype }});
+  CHECK_INPUT_TYPE(scale_q, dl_uint8);
+  CHECK_INPUT_TYPE(kv_cache_with_scale, dl_uint8);
+  CHECK_INPUT_TYPE(weights, {{ weights_input_dtype }});
+  CHECK_INPUT_TYPE(seqlens_kv, dl_int32);
+  CHECK_INPUT_TYPE(page_table, dl_int32);
+  CHECK_INPUT_TYPE(metadata, dl_int32);
+  CHECK_INPUT_TYPE(out, {{ out_input_dtype }});
+  CHECK_DEVICE(scale_q, q);
+  CHECK_DEVICE(kv_cache_with_scale, q);
+  CHECK_DEVICE(weights, q);
+  CHECK_DEVICE(seqlens_kv, q);
+  CHECK_DEVICE(page_table, q);
+  CHECK_DEVICE(metadata, q);
+  CHECK_DEVICE(out, q);
+
+  constexpr int  kNumHeads        = {{ num_heads }};
+  constexpr int  kHeadDim         = {{ headdim }};
+  constexpr int  kPageSize        = {{ page_size }};
+  constexpr int  kTileKV          = {{ tile_kv }};
+  constexpr int  kTileQH          = {{ tile_qh }};
+  constexpr int  kNextN           = {{ next_n }};
+  constexpr bool kContextLens2D    = {{ is_context_lens_2d_literal }};
+  constexpr bool kIsVarlen         = {{ is_varlen_literal }};
+  constexpr int  kStagesQ          = {{ stages_q }};
+  constexpr int  kStagesKV         = {{ stages_kv }};
+  constexpr int  kQKVPackFactor    = {{ qkv_pack_factor }};
+  constexpr int  kScaleVectorSize  = 32;
+  constexpr int  kScaleStorageBytes = 4;
+  constexpr bool kIsKVScaleMajorM   = {{ is_kv_scale_m_major_literal }};
+
+  static_assert(!kIsVarlen || kNextN == 1, "varlen paged MQA logits requires next_n=1");
+  if constexpr (kIsVarlen) {
+    TVM_FFI_ICHECK(indices.has_value()) << "varlen paged MQA logits requires indices";
+  }
+
+  TVM_FFI_ICHECK(seqlens_kv.dim() == (kContextLens2D ? 2 : 1))
+      << "Unexpected seqlens_kv rank for this JIT kernel";
+
+  const int64_t batch_size   = q.size(0);
+  const int64_t next_n       = q.size(1);
+  const int64_t num_heads    = q.size(2);
+  const int64_t physical_headdim = q.size(3);
+  const int64_t total_q      = batch_size * next_n;
+  const int64_t total_qh     = total_q * num_heads;
+  const int64_t num_blocks   = kv_cache_with_scale.size(0);
+  const int64_t page_size    = kv_cache_with_scale.size(1);
+  const int64_t num_kv_heads = kv_cache_with_scale.size(2);
+  const int64_t fused_headdim = kv_cache_with_scale.size(3);
+  const int64_t kv_cache_stride = kv_cache_with_scale.stride(0);
+  const int64_t max_pages    = page_table.size(1);
+  const int64_t num_mps      = metadata.size(0) - 1;
+  const int64_t page_table_num_elements = (batch_size - 1) * page_table.stride(0) + max_pages;
+
+  TVM_FFI_ICHECK(next_n == kNextN) << "Unexpected next_n for this JIT kernel";
+  TVM_FFI_ICHECK(num_heads == kNumHeads) << "Unexpected num_heads for this JIT kernel";
+  TVM_FFI_ICHECK(physical_headdim * kQKVPackFactor == kHeadDim)
+      << "Unexpected packed headdim for this JIT kernel";
+  TVM_FFI_ICHECK(page_size == kPageSize) << "Unexpected page_size for this JIT kernel";
+  TVM_FFI_ICHECK(num_kv_heads == 1 && fused_headdim == physical_headdim + 4)
+      << "kv_cache_with_scale must have shape [num_blocks, page_size, 1, packed_headdim + 4]";
+  TVM_FFI_ICHECK(kHeadDim % kScaleVectorSize == 0) << "headdim must be divisible by 32";
+  TVM_FFI_ICHECK(num_blocks > 0 && max_pages > 0) << "KV cache and page table must be non-empty";
+  TVM_FFI_ICHECK(num_mps > 0 && metadata.size(1) == 2)
+      << "metadata shape must be [num_mps + 1, 2]";
+  TVM_FFI_ICHECK(page_table.size(0) == batch_size)
+      << "page_table.shape[0] must match batch_size";
+  TVM_FFI_ICHECK(weights.size(0) == total_q && weights.size(1) == num_heads)
+      << "weights shape must be [batch_size * next_n, num_heads]";
+  TVM_FFI_ICHECK(out.size(0) == total_q && out.size(1) > 0)
+      << "out shape must be [batch_size * next_n, max_context_len]";
+  TVM_FFI_ICHECK(out.stride(1) == 1 && out.stride(0) >= out.size(1))
+      << "out must be contiguous at the last dimension with a valid row stride";
+  TVM_FFI_ICHECK(q.stride(3) == 1 && q.stride(2) == physical_headdim &&
+                     q.stride(1) == num_heads * physical_headdim &&
+                     q.stride(0) == next_n * num_heads * physical_headdim)
+      << "q must be contiguous [batch_size, next_n, num_heads, packed_headdim]";
+  TVM_FFI_ICHECK(scale_q.size(0) == batch_size && scale_q.size(1) == next_n &&
+                     scale_q.size(2) == num_heads && scale_q.size(3) == kScaleStorageBytes)
+      << "scale_q must have shape [batch_size, next_n, num_heads, 4]";
+  const bool is_q_scale_m_major = scale_q.stride(2) == 1;
+  if (is_q_scale_m_major) {
+    TVM_FFI_ICHECK(scale_q.stride(0) == next_n * num_heads && scale_q.stride(1) == num_heads &&
+                       scale_q.stride(3) == total_qh)
+        << "M-major scale_q has invalid strides";
+  } else {
+    TVM_FFI_ICHECK(scale_q.stride(3) == 1 && scale_q.stride(2) == kScaleStorageBytes &&
+                       scale_q.stride(1) == num_heads * kScaleStorageBytes &&
+                       scale_q.stride(0) == next_n * num_heads * kScaleStorageBytes)
+        << "K-major scale_q has invalid strides";
+  }
+  TVM_FFI_ICHECK(kv_cache_with_scale.stride(1) == fused_headdim &&
+                     kv_cache_with_scale.stride(3) == 1)
+      << "kv_cache_with_scale must be contiguous within each block";
+  TVM_FFI_ICHECK(kv_cache_stride % sizeof(uint32_t) == 0)
+      << "kv_cache_with_scale block stride must be uint32-aligned";
+
+  if constexpr (kContextLens2D) {
+    TVM_FFI_ICHECK(seqlens_kv.size(0) == batch_size && seqlens_kv.size(1) == next_n)
+        << "2D seqlens_kv shape must be [batch_size, next_n]";
+  } else {
+    TVM_FFI_ICHECK(seqlens_kv.size(0) == batch_size)
+        << "1D seqlens_kv shape must be [batch_size]";
+  }
+
+  ffi::MUSADeviceGuard device_guard(q.device().device_id);
+  musaStream_t         stream = get_stream(q.device());
+
+  // Flatten contiguous [batch, next_n, heads, headdim] Q into [total_q * heads, headdim].
+  auto stride_q      = make_stride(q.stride(2) * kQKVPackFactor, _1{});
+  auto stride_kv     = make_stride(kHeadDim, _1{}, kv_cache_stride * kQKVPackFactor);
+  auto stride_w      = make_stride(_1{}, total_q * num_heads);
+  auto stride_logits = make_stride(out.stride(0), _1{});
+  uint32_t const* indices_ptr = nullptr;
+  if constexpr (kIsVarlen) {
+    auto indices_tensor = indices.value();
+    CHECK_INPUT(indices_tensor);
+    CHECK_DIM(1, indices_tensor);
+    CHECK_INPUT_TYPE(indices_tensor, dl_int32);
+    CHECK_DEVICE(indices_tensor, q);
+    TVM_FFI_ICHECK(indices_tensor.size(0) == total_q)
+        << "indices.shape[0] must match the total number of Q tokens";
+    indices_ptr = static_cast<uint32_t const*>(indices_tensor.data_ptr());
+  }
+
+  auto launch = [&](auto q_scale_major) {
+    constexpr bool kIsQScaleMajorM = decltype(q_scale_major)::value;
+    auto stride_sfq = [&]() {
+      if constexpr (kIsQScaleMajorM) {
+        return make_stride(_1{}, total_qh);
+      } else {
+        return make_stride(Int<kScaleStorageBytes>{}, _1{});
+      }
+    }();
+    auto stride_sfkv = [&]() {
+      if constexpr (kIsKVScaleMajorM) {
+        return make_stride(_1{}, Int<kPageSize>{}, kv_cache_stride);
+      } else {
+        return make_stride(Int<kScaleStorageBytes>{}, _1{}, kv_cache_stride);
+      }
+    }();
+
+    using Element = {{ qkv_element_type }};
+    auto* fused_kv_base = static_cast<uint8_t*>(kv_cache_with_scale.data_ptr());
+    auto* kv_ptr = reinterpret_cast<Element const*>(fused_kv_base);
+    auto* scale_kv_ptr = reinterpret_cast<mutlass::float_ue8m0_t const*>(
+        fused_kv_base + kPageSize * physical_headdim);
+    using Kernel = mate::deep_gemm::MP32PagedMQALogitsBlockScale<Element,
+                                                                 {{ element_w_literal }},
+                                                                 {{ out_element_literal }},
+                                                                 kNextN,
+                                                                 kNumHeads,
+                                                                 kHeadDim,
+                                                                 kTileQH,
+                                                                 kPageSize,
+                                                                 kTileKV,
+                                                                 kContextLens2D,
+                                                                 kIsVarlen,
+                                                                 decltype(stride_q),
+                                                                 decltype(stride_kv),
+                                                                 decltype(stride_sfq),
+                                                                 decltype(stride_sfkv),
+                                                                 decltype(stride_w),
+                                                                 uint32_t,
+                                                                 decltype(stride_logits),
+                                                                 kStagesQ,
+                                                                 kStagesKV,
+                                                                  kScaleStorageBytes,
+                                                                 kIsQScaleMajorM,
+                                                                 kIsKVScaleMajorM>;
+
+    typename Kernel::Arguments arguments{
+        .total_num_token_q = static_cast<uint32_t>(total_q),
+        .total_qh          = static_cast<uint32_t>(total_qh),
+        .num_kv_blocks     = static_cast<uint32_t>(num_blocks),
+        .ptr_q             = static_cast<Element const*>(q.data_ptr()),
+        .stride_q          = stride_q,
+        .ptr_kv            = kv_ptr,
+        .stride_kv         = stride_kv,
+        .ptr_sfq           = static_cast<mutlass::float_ue8m0_t const*>(scale_q.data_ptr()),
+        .stride_sfq        = stride_sfq,
+        .ptr_sfkv          = scale_kv_ptr,
+        .stride_sfkv       = stride_sfkv,
+        .ptr_weights       = static_cast<{{ element_w_literal }} const*>(weights.data_ptr()),
+        .stride_weights    = stride_w,
+        .context_lens      = static_cast<uint32_t const*>(seqlens_kv.data_ptr()),
+        .metadata          = static_cast<uint32_t const*>(metadata.data_ptr()),
+        .indices           = indices_ptr,
+        .page_table        = static_cast<uint32_t const*>(page_table.data_ptr()),
+        .stride_page_table = static_cast<uint32_t>(page_table.stride(0)),
+        .page_table_num_elements = static_cast<uint64_t>(page_table_num_elements),
+        .ptr_logits        = static_cast<{{ out_element_literal }}*>(out.data_ptr()),
+        .stride_logits     = stride_logits,
+        .max_seqlen_kv     = static_cast<uint32_t>(out.size(1)),
+    };
+
+    auto params = Kernel::to_underlying_arguments(arguments);
+    mutlass::device_kernel<Kernel>
+        <<<static_cast<uint32_t>(num_mps), Kernel::MaxThreadsPerBlock,
+           Kernel::SharedStorageSize, stream>>>(params);
+    MATE_CHECK_MUSA_KERNEL_LAUNCH();
+  };
+
+  if (is_q_scale_m_major) {
+    launch(std::true_type{});
+  } else {
+    launch(std::false_type{});
+  }
+
+{% if clean_logits %}
+  if constexpr (kContextLens2D) {
+    ffi::Shape      seqlens_kv_flat_shape{total_q};
+    ffi::Shape      seqlens_kv_flat_strides{1};
+    ffi::TensorView seqlens_kv_flat = seqlens_kv.as_strided(seqlens_kv_flat_shape, seqlens_kv_flat_strides);
+    clean_paged_mqa_logits_blockscale<1>(out,
+                                          seqlens_kv_flat,
+                                          total_q,
+                                          out.size(1),
+                                          static_cast<uint64_t>(out.stride(0)));
+  } else {
+    clean_paged_mqa_logits_blockscale<kNextN>(out,
+                                               seqlens_kv,
+                                               total_q,
+                                               out.size(1),
+                                               static_cast<uint64_t>(out.stride(0)));
+  }
+{% endif %}
+}

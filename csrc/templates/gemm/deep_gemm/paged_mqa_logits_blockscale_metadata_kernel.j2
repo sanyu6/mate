@@ -1,0 +1,80 @@
+#include <musa_runtime.h>
+
+#include <cstddef>
+#include <cstdint>
+
+#include "mate/gemm/deep_gemm/mp32_paged_mqa_logits_blockscale_metadata.hpp"
+#include "op_utils.hpp"
+
+void get_paged_mqa_logits_blockscale_metadata(ffi::TensorView                context_lens,
+                                              ffi::Optional<ffi::TensorView> indices,
+                                              ffi::TensorView                metadata) {
+  CHECK_MUSA(context_lens);
+  CHECK_MUSA(metadata);
+  CHECK_CONTIGUOUS(context_lens);
+  CHECK_CONTIGUOUS(metadata);
+  CHECK_INPUT_TYPE(context_lens, dl_int32);
+  CHECK_INPUT_TYPE(metadata, dl_int32);
+  CHECK_DEVICE(metadata, context_lens);
+
+  constexpr uint32_t kNextN           = {{ next_n }};
+  constexpr bool     kIsContextLens2D = {{ is_context_lens_2d_literal }};
+  constexpr bool     kIsVarlen        = {{ is_varlen_literal }};
+  constexpr uint32_t kTileKV          = {{ tile_kv }};
+  constexpr uint32_t kNumMPs          = {{ num_mps }};
+
+  static_assert(kNextN >= 1, "paged MQA logits next_n must be positive");
+  static_assert(kTileKV > 0, "paged MQA logits tile_kv must be positive");
+  static_assert(!kIsVarlen || kNextN == 1, "varlen paged MQA logits requires next_n=1");
+  if constexpr (kIsVarlen) {
+    TVM_FFI_ICHECK(indices.has_value()) << "varlen paged MQA logits requires indices";
+  }
+
+  TVM_FFI_ICHECK(context_lens.dim() == (kIsContextLens2D ? 2 : 1))
+      << "context_lens rank does not match this JIT kernel";
+  if constexpr (kIsContextLens2D) {
+    TVM_FFI_ICHECK(context_lens.size(1) == kNextN) << "context_lens.shape[1] must match next_n";
+  }
+
+  CHECK_DIM(2, metadata);
+  TVM_FFI_ICHECK(metadata.size(0) == kNumMPs + 1 && metadata.size(1) == 2)
+      << "metadata shape must be [num_mps + 1, 2]";
+  TVM_FFI_ICHECK(context_lens.size(0) > 0) << "context_lens must contain at least one request";
+
+  uint32_t const num_requests     = static_cast<uint32_t>(context_lens.size(0));
+  auto const*    context_lens_ptr = static_cast<uint32_t const*>(context_lens.data_ptr());
+  auto*          metadata_ptr     = static_cast<uint32_t*>(metadata.data_ptr());
+
+  ffi::MUSADeviceGuard device_guard(context_lens.device().device_id);
+  musaStream_t         stream = get_stream(context_lens.device());
+
+  constexpr uint32_t kNumThreads = 1024;
+  constexpr uint32_t kNumWarps   = kNumThreads / mutlass::NumThreadsPerWarp;
+
+  if constexpr (kIsVarlen) {
+    auto indices_tensor = indices.value();
+    CHECK_INPUT(indices_tensor);
+    CHECK_DIM(1, indices_tensor);
+    CHECK_INPUT_TYPE(indices_tensor, dl_int32);
+    CHECK_DEVICE(indices_tensor, context_lens);
+    TVM_FFI_ICHECK(indices_tensor.size(0) == context_lens.size(0))
+        << "indices.shape[0] must match context_lens.shape[0]";
+    auto const* indices_ptr = static_cast<uint32_t const*>(indices_tensor.data_ptr());
+
+    size_t const smem_size = size_t(2 * num_requests + kNumWarps + 1) * sizeof(uint32_t);
+    auto kernel = mate::deep_gemm::mp32_varlen_paged_mqa_logits_blockscale_metadata<kTileKV, kNumMPs>;
+    MATE_MUSA_RUNTIME_CHECK(
+        musaFuncSetAttribute(kernel, musaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size)));
+    kernel<<<1, kNumThreads, smem_size, stream>>>(
+        num_requests, num_requests, context_lens_ptr, indices_ptr, metadata_ptr);
+    MATE_CHECK_MUSA_KERNEL_LAUNCH();
+  } else {
+    size_t const smem_size = size_t(num_requests + kNumWarps) * sizeof(uint32_t);
+    auto kernel = mate::deep_gemm::mp32_paged_mqa_logits_blockscale_metadata<kNextN, kTileKV, kNumMPs,
+                                                                             kIsContextLens2D>;
+    MATE_MUSA_RUNTIME_CHECK(
+        musaFuncSetAttribute(kernel, musaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size)));
+    kernel<<<1, kNumThreads, smem_size, stream>>>(num_requests, context_lens_ptr, metadata_ptr);
+    MATE_CHECK_MUSA_KERNEL_LAUNCH();
+  }
+}

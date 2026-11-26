@@ -435,6 +435,7 @@ struct VarlenFlashAttentionParams {
                            &params.tile_v_dim1,
                            &params.tile_v_dim2};
   MATE_MUSA_DRIVER_CHECK(muLaunchKernelEx(&launch_config, asm_func, kernel_params, nullptr));
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
 {% endmacro %}
 
 {# Build and launch a non-varlen kernel. #}
@@ -613,6 +614,7 @@ struct VarlenFlashAttentionParams {
                            &params.tile_out_dim2,
                            &params.tile_out_dim3};
   MATE_MUSA_DRIVER_CHECK(muLaunchKernelEx(&launch_config, asm_func, kernel_params, nullptr));
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
   };
   launch_dense(dense_q, dense_k, dense_v, dense_out, dense_out_lse);
 {% endmacro %}
@@ -694,7 +696,6 @@ void run_{{ func_name }}(const std::string&                 object_path,
 {% else %}
 {{ emit_non_varlen_launch() }}
 {% endif %}
-  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_{{ func_name }}, run_{{ func_name }});

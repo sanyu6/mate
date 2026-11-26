@@ -5,212 +5,14 @@ import random
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 import mate
 from mate.testing import supported_musa_compute_capability
+from mate.testing.operators.gdn import decode_delta_rule
 
 
 # Keep the reference path numerically aligned with gdn_unified_tilelang testing.
 pytestmark = pytest.mark.usefixtures("disable_mudnn_tf32")
-
-
-@torch.inference_mode
-def decode_delta_rule(
-    q: torch.Tensor,  # [B, num_q_heads, K]
-    k: torch.Tensor,  # [B, num_k_heads, K]
-    v: torch.Tensor,  # [B, num_v_heads, V]
-    state: torch.Tensor,  # [B, num_heads, K, V]
-    A_log: torch.Tensor,  # [num_heads] - log decay parameter
-    a: torch.Tensor,  # [B, num_heads] - input-dependent decay
-    dt_bias: torch.Tensor,  # [num_heads] - decay bias
-    b: torch.Tensor,  # [B, num_heads] - update gate input
-    scale_factor: float = 1.0,
-    softplus_beta: float = 1.0,
-    softplus_threshold: float = 20.0,
-    use_l2_norm: bool = True,
-    state_dtype: torch.dtype = torch.float32,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Reference implementation for single-step decode with GDN formula.
-
-    Strictly follows the Triton kernel logic from fused_sigmoid_gating_recurrent.py:
-        1. Compute g = -exp(A_log) * softplus(a + dt_bias)
-        2. Compute beta = sigmoid(b)
-        3. Apply L2 norm to q and k (if enabled)
-        4. h *= exp(g)                    # Apply decay to state
-        5. v_new = v - k^T @ h            # Delta rule (h is [K,V], k is [K])
-        6. v_new *= beta                  # Apply update gate
-        7. h += k @ v_new^T               # Update state (outer product)
-        8. o = q^T @ h                    # Compute output (h is [K,V], q is [K])
-
-    Args:
-        q: Query [B, num_q_heads, K]
-        k: Key [B, num_k_heads, K]
-        v: Value [B, num_v_heads, V]
-        state: Input state [B, num_heads, K, V], where num_heads = num_v_heads
-        A_log: Log decay parameter [num_heads]
-        a: Input-dependent decay [B, num_heads]
-        dt_bias: Decay bias [num_heads]
-        b: Update gate input [B, num_heads]
-        scale_factor: Scale factor for q
-        softplus_beta: Beta parameter for softplus activation
-        softplus_threshold: Threshold for softplus numerical stability
-        use_l2_norm: Whether to apply L2 normalization to q and k
-        state_dtype: Storage dtype for the hidden state (read in fp32, stored in this dtype)
-
-    Returns:
-        output: [B, num_heads, V]
-        new_state: [B, num_heads, K, V]
-    """
-    B = q.size(0)
-    num_q_heads = q.size(1)
-    num_k_heads = k.size(1)
-    num_v_heads = v.size(1)
-    K = q.size(2)
-    V = v.size(2)
-
-    # State and output are always based on num_v_heads (matches kernel's HV dimension)
-    num_heads = num_v_heads
-
-    device = q.device
-    dtype = torch.float32
-
-    # Convert to float32 for computation
-    A_log = A_log.to(dtype).to(device)
-    a = a.to(dtype).to(device)
-    dt_bias = dt_bias.to(dtype).to(device)
-    b = b.to(dtype).to(device)
-
-    # ============================================
-    # Compute gating values (following Triton kernel exactly)
-    # ============================================
-
-    # Step 1: Compute g = -exp(A_log) * softplus(a + dt_bias)
-    # Triton kernel lines 100-109
-    x = a + dt_bias  # [B, num_heads]
-    beta_x = softplus_beta * x
-
-    # Apply softplus with numerical stability
-    # softplus(x) = (1/beta) * log(1 + exp(beta*x)) if beta*x <= threshold, else x
-    softplus_x = torch.where(
-        beta_x <= softplus_threshold,
-        (1.0 / softplus_beta) * torch.log(1.0 + torch.exp(beta_x)),
-        x,
-    )
-
-    # Compute g (log-space decay gate)
-    # Triton kernel line 109: b_g = -tl.exp(b_A_log) * softplus_x
-    g = -torch.exp(A_log) * softplus_x  # [B, num_heads]
-
-    # Step 2: Compute beta = sigmoid(b)
-    # Triton kernel line 112: b_beta = 1.0 / (1.0 + tl.exp(-b_b))
-    beta = 1.0 / (1.0 + torch.exp(-b))  # [B, num_heads]
-
-    # Expand heads if needed (for GQA/GVA)
-    # The reference works at v_heads level
-    # For GQA (num_q_heads > num_v_heads): k and q need to be averaged/pooled per v_head
-    # For GVA (num_v_heads > num_q_heads): q and k need to be repeated
-    if num_k_heads < num_v_heads:
-        k = k.repeat_interleave(num_v_heads // num_k_heads, dim=1)
-    if num_q_heads < num_v_heads:
-        q = q.repeat_interleave(num_v_heads // num_q_heads, dim=1)
-    elif num_q_heads > num_v_heads:
-        # GQA: multiple q_heads per v_head, reshape and average
-        # [B, num_q_heads, K] -> [B, num_v_heads, num_q_heads//num_v_heads, K]
-        q = q.reshape(B, num_v_heads, num_q_heads // num_v_heads, K).mean(dim=2)
-        if num_k_heads == num_q_heads:
-            k = k.reshape(B, num_v_heads, num_k_heads // num_v_heads, K).mean(dim=2)
-
-    q = q.to(dtype)
-    k = k.to(dtype)
-    v = v.to(dtype)
-    state = state.to(dtype)
-
-    # Apply L2 normalization if requested
-    if use_l2_norm:
-        q = F.normalize(q, p=2.0, dim=-1)
-        k = F.normalize(k, p=2.0, dim=-1)
-
-    # Apply scale to q
-    q = q * scale_factor
-
-    # ============================================
-    # Process each batch and head
-    # ============================================
-    new_state = torch.zeros(B, num_heads, K, V, device=device, dtype=state_dtype)
-    output = torch.zeros(B, num_heads, V, device=device, dtype=dtype)
-
-    for b_idx in range(B):
-        for h_idx in range(num_heads):
-            # Get current vectors
-            q_h = q[b_idx, h_idx]  # [K]
-            k_h = k[b_idx, h_idx]  # [K]
-            v_h = v[b_idx, h_idx]  # [V]
-            h_state = (
-                state[b_idx, h_idx].clone().to(torch.float32)
-            )  # [K, V] read as fp32
-
-            # Get gating values for this batch and head
-            g_val = g[b_idx, h_idx]  # scalar
-            beta_val = beta[b_idx, h_idx]  # scalar
-
-            # ============================================
-            # Recurrent update (following Triton kernel lines 121-134)
-            # ============================================
-
-            # Step 1: Apply gating to hidden state: h *= exp(g)
-            # Triton kernel line 122: b_h *= tl.exp(b_g)
-            h_state = h_state * torch.exp(g_val)
-
-            # Step 2: Delta rule: v -= sum(h * k, dim=0)
-            # Triton kernel line 125: b_v -= tl.sum(b_h * b_k[:, None], 0)
-            # Triton: b_h is [BK, BV], b_k is [BK]
-            # b_k[:, None] makes it [BK, 1]
-            # b_h * b_k[:, None] gives [BK, BV] (element-wise per row)
-            # tl.sum(..., 0) sums over BK dimension -> [BV]
-            #
-            # Equivalent to: k^T @ h where h is [K, V]
-            # [K] @ [K, V] = [V]
-            # Match the kernel's explicit FP32 reduction for k * state rather
-            # than dispatching a backend GEMV with an implementation-defined
-            # reduction order.
-            v_new = v_h - torch.sum(h_state * k_h[:, None], dim=0)
-
-            # Step 3: Apply beta gating: v *= beta
-            # Triton kernel line 128: b_v *= b_beta
-            v_new = v_new * beta_val
-
-            # Step 4: Update hidden state: h += k[:, None] * v[None, :]
-            # Triton kernel line 131: b_h += b_k[:, None] * b_v[None, :]
-            # Triton: [BK, BV] += [BK, 1] * [1, BV]
-            # This is outer product: k @ v^T
-            # [K, V] += [K, 1] @ [1, V]
-            # Keep the reference as element-wise FP32 arithmetic.  Expressing
-            # this outer product with ``@`` dispatches to MUBLAS, whose TF32
-            # override changes the reference values.
-            h_state = h_state + k_h[:, None] * v_new[None, :]
-
-            # Step 5: Compute output: o = sum(h * q, dim=0)
-            # Triton kernel line 134: b_o = tl.sum(b_h * b_q[:, None], 0)
-            # Triton: b_h is [BK, BV], b_q is [BK]
-            # b_q[:, None] makes it [BK, 1]
-            # b_h * b_q[:, None] gives [BK, BV] (element-wise per row)
-            # tl.sum(..., 0) sums over BK dimension -> [BV]
-            #
-            # Equivalent to: q^T @ h where h is [K, V]
-            # [K] @ [K, V] = [V]
-            # Keep the reference reduction explicit instead of dispatching a
-            # MUSA GEMV.  The kernel accumulates q * state in a fixed FP32
-            # warp-reduction order; using ``q_h @ h_state`` can select a
-            # backend reduction with a different order near low-precision
-            # output rounding boundaries.
-            output[b_idx, h_idx] = torch.sum(h_state * q_h[:, None], dim=0)
-
-            # Store updated state (cast back to state_dtype)
-            new_state[b_idx, h_idx] = h_state.to(state_dtype)
-
-    return output, new_state
 
 
 def _get_default_seed() -> int:
@@ -347,8 +149,10 @@ def _assert_decode_matches_reference(
     use_qk_l2norm: bool,
     output: torch.Tensor | None = None,
     output_rtol: float | None = None,
+    state_dtype: torch.dtype = torch.float32,
 ) -> None:
-    state = input_state_ref.transpose(-2, -1).contiguous()
+    input_state_storage = input_state_ref.to(state_dtype)
+    state = input_state_storage.transpose(-2, -1).contiguous()
     state_ptr = state.data_ptr()
     out, returned_state = mate.gated_delta_rule_decode(
         q=q,
@@ -375,7 +179,7 @@ def _assert_decode_matches_reference(
         q.squeeze(1).float(),
         k.squeeze(1).float(),
         v.squeeze(1).float(),
-        input_state_ref,
+        input_state_storage,
         A_log=A_log.float(),
         a=a.squeeze(1).float(),
         dt_bias=dt_bias.float(),
@@ -384,23 +188,29 @@ def _assert_decode_matches_reference(
         softplus_beta=1.0,
         softplus_threshold=20.0,
         use_l2_norm=use_qk_l2norm,
+        state_dtype=state_dtype,
     )
     ref_o = ref_o.to(q.dtype)
     ref_state = ref_state.transpose(-2, -1).contiguous()
 
     default_atol = 1e-3 if q.dtype == torch.float16 else 5e-3
     default_rtol = 1e-3 if q.dtype == torch.float16 else 5e-3
+    output_atol = 1e-2 if state_dtype == torch.bfloat16 else default_atol
+    state_atol = 2e-2 if state_dtype == torch.bfloat16 else default_atol
+    state_rtol = 1e-2 if state_dtype == torch.bfloat16 else default_rtol
     torch.testing.assert_close(
         out.squeeze(1),
         ref_o,
-        atol=default_atol,
-        rtol=default_rtol if output_rtol is None else output_rtol,
+        atol=output_atol,
+        rtol=(1e-2 if state_dtype == torch.bfloat16 else default_rtol)
+        if output_rtol is None
+        else output_rtol,
     )
     torch.testing.assert_close(
         returned_state,
         ref_state,
-        atol=default_atol,
-        rtol=default_rtol,
+        atol=state_atol,
+        rtol=state_rtol,
     )
 
 
@@ -409,6 +219,7 @@ def _make_decode_pool_inputs(
     batch_size: int,
     pool_size: int,
     seed: int,
+    state_dtype: torch.dtype = torch.float32,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -446,7 +257,7 @@ def _make_decode_pool_inputs(
         num_v_heads,
         head_size,
         head_size,
-        dtype=torch.float32,
+        dtype=state_dtype,
         device=device,
     )
 
@@ -522,12 +333,13 @@ def _assert_decode_pool_matches_reference(
             softplus_beta=1.0,
             softplus_threshold=20.0,
             use_l2_norm=True,
+            state_dtype=state_pool.dtype,
         )
         ref_out[valid_batch, 0] = ref_o.to(q.dtype)
         ref_state[valid_slots] = ref_state_kv.transpose(-2, -1).contiguous()
 
-    atol = 5e-3
-    rtol = 5e-3
+    atol = 2e-2 if state_pool.dtype == torch.bfloat16 else 5e-3
+    rtol = 1e-2 if state_pool.dtype == torch.bfloat16 else 5e-3
     out_4d = out.unsqueeze(1) if out.dim() == 3 else out
     torch.testing.assert_close(out_4d, ref_out, atol=atol, rtol=rtol)
     torch.testing.assert_close(state_under_test, ref_state, atol=atol, rtol=rtol)
@@ -548,7 +360,7 @@ def _assert_decode_pool_matches_reference(
     return out_4d, state_under_test
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("batch_size", [1, 4, 16, 32])
 def test_decode_kernel_pool_state_indices_pretranspose(
     batch_size: int,
@@ -578,10 +390,12 @@ def test_decode_kernel_pool_state_indices_pretranspose(
     )
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("batch_size", [4, 8, 32])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 def test_decode_kernel_pool_negative_state_indices_pretranspose(
     batch_size: int,
+    state_dtype: torch.dtype,
     seed: int = _get_default_seed(),
 ) -> None:
     pool_size = batch_size * 2
@@ -589,6 +403,7 @@ def test_decode_kernel_pool_negative_state_indices_pretranspose(
         batch_size=batch_size,
         pool_size=pool_size,
         seed=seed,
+        state_dtype=state_dtype,
     )
     state_indices = torch.randperm(pool_size, device=q.device)[:batch_size].to(
         torch.int32
@@ -609,7 +424,7 @@ def test_decode_kernel_pool_negative_state_indices_pretranspose(
     assert torch.all(out[state_indices < 0] == 0)
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("batch_size", [1, 4, 16, 32])
 def test_decode_kernel_pool_all_padding_state_indices_pretranspose(
     batch_size: int,
@@ -887,7 +702,7 @@ def _test_decode_kernel_bitwise_stable_pretranspose(
     )
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("beta", [True])
 @pytest.mark.parametrize("alpha", [True])
 @pytest.mark.parametrize("scale", [1.0])
@@ -923,12 +738,14 @@ def test_decode_kernel_basic_pretranspose(
     )
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 @pytest.mark.parametrize("dt_bias_dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 def test_decode_kernel_sglang_split_qkv_pretranspose(
     dtype: str,
     dt_bias_dtype: str,
+    state_dtype: torch.dtype,
     seed: int = _get_default_seed(),
 ) -> None:
     random.seed(seed)
@@ -990,10 +807,11 @@ def test_decode_kernel_sglang_split_qkv_pretranspose(
         scale=scale,
         output=None,
         use_qk_l2norm=True,
+        state_dtype=state_dtype,
     )
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("use_qk_l2norm", [True, False])
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -1067,7 +885,7 @@ def test_decode_kernel_strided_inputs_and_output_pretranspose(
     )
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.parametrize("beta", [True])
 @pytest.mark.parametrize("scale", [1.0])
 @pytest.mark.parametrize("head_size", [128])

@@ -12,9 +12,9 @@
 #include <mute/arch/simd_mp31.hpp>
 #include <mute/tensor.hpp>
 #include <mutlass/gemm/collective/collective_builder.hpp>
+#include <mutlass/pipeline/pipeline.hpp>
 #include <type_traits>
 
-#include "mate/attention/fmha/pipeline_ws.hpp"
 #include "mate/attention/fmha/utils.hpp"
 #include "mate/attention/msa/msa_options.hpp"
 #include "mate/attention/msa/paged_kv.hpp"
@@ -151,16 +151,16 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
   static constexpr bool UseKPipelinePhaseGuard  = IsPagedKV && is_same_v<Element, mutlass::bfloat16_t>;
   static constexpr int  NumKPipelinePhaseGuards = UseKPipelinePhaseGuard ? 2 : 0;
   static constexpr int  MaxKBarPerStageRatio    = UseKPipelinePhaseGuard ? 16 : 1;
-  using MainloopPipelineQ                       = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<QStages>;
+  using MainloopPipelineQ                       = mutlass::Mp31PipelineTmeAsync<QStages>;
   static constexpr int KPipelineAdditionalBarriers =
       static_cast<int>(mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount) +
       static_cast<int>(MainloopPipelineQ::NumBarriers) + NumKPipelinePhaseGuards;
   using KBarPerStageRatioHelper =
-      mutlass::Mp31PipelineWarpSpecializedBarrierRatio<MaxKBarPerStageRatio, KPipelineAdditionalBarriers, KStages>;
+      mutlass::Mp31PipelineBarrierRatio<MaxKBarPerStageRatio, KPipelineAdditionalBarriers, KStages>;
   static constexpr int KBarPerStageRatio = KBarPerStageRatioHelper::value;
   static_assert(KBarPerStageRatio > 0,
                 "MSA max-score K pipeline exceeds the MP31 async barrier budget even with one barrier pair per stage");
-  using MainloopPipelineK                = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<KStages, KBarPerStageRatio>;
+  using MainloopPipelineK                = mutlass::Mp31PipelineTmeAsync<KStages, KBarPerStageRatio>;
   static constexpr int AsyncBarrierCount = static_cast<int>(mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount) +
                                            static_cast<int>(MainloopPipelineQ::NumBarriers) +
                                            static_cast<int>(MainloopPipelineK::NumBarriers) + NumKPipelinePhaseGuards;
@@ -275,9 +275,9 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
         : q(make_q_params(), static_cast<uint32_t>(reinterpret_cast<uint64_t>(&barrier_storage->pipeline_q))),
           k(make_k_params(), static_cast<uint32_t>(reinterpret_cast<uint64_t>(&barrier_storage->pipeline_k))),
           q_read{},
-          q_write(mutlass::make_producer_start_state_warpspecialized<MainloopPipelineQ>()),
+          q_write(mutlass::make_mp31_producer_start_state<MainloopPipelineQ>()),
           k_read{},
-          k_write(mutlass::make_producer_start_state_warpspecialized<MainloopPipelineK>()) {
+          k_write(mutlass::make_mp31_producer_start_state<MainloopPipelineK>()) {
       if constexpr (UseKPipelinePhaseGuard) {
         if (mutlass::canonical_warp_idx() == 0) {
           mutlass::arch::AsyncBarrier::init(KPipelinePhase0GuardId, NumConsumerWarps, 0);
@@ -430,8 +430,7 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
     uint32_t bar_id  = pipeline.q.producer_get_barrier_id(pipeline.q_write);
     auto     cta_tme = params.load_q.tme_load.get_slice(0);
     Tensor   gQ      = make_tme_q_gmem(params.load_q, work_tile);
-    Tensor   sQ =
-        make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQTme{})(_, _, _, pipeline.q_write.index());
+    Tensor   sQ      = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), take<0, 3>(SmemLayoutQTme{}));
     copy(params.load_q.tme_load.with(bar_id), cta_tme.partition_S(gQ), cta_tme.partition_D(sQ));
     ++pipeline.q_write;
   }

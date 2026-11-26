@@ -7,7 +7,7 @@
 
 namespace mate::attention::fmha {
 
-template <int Rows, bool HasLearnableSink, int MaxOffset = 0>
+template <int Rows, bool HasLearnableSink, int MaxOffset = 0, bool SkipUnitRescale = false>
 struct Softmax {
   using Element = float;
   using TensorT = decltype(make_tensor<Element>(Shape<Int<Rows>>{}));
@@ -22,14 +22,15 @@ struct Softmax {
       : sm_scale(softmax_scale_), sm_scale_log2(softmax_scale_log2_) {};
 
   // TODO: more simd
-  template <bool IsFirst, bool CheckInf, class AccQK, class TiledMmaQK>
-  MUTLASS_DEVICE auto online_softmax(AccQK& acc_qk, TiledMmaQK const& tiled_mma_qk) {
+  template <bool IsFirst, bool CheckInf, bool OutputBf16, class AccQK, class TiledMmaQK, class Probabilities>
+  MUTLASS_DEVICE auto online_softmax_impl(AccQK& acc_qk, TiledMmaQK const& tiled_mma_qk, Probabilities& probabilities) {
     auto          reduction_target_qk = reduction_target_n(tiled_mma_qk);
     constexpr int red_rank            = decltype(rank(reduction_target_qk))::value;
 
     Tensor acc_qk_mn = make_tensor(acc_qk.data(), layout_acc_mn(tiled_mma_qk, acc_qk.layout()));
 
-    static_assert(size<1>(acc_qk_mn) % 4 == 0, "N must be a multiple of 4");
+    static_assert(size<1>(acc_qk_mn) >= 8 && size<1>(acc_qk_mn) % 8 == 0,
+                  "Two-chain row reduction requires N to be at least 8 and a multiple of 8");
 
     TensorT correction_scales;
     Tensor  row_max_prev = make_fragment_like(row_max);
@@ -43,19 +44,20 @@ struct Softmax {
     MUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size<0>(acc_qk_mn); ++i) {
       // RowMax
-      float4 row_max_cur;
+      float4 row_max_even = make_float4(acc_qk_mn(i, 0), acc_qk_mn(i, 1), acc_qk_mn(i, 2), acc_qk_mn(i, 3));
+      float4 row_max_odd  = make_float4(acc_qk_mn(i, 4), acc_qk_mn(i, 5), acc_qk_mn(i, 6), acc_qk_mn(i, 7));
 
       MUTLASS_PRAGMA_UNROLL
-      for (int j = 0; j < size<1>(acc_qk_mn); j += 4) {
-        float4 vec_acc =
+      for (int j = 8; j < size<1>(acc_qk_mn); j += 8) {
+        float4 vec_even =
             make_float4(acc_qk_mn(i, j + 0), acc_qk_mn(i, j + 1), acc_qk_mn(i, j + 2), acc_qk_mn(i, j + 3));
-
-        if (j == 0) {
-          row_max_cur = vec_acc;
-        } else {
-          mute::max(row_max_cur, vec_acc, row_max_cur);
-        }
+        float4 vec_odd =
+            make_float4(acc_qk_mn(i, j + 4), acc_qk_mn(i, j + 5), acc_qk_mn(i, j + 6), acc_qk_mn(i, j + 7));
+        vmax_reduce_rotated(row_max_even, row_max_even, vec_even);
+        vmax_reduce_rotated(row_max_odd, row_max_odd, vec_odd);
       }
+      float4 row_max_cur;
+      vmax_reduce_rotated(row_max_cur, row_max_even, row_max_odd);
       float2 v2_row_max_cur;
       mute::max(v2_row_max_cur, make_float2(row_max_cur.x, row_max_cur.y), make_float2(row_max_cur.z, row_max_cur.w));
       row_max(i) = max(v2_row_max_cur.x, v2_row_max_cur.y);
@@ -71,10 +73,11 @@ struct Softmax {
         row_max(i) = max(row_max_prev(i), row_max(i));
       }
 
-      bool const is_all_masked = row_max(i) == (-std::numeric_limits<Element>::infinity());
-      Element    max_scaled    = row_max(i);
+      bool    is_all_masked = false;
+      Element max_scaled    = row_max(i);
       if constexpr (CheckInf) {
-        max_scaled = is_all_masked ? Element{0} : row_max(i);
+        is_all_masked = row_max(i) == (-std::numeric_limits<Element>::infinity());
+        max_scaled    = is_all_masked ? Element{0} : row_max(i);
       }
 
       // if (i == 0 && threadIdx.x == 128) {
@@ -83,30 +86,64 @@ struct Softmax {
       // }
 
       // Exp
-      Element scale_max = max_scaled * sm_scale_log2;
+      Element const scale_max = max_scaled * sm_scale_log2;
+      // MUTLASS_PRAGMA_UNROLL
+      // for (int j = 0; j < size<1>(acc_qk_mn); j += 4) {
+      //   acc_qk_mn(i, j + 0) = acc_qk_mn(i, j + 0) * sm_scale_log2 - scale_max + MaxOffset;
+      //   acc_qk_mn(i, j + 1) = acc_qk_mn(i, j + 1) * sm_scale_log2 - scale_max + MaxOffset;
+      //   acc_qk_mn(i, j + 2) = acc_qk_mn(i, j + 2) * sm_scale_log2 - scale_max + MaxOffset;
+      //   acc_qk_mn(i, j + 3) = acc_qk_mn(i, j + 3) * sm_scale_log2 - scale_max + MaxOffset;
+
+      //   float4 v4f32_src =
+      //       make_float4(acc_qk_mn(i, j + 0), acc_qk_mn(i, j + 1), acc_qk_mn(i, j + 2), acc_qk_mn(i, j + 3));
+
+      //   mute::fast_exp2(v4f32_src, v4f32_src);
+
+      //   acc_qk_mn(i, j + 0) = v4f32_src.x;
+      //   acc_qk_mn(i, j + 1) = v4f32_src.y;
+      //   acc_qk_mn(i, j + 2) = v4f32_src.z;
+      //   acc_qk_mn(i, j + 3) = v4f32_src.w;
+      // }
+      Element const bias = Element(MaxOffset) - scale_max;
+
       MUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < size<1>(acc_qk_mn); j += 4) {
-        acc_qk_mn(i, j + 0) = acc_qk_mn(i, j + 0) * sm_scale_log2 - scale_max + MaxOffset;
-        acc_qk_mn(i, j + 1) = acc_qk_mn(i, j + 1) * sm_scale_log2 - scale_max + MaxOffset;
-        acc_qk_mn(i, j + 2) = acc_qk_mn(i, j + 2) * sm_scale_log2 - scale_max + MaxOffset;
-        acc_qk_mn(i, j + 3) = acc_qk_mn(i, j + 3) * sm_scale_log2 - scale_max + MaxOffset;
+        float32x4_t values = {
+            acc_qk_mn(i, j + 0),
+            acc_qk_mn(i, j + 1),
+            acc_qk_mn(i, j + 2),
+            acc_qk_mn(i, j + 3),
+        };
 
-        float4 v4f32_src =
-            make_float4(acc_qk_mn(i, j + 0), acc_qk_mn(i, j + 1), acc_qk_mn(i, j + 2), acc_qk_mn(i, j + 3));
+        vfma(values, sm_scale_log2, values, bias);
 
-#if defined(MATE_FMHA_USE_SCALAR_EXP2)
-        v4f32_src.x = exp2f(v4f32_src.x);
-        v4f32_src.y = exp2f(v4f32_src.y);
-        v4f32_src.z = exp2f(v4f32_src.z);
-        v4f32_src.w = exp2f(v4f32_src.w);
+        if constexpr (OutputBf16) {
+          Tensor       probabilities_frg = recast<uint64_t>(probabilities);
+          bfloat16x4_t values_bf16;
+#if defined(MATE_FMHA_WORKAROUND_BST_OVERLAP)
+          MUTLASS_PRAGMA_UNROLL
+          for (int k = 0; k < 4; ++k) {
+            values_bf16[k] = __builtin_bit_cast(__bf16, mutlass::bfloat16_t(exp2f(values[k])));
+          }
 #else
-        mute::fast_exp2(v4f32_src, v4f32_src);
+          vexp2(values_bf16, values);
+#endif
+          probabilities_frg((i * size<1>(acc_qk_mn) + j) / 4) = __builtin_bit_cast(uint64_t, values_bf16);
+        } else {
+#if defined(MATE_FMHA_WORKAROUND_BST_OVERLAP)
+          values[0] = exp2f(values[0]);
+          values[1] = exp2f(values[1]);
+          values[2] = exp2f(values[2]);
+          values[3] = exp2f(values[3]);
+#else
+          vexp2(values, values);
 #endif
 
-        acc_qk_mn(i, j + 0) = v4f32_src.x;
-        acc_qk_mn(i, j + 1) = v4f32_src.y;
-        acc_qk_mn(i, j + 2) = v4f32_src.z;
-        acc_qk_mn(i, j + 3) = v4f32_src.w;
+          acc_qk_mn(i, j + 0) = values[0];
+          acc_qk_mn(i, j + 1) = values[1];
+          acc_qk_mn(i, j + 2) = values[2];
+          acc_qk_mn(i, j + 3) = values[3];
+        }
       }
 
       // RowSum
@@ -115,28 +152,75 @@ struct Softmax {
         row_sum(i)           = correction_scales(i) * row_sum(i);
       }
 
-      float4 row_sum_cur;
-      MUTLASS_PRAGMA_UNROLL
-      for (int j = 0; j < size<1>(acc_qk_mn); j += 4) {
-        float4 vec_acc =
-            make_float4(acc_qk_mn(i, j + 0), acc_qk_mn(i, j + 1), acc_qk_mn(i, j + 2), acc_qk_mn(i, j + 3));
-        if (j == 0) {
-          row_sum_cur = vec_acc;
-        } else {
-          mute::add(row_sum_cur, vec_acc, row_sum_cur);
+      Element row_sum_block;
+      if constexpr (OutputBf16) {
+        Tensor       probabilities_frg = recast<uint64_t>(probabilities);
+        int const    row_offset        = i * size<1>(acc_qk_mn) / 4;
+        bfloat16x4_t row_sum_even      = __builtin_bit_cast(bfloat16x4_t, probabilities_frg(row_offset));
+        bfloat16x4_t row_sum_odd       = __builtin_bit_cast(bfloat16x4_t, probabilities_frg(row_offset + 1));
+        MUTLASS_PRAGMA_UNROLL
+        for (int j = 8; j < size<1>(acc_qk_mn); j += 8) {
+          bfloat16x4_t values_even = __builtin_bit_cast(bfloat16x4_t, probabilities_frg(row_offset + j / 4));
+          bfloat16x4_t values_odd  = __builtin_bit_cast(bfloat16x4_t, probabilities_frg(row_offset + j / 4 + 1));
+          vadd(row_sum_even, values_even, row_sum_even);
+          vadd(row_sum_odd, values_odd, row_sum_odd);
         }
+        bfloat16x4_t row_sum_bf16;
+        vadd(row_sum_bf16, row_sum_even, row_sum_odd);
+        row_sum_block = vsum(row_sum_bf16);
+      } else {
+        float4 row_sum_cur;
+        MUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < size<1>(acc_qk_mn); j += 4) {
+          float4 vec_acc =
+              make_float4(acc_qk_mn(i, j + 0), acc_qk_mn(i, j + 1), acc_qk_mn(i, j + 2), acc_qk_mn(i, j + 3));
+          if (j == 0) {
+            row_sum_cur = vec_acc;
+          } else {
+            mute::add(row_sum_cur, vec_acc, row_sum_cur);
+          }
+        }
+        float2 v2_row_sum_cur;
+        mute::add(v2_row_sum_cur, make_float2(row_sum_cur.x, row_sum_cur.y), make_float2(row_sum_cur.z, row_sum_cur.w));
+        row_sum_block = v2_row_sum_cur.x + v2_row_sum_cur.y;
       }
-      float2 v2_row_sum_cur;
-      mute::add(v2_row_sum_cur, make_float2(row_sum_cur.x, row_sum_cur.y), make_float2(row_sum_cur.z, row_sum_cur.w));
-      Element row_sum_block = v2_row_sum_cur.x + v2_row_sum_cur.y;
-      row_sum(i)            = IsFirst ? row_sum_block : (row_sum(i) + row_sum_block);
+      row_sum(i) = IsFirst ? row_sum_block : (row_sum(i) + row_sum_block);
     }
 
     return correction_scales;
   }
 
+  template <bool IsFirst, bool CheckInf, class AccQK, class TiledMmaQK>
+  MUTLASS_DEVICE auto online_softmax(AccQK& acc_qk, TiledMmaQK const& tiled_mma_qk) {
+    return online_softmax_impl<IsFirst, CheckInf, false>(acc_qk, tiled_mma_qk, acc_qk);
+  }
+
+  template <bool IsFirst,
+            bool CheckInf,
+            class AccQK,
+            class TiledMmaQK,
+            class EngineProbabilities,
+            class LayoutProbabilities>
+  MUTLASS_DEVICE auto online_softmax_bf16(AccQK&                                            acc_qk,
+                                          TiledMmaQK const&                                 tiled_mma_qk,
+                                          Tensor<EngineProbabilities, LayoutProbabilities>& probabilities) {
+    return online_softmax_impl<IsFirst, CheckInf, true>(acc_qk, tiled_mma_qk, probabilities);
+  }
+
   template <class AccPV, class TiledMmaPV>
   MUTLASS_DEVICE void rescale_o(AccPV& acc_pv, TiledMmaPV const& tiled_mma_pv, TensorT const& correction_scales) {
+    if constexpr (SkipUnitRescale) {
+      // If correction_scales is 1.0f, there is no need to perform vectorized rescale.
+      bool needs_rescale = false;
+      MUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < Rows; ++i) {
+        needs_rescale |= (correction_scales(i) != 1.f);
+      }
+      if (!__any_sync(uint32_t(-1), needs_rescale)) {
+        return;
+      }
+    }
+
     Tensor acc_pv_mn = make_tensor(acc_pv.data(), layout_acc_mn(tiled_mma_pv, acc_pv.layout()));
     static_assert(size<0>(acc_pv_mn) == Rows);
     MUTLASS_PRAGMA_UNROLL

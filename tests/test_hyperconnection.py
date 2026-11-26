@@ -108,7 +108,7 @@ def _make_mhc_inputs(
     return residual, hc_fn, hc_scale, hc_base
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.usefixtures("enable_musa_tf32")
 @pytest.mark.parametrize("m", [13, 137, 4096, 8192])
 @pytest.mark.parametrize("n,k", [(24, 28672), (24, 7680), (24, 7168)])
@@ -143,7 +143,7 @@ def test_hc_prenorm_gemm(m: int, n: int, k: int, num_splits: int | None) -> None
     )
 
 
-@supported_musa_compute_capability([31])
+@supported_musa_compute_capability([31, 32])
 @pytest.mark.usefixtures("enable_musa_tf32")
 @pytest.mark.parametrize("num_tokens,hidden_size,split_k", [(16, 4096, 32)])
 def test_mhc_pre_deepgemm_tilelang_matches_torch_reference(

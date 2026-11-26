@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import dataclasses
 from functools import cache
 import warnings
@@ -24,7 +25,21 @@ _ENV_ENABLE = "MATE_PYTEST_GUARD_ALLOC"
 _ENV_MODE = "MATE_PYTEST_GUARD_MODE"
 _ENV_LOG_ALLOCATIONS = "MATE_PYTEST_GUARD_LOG_ALLOCATIONS"
 _SKIP_REASON = "guard allocator debug mode does not support MUSA graph capture"
-_DRY_RUN_SKIP_REASON = "test is not adapted to MATE dry-run"
+_DRY_RUN_MARKER = "mate_dry_run"
+_DRY_RUN_UNMARKED_REASON = "test is not marked with pytest.mark.mate_dry_run"
+_DRY_RUN_MARKED_PROPERTY = "mate_dry_run_marked_file"
+_DRY_RUN_UNMARKED_PROPERTY = "mate_dry_run_unmarked_file"
+_JIT_DUMP_DIR_ENV = "MATE_JIT_DUMP_DIR"
+_JIT_DUMP_REFERENCE_ENV = "MATE_JIT_DUMP_REFERENCE"
+
+
+@dataclasses.dataclass
+class _DryRunCompatibilitySummary:
+    marked_tests: int = 0
+    unmarked_tests_by_file: Counter[str] = dataclasses.field(default_factory=Counter)
+
+
+_DRY_RUN_COMPATIBILITY = _DryRunCompatibilitySummary()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -202,6 +217,15 @@ def _is_musa_oom(excinfo) -> bool:
     return False
 
 
+def _item_path(item: pytest.Item, config: pytest.Config) -> str:
+    path = Path(item.path)
+    try:
+        path = path.relative_to(config.rootpath)
+    except ValueError:
+        pass
+    return path.as_posix()
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     dry_run_group = parser.getgroup("mate-dry-run")
     dry_run_group.addoption(
@@ -221,6 +245,27 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help=(
             "Repeat each Operator call N additional times and require exact outputs. "
             f"Overrides {MATE_BITWISE_CHECKS_ENV}."
+        ),
+    )
+
+    jit_dump_group = parser.getgroup("mate-jit-dump")
+    jit_dump_group.addoption(
+        "--jit-dump",
+        action="store",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Dump one standalone JIT artifact per matching pytest item. "
+            f"Equivalent to setting {_JIT_DUMP_DIR_ENV}."
+        ),
+    )
+    jit_dump_group.addoption(
+        "--jit-dump-reference",
+        action="store_true",
+        default=None,
+        help=(
+            "Dump registered reference outputs. "
+            f"Equivalent to setting {_JIT_DUMP_REFERENCE_ENV}=1."
         ),
     )
     group = parser.getgroup("mate-guard")
@@ -324,7 +369,71 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+def _set_jit_dump_env_from_options(config: pytest.Config) -> None:
+    dump_option = config.getoption("jit_dump")
+    if dump_option is not None:
+        previous_dump = os.environ.get(_JIT_DUMP_DIR_ENV)
+        if previous_dump is not None and previous_dump != dump_option:
+            warnings.warn(
+                pytest.PytestWarning(
+                    f"--jit-dump overrides {_JIT_DUMP_DIR_ENV}={previous_dump!r}"
+                ),
+                stacklevel=1,
+            )
+        os.environ[_JIT_DUMP_DIR_ENV] = dump_option
+
+    reference_option = config.getoption("jit_dump_reference")
+    if reference_option:
+        previous_reference = os.environ.get(_JIT_DUMP_REFERENCE_ENV)
+        if previous_reference not in (None, "1"):
+            warnings.warn(
+                pytest.PytestWarning(
+                    f"--jit-dump-reference overrides {_JIT_DUMP_REFERENCE_ENV}="
+                    f"{previous_reference!r}"
+                ),
+                stacklevel=1,
+            )
+        os.environ[_JIT_DUMP_REFERENCE_ENV] = "1"
+
+
+def _configure_jit_dump(config: pytest.Config) -> None:
+    _set_jit_dump_env_from_options(config)
+    output_value = os.environ.get(_JIT_DUMP_DIR_ENV)
+    reference_enabled = _parse_bool_env(_JIT_DUMP_REFERENCE_ENV, default=False)
+    os.environ[_JIT_DUMP_REFERENCE_ENV] = "1" if reference_enabled else "0"
+
+    if reference_enabled and not output_value:
+        raise pytest.UsageError(
+            f"{_JIT_DUMP_REFERENCE_ENV}=1 requires {_JIT_DUMP_DIR_ENV} or --jit-dump"
+        )
+    if not output_value:
+        return
+
+    numprocesses = getattr(config.option, "numprocesses", None)
+    if numprocesses not in (None, 0):
+        raise pytest.UsageError("JIT dump does not support pytest-xdist")
+    if hasattr(config, "workerinput"):
+        raise pytest.UsageError("JIT dump does not support pytest-xdist workers")
+
+    try:
+        from mate.jit.dump.context import get_jit_dump_context
+
+        dump_context = get_jit_dump_context()
+    except (RuntimeError, ValueError) as exc:
+        raise pytest.UsageError(f"Invalid JIT dump architecture: {exc}") from exc
+    assert dump_context is not None
+
+    from mate.jit.dump.pytest_plugin import JITDumpPytestPlugin
+
+    plugin = JITDumpPytestPlugin(Path(output_value), dump_context)
+    config.pluginmanager.register(plugin, "mate-jit-dump")
+
+
 def pytest_configure(config: pytest.Config) -> None:
+    _configure_jit_dump(config)
+    _DRY_RUN_COMPATIBILITY.marked_tests = 0
+    _DRY_RUN_COMPATIBILITY.unmarked_tests_by_file.clear()
+
     bitwise_checks = config.getoption("bitwise_checks")
     if bitwise_checks is None:
         value = os.environ.get(MATE_BITWISE_CHECKS_ENV)
@@ -349,6 +458,10 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
         "guard_incompatible: skip this test when pytest guard allocator mode is active",
+    )
+    config.addinivalue_line(
+        "markers",
+        "mate_dry_run: test is safe and required to complete in MATE dry-run mode",
     )
 
     guard_config = _resolve_guard_config(config)
@@ -375,12 +488,22 @@ def pytest_collection_modifyitems(
     config: pytest.Config,
     items: list[pytest.Item],
 ) -> None:
+    dry_run_enabled = is_dry_run_enabled()
     current_cc, detail = _current_musa_compute_capability()
     guard_config = getattr(config, "_mate_guard_config", None)
     guard_enabled = guard_config is not None and guard_config.enabled
     skip_graph = pytest.mark.skip(reason=_SKIP_REASON)
+    skip_unmarked_dry_run = pytest.mark.skip(reason=_DRY_RUN_UNMARKED_REASON)
 
     for item in items:
+        if dry_run_enabled:
+            path = _item_path(item, config)
+            if item.get_closest_marker(_DRY_RUN_MARKER) is None:
+                item.user_properties.append((_DRY_RUN_UNMARKED_PROPERTY, path))
+                item.add_marker(skip_unmarked_dry_run)
+            else:
+                item.user_properties.append((_DRY_RUN_MARKED_PROPERTY, path))
+
         test_func = getattr(item, "obj", None)
         requirement = getattr(test_func, MUSA_ARCH_REQUIREMENT_ATTR, None)
         if requirement is not None:
@@ -403,6 +526,20 @@ def pytest_collection_modifyitems(
             item.add_marker(skip_graph)
 
 
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    if report.when != "setup":
+        return
+
+    properties = dict(report.user_properties)
+    marked_file = properties.get(_DRY_RUN_MARKED_PROPERTY)
+    if marked_file is not None:
+        _DRY_RUN_COMPATIBILITY.marked_tests += 1
+
+    unmarked_file = properties.get(_DRY_RUN_UNMARKED_PROPERTY)
+    if unmarked_file is not None:
+        _DRY_RUN_COMPATIBILITY.unmarked_tests_by_file[unmarked_file] += 1
+
+
 @pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
     """Keep the complete dry-run lifecycle inside fake tensor mode."""
@@ -418,18 +555,20 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]):
     """Normalize dry-run and MUSA OOM outcomes for the test call phase."""
     report = yield
 
-    if call.when == "call" and is_dry_run_enabled():
+    if (
+        call.when == "call"
+        and is_dry_run_enabled()
+        and item.get_closest_marker(_DRY_RUN_MARKER) is not None
+    ):
         if _is_dry_run_complete(call.excinfo):
             report.outcome = "passed"
             report.longrepr = None
-        elif report.outcome != "skipped":
-            warnings.warn(
-                f"{item.nodeid}: {_DRY_RUN_SKIP_REASON}",
-                pytest.PytestWarning,
-                stacklevel=1,
+        elif report.outcome == "passed":
+            report.outcome = "failed"
+            report.longrepr = (
+                f"{item.nodeid}: test is marked with pytest.mark.{_DRY_RUN_MARKER} "
+                f"but did not raise {MateDryRunComplete.__name__}"
             )
-            report.outcome = "skipped"
-            report.longrepr = ("", 0, f"Skipped: {_DRY_RUN_SKIP_REASON}")
     elif call.when == "call" and _is_musa_oom(call.excinfo):
         warnings.warn(
             # f"MUSA out of memory; skipping test: {call.excinfo.value}",
@@ -440,6 +579,42 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]):
         report.longrepr = ("", 0, "Skipped: MUSA out of memory")
 
     return report
+
+
+def pytest_terminal_summary(
+    terminalreporter: pytest.TerminalReporter,
+    exitstatus: int,
+    config: pytest.Config,
+) -> None:
+    if not is_dry_run_enabled():
+        return
+
+    terminalreporter.write_sep("=", "MATE dry-run compatibility")
+    unmarked = _DRY_RUN_COMPATIBILITY.unmarked_tests_by_file
+    if unmarked:
+        skipped_tests = sum(unmarked.values())
+        test_label = "test" if skipped_tests == 1 else "tests"
+        file_label = "file" if len(unmarked) == 1 else "files"
+        terminalreporter.write_line(
+            "WARNING: skipped "
+            f"{skipped_tests} unmarked {test_label} "
+            f"from {len(unmarked)} {file_label}:",
+            yellow=True,
+        )
+        for path, count in sorted(unmarked.items()):
+            item_label = "test" if count == 1 else "tests"
+            terminalreporter.write_line(f"  {path}: {count} {item_label}", yellow=True)
+        terminalreporter.write_line(
+            f"Add pytestmark = pytest.mark.{_DRY_RUN_MARKER} only after a test "
+            f"file supports MATE dry-run.",
+            yellow=True,
+        )
+    else:
+        terminalreporter.write_line("No unmarked tests were skipped.")
+
+    marked = _DRY_RUN_COMPATIBILITY.marked_tests
+    marked_label = "test" if marked == 1 else "tests"
+    terminalreporter.write_line(f"Marked for MATE dry-run: {marked} {marked_label}")
 
 
 def _get_shard_config():

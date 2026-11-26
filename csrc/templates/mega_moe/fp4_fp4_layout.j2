@@ -1,0 +1,34 @@
+#include "mate/mega_moe/prefill/fp4_fp4/symmetric_layout.hpp"
+#include "op_utils.hpp"
+using Fp4Layout=::mega_moe::prefill::mp32::fp4_fp4::SymmetricLayout<{{ ranks }},{{ tokens }},{{ hidden }},{{ intermediate }},{{ experts }},{{ topk }}>;
+
+int64_t {{ func_name }}_bytes() { return Fp4Layout::kBytes; }
+
+void {{ func_name }}_probe(ffi::TensorView buffer,ffi::TensorView ptrs,ffi::TensorView out,int rank) {
+  CHECK_INPUT_AND_TYPE(buffer,dl_uint8); CHECK_DIM(1,buffer);
+  CHECK_INPUT_AND_TYPE(out,dl_uint8); CHECK_DIM(1,out); CHECK_DEVICE(buffer,out);
+  TVM_FFI_ICHECK_GE(buffer.numel(),Fp4Layout::allocation_bytes()); TVM_FFI_ICHECK_EQ(out.numel(),Fp4Layout::kRanks);
+  ffi::MUSADeviceGuard guard(buffer.device().device_id);
+  check_mp32(buffer.device(),"FP4 symmetric IPC probe");
+  auto sym=mate::mega_moe::make_sym_buffer<Fp4Layout::kRanks>(ptrs,rank);
+  TVM_FFI_ICHECK_EQ(sym.base,reinterpret_cast<int64_t>(buffer.data_ptr()));
+  auto stream=get_stream(buffer.device());
+  ::mega_moe::prefill::mp32::fp4_fp4::ipc_barrier_kernel<Fp4Layout><<<1,128,0,stream>>>(sym);
+  ::mega_moe::prefill::mp32::fp4_fp4::ipc_probe_kernel<Fp4Layout><<<1,128,0,stream>>>(sym,static_cast<uint8_t*>(out.data_ptr()));
+  ::mega_moe::prefill::mp32::fp4_fp4::ipc_barrier_kernel<Fp4Layout><<<1,128,0,stream>>>(sym);
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}_bytes,{{ func_name }}_bytes);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}_probe,{{ func_name }}_probe);
+
+int64_t {{ func_name }}_workspace_bytes() { return Fp4Layout::dispatch_workspace_bytes(); }
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}_workspace_bytes,{{ func_name }}_workspace_bytes);
+
+int64_t {{ func_name }}_control_bytes() {
+  return ::mega_moe::prefill::PrefillSplitWorkspace(nullptr,Fp4Layout::kRanks,Fp4Layout::kExperts,
+      Fp4Layout::kTokens,Fp4Layout::kTopK).get_control_region_num_bytes();
+}
+int64_t {{ func_name }}_barrier_bytes() { return ::mega_moe::layout::Workspace::kNumBarrierSignalBytes; }
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}_control_bytes,{{ func_name }}_control_bytes);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}_barrier_bytes,{{ func_name }}_barrier_bytes);

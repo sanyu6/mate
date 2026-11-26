@@ -151,6 +151,10 @@ JIT/AOT modules that compile MUSA kernels.
 | `MATE_PYTEST_GUARD_ALLOC` | `0` | Enable the guarded allocator by default for MATE repository pytest runs |
 | `MATE_PYTEST_GUARD_MODE` | `tail` | Default MATE repository pytest guard allocator mode: `tail` or `head` |
 | `MATE_PYTEST_GUARD_LOG_ALLOCATIONS` | `0` | Log guarded alloc/free events during MATE repository pytest runs |
+| `MATE_JIT_DUMP_DIR` | unset | Enable JIT dump and select the pytest artifact root; equivalent to `--jit-dump` |
+| `MATE_JIT_DUMP_REFERENCE` | `0` | Save registered references in each JIT dump; equivalent to `--jit-dump-reference` |
+| `MATE_JIT_DUMP_LOADER_SO` | auto-built | Override the standalone TVM-FFI dump loader library |
+| `MATE_JIT_DUMP_MUSART_SO` | auto-detected | Override the MUSA runtime library bundled into each JIT dump |
 | `MATE_DRY_RUN` | `0` | Internal test/diagnostic mode used by MATE tests; not intended as a normal user runtime setting |
 | `MATE_PYTEST_SHARD_TOTAL` | `1` | Number of shards to dispatch all the tests to |
 | `MATE_PYTEST_SHARD_INDEX` | `0` | Index of current shard |
@@ -165,3 +169,11 @@ The `MATE_PYTEST_GUARD_*` variables are consumed by MATE's in-repository
 pytest `conftest.py`; they are not installed as a general pytest plugin for
 external projects. Prefer `mate guard-run` for user-facing guarded allocator
 debug sessions.
+
+The `MATE_JIT_DUMP_*` variables configure the in-repository JIT dump workflow
+documented in [`tools/jit_dump/README.md`](../tools/jit_dump/README.md). Set them
+before pytest collection so supported JIT modules select their dump wrapper when
+imported. JIT dump does not support active pytest-xdist workers.
+`MATE_MUSA_ARCH_LIST` selects the dump architecture and must contain exactly one
+target when explicitly set for JIT dump. If it is unset, JIT dump uses the
+current device architecture.

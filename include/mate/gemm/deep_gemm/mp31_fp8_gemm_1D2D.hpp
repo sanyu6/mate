@@ -6,9 +6,9 @@
 #include <mute/atom/copy_atom.hpp>
 #include <mute/tensor.hpp>
 #include <mutlass/gemm/collective/collective_builder.hpp>
+#include <mutlass/pipeline/pipeline.hpp>
 #include <type_traits>
 
-#include "mate/attention/fmha/pipeline_ws.hpp"
 #include "mate/common/mma_mp31_sqmma.hpp"
 #include "mate/gemm/deep_gemm/gemm_type.hpp"
 #include "mate/gemm/deep_gemm/mp31_scheduler.hpp"
@@ -96,7 +96,7 @@ struct Mp31Fp8Gemm1D2D {
   static constexpr TME::CacheHint TmeBOuterHint = TME::CacheHint::CACHE_NONE;
 
   static constexpr int BarPerStageRatio = 2;
-  using PipelineAB                      = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<kStages, BarPerStageRatio>;
+  using PipelineAB                      = mutlass::Mp31PipelineTmeAsync<kStages, BarPerStageRatio>;
   using PipelineABParams                = typename PipelineAB::Params;
   using PipelineABState                 = typename PipelineAB::PipelineState;
 
@@ -119,12 +119,12 @@ struct Mp31Fp8Gemm1D2D {
     mute::array_aligned<ElementB, cosize_v<SmemLayoutB>, 256> smem_b;
   };
 
-  using TME_A = decltype(make_tme_copy<TmeAInnerHint, TmeAOuterHint>(
+  using TME_A = decltype(make_tme_copy<void, TmeAInnerHint, TmeAOuterHint>(
       MP31_TME_LOAD{},
       make_tensor(make_gmem_ptr(static_cast<ElementA const*>(nullptr)), repeat_like(StrideA{}, int32_t(0)), StrideA{}),
       take<0, 2>(SmemLayoutA{})));
 
-  using TME_B = decltype(make_tme_copy<TmeBInnerHint, TmeBOuterHint>(
+  using TME_B = decltype(make_tme_copy<void, TmeBInnerHint, TmeBOuterHint>(
       MP31_TME_LOAD{},
       make_tensor(make_gmem_ptr(static_cast<ElementB const*>(nullptr)), repeat_like(StrideB{}, int32_t(0)), StrideB{}),
       take<0, 2>(SmemLayoutB{})));
@@ -189,8 +189,8 @@ struct Mp31Fp8Gemm1D2D {
 
     auto  gA    = make_tensor(make_gmem_ptr(args.ptr_a), make_shape(args.m, args.k, args.num_groups), args.stride_a);
     auto  gB    = make_tensor(make_gmem_ptr(args.ptr_b), make_shape(args.n, args.k, args.num_groups), args.stride_b);
-    TME_A tme_a = make_tme_copy<TmeAInnerHint, TmeAOuterHint>(MP31_TME_LOAD{}, gA, take<0, 2>(SmemLayoutA{}));
-    TME_B tme_b = make_tme_copy<TmeBInnerHint, TmeBOuterHint>(MP31_TME_LOAD{}, gB, take<0, 2>(SmemLayoutB{}));
+    TME_A tme_a = make_tme_copy<void, TmeAInnerHint, TmeAOuterHint>(MP31_TME_LOAD{}, gA, take<0, 2>(SmemLayoutA{}));
+    TME_B tme_b = make_tme_copy<void, TmeBInnerHint, TmeBOuterHint>(MP31_TME_LOAD{}, gB, take<0, 2>(SmemLayoutB{}));
 
     auto sfa_layout = make_layout(make_shape(args.m, k_tiles_qt, args.num_groups), args.stride_sfa);
     auto sfb_layout = make_layout(make_shape(n_tiles_qt, k_tiles_qt, args.num_groups), args.stride_sfb);
@@ -261,7 +261,7 @@ struct Mp31Fp8Gemm1D2D {
 
     const uint32_t k_blocks = uint32_t(params.k_blocks);
 
-    PipelineABState pipe_write = mutlass::make_producer_start_state_warpspecialized<PipelineAB>();
+    PipelineABState pipe_write = mutlass::make_mp31_producer_start_state<PipelineAB>();
     PipelineABState pipe_read;
 
     PipelineSeqParams seq_params{};

@@ -1,0 +1,295 @@
+#include <musa_runtime.h>
+
+#include <cstdint>
+#include <type_traits>
+
+#include "mate/gemm/deep_gemm/mp32_mqa_logits_blockscale.hpp"
+#include "mate/gemm/deep_gemm/mpxx_clean_logits.hpp"
+#include "mutlass/device_kernel.h"
+#include "op_utils.hpp"
+
+using namespace mute;
+
+namespace {
+
+void clean_mqa_logits_blockscale(
+  ffi::TensorView logits,
+  ffi::TensorView cu_seqlen_k_start,
+  ffi::TensorView cu_seqlen_k_end,
+  int64_t         seqlen_q,
+  int64_t         seqlen_kv,
+  uint64_t        stride_kv
+) {
+  constexpr int kNextN    = 1;
+  constexpr int kBlockKV  = 8192;
+  constexpr int kNumWarps = 8;
+  constexpr int kSmemSize = kBlockKV * sizeof({{ out_element_literal }});
+
+  musaDeviceProp dprops{};
+  MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&dprops, logits.device().device_id));
+  const int num_persistent_blocks = dprops.multiProcessorCount;
+  TVM_FFI_ICHECK(num_persistent_blocks > 0) << "No available MUSA MPs";
+
+  musaStream_t stream = get_stream(logits.device());
+  mate::deep_gemm::mpxx_clean_logits<kNextN, kBlockKV, kNumWarps, {{ out_element_literal }}>
+      <<<num_persistent_blocks, kNumWarps * 32, kSmemSize, stream>>>(
+          static_cast<uint32_t>(seqlen_q),
+          static_cast<uint32_t>(seqlen_kv),
+          stride_kv,
+          static_cast<uint32_t const*>(cu_seqlen_k_start.data_ptr()),
+          static_cast<uint32_t*>(cu_seqlen_k_end.data_ptr()),
+          static_cast<{{ out_element_literal }}*>(logits.data_ptr()));
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}
+
+}  // namespace
+
+void {{ func_name }}(
+  ffi::TensorView                q,
+  ffi::TensorView                kv,
+  ffi::TensorView                scale_q,
+  ffi::TensorView                scale_kv,
+  ffi::TensorView                weights,
+  ffi::TensorView                cu_seqlen_k_start,
+  ffi::TensorView                cu_seqlen_k_end,
+  ffi::TensorView                out,
+  bool                           clean_logits,
+  ffi::Optional<ffi::TensorView> schedule_meta
+) {
+  CHECK_MUSA(q);
+  CHECK_MUSA(kv);
+  CHECK_MUSA(scale_q);
+  CHECK_MUSA(scale_kv);
+  CHECK_INPUT(weights);
+  CHECK_INPUT(cu_seqlen_k_start);
+  CHECK_INPUT(cu_seqlen_k_end);
+  CHECK_MUSA(out);
+  CHECK_DIM(3, q);
+  CHECK_DIM(2, kv);
+  CHECK_DIM(3, scale_q);
+  CHECK_DIM(2, scale_kv);
+  CHECK_DIM(2, weights);
+  CHECK_DIM(1, cu_seqlen_k_start);
+  CHECK_DIM(1, cu_seqlen_k_end);
+  CHECK_DIM(2, out);
+  CHECK_INPUT_TYPE(q, {{ qkv_input_dtype }});
+  CHECK_INPUT_TYPE(kv, {{ qkv_input_dtype }});
+  CHECK_INPUT_TYPE(scale_q, dl_uint8);
+  CHECK_INPUT_TYPE(scale_kv, dl_uint8);
+  CHECK_INPUT_TYPE(weights, {{ weights_input_dtype }});
+  CHECK_INPUT_TYPE(cu_seqlen_k_start, dl_int32);
+  CHECK_INPUT_TYPE(cu_seqlen_k_end, dl_int32);
+  CHECK_INPUT_TYPE(out, {{ out_input_dtype }});
+  CHECK_DEVICE(kv, q);
+  CHECK_DEVICE(scale_q, q);
+  CHECK_DEVICE(scale_kv, q);
+  CHECK_DEVICE(weights, q);
+  CHECK_DEVICE(cu_seqlen_k_start, q);
+  CHECK_DEVICE(cu_seqlen_k_end, q);
+  CHECK_DEVICE(out, q);
+
+  ffi::MUSADeviceGuard device_guard(q.device().device_id);
+
+  musaDeviceProp device_prop{};
+  MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&device_prop, q.device().device_id));
+
+  musaStream_t stream = get_stream(q.device());
+
+  const int64_t seqlen_q        = out.size(0);
+  const int64_t num_heads       = q.size(1);
+  const int64_t physical_headdim = q.size(2);
+  const int64_t seqlen_kv       = kv.size(0);
+
+  constexpr bool kIsCompressedLogits = {{ compressed_logits_literal }};
+  constexpr int  kTileKV             = {{ tile_kv }};
+  constexpr int  kTileQ              = {{ tile_q }};
+  constexpr int  kTileQH             = {{ tile_qh }};
+  constexpr int  kNumHeads           = {{ num_heads }};
+  constexpr int  kHeadDim            = {{ headdim }};
+  constexpr int  kStagesQ            = {{ stages_q }};
+  constexpr int  kStagesKV           = {{ stages_kv }};
+  constexpr int  kQKVPackFactor      = {{ qkv_pack_factor }};
+  constexpr int  kScaleVectorSize    = 32;
+  constexpr int  kScaleStorageBytes  = 4;
+
+  constexpr bool     kUseSchedule = {{ use_schedule_literal }};
+  constexpr uint32_t kNumMPs      = {{ num_mps }};
+
+  TVM_FFI_ICHECK(num_heads == kNumHeads) << "Unexpected num_heads for this JIT kernel";
+  TVM_FFI_ICHECK(kHeadDim % kScaleVectorSize == 0) << "headdim must be divisible by 32";
+  TVM_FFI_ICHECK(physical_headdim * kQKVPackFactor == kHeadDim)
+      << "Unexpected packed headdim for this JIT kernel";
+  TVM_FFI_ICHECK(q.size(0) == seqlen_q) << "q.shape[0] must match out.shape[0]";
+  TVM_FFI_ICHECK(kv.size(1) == physical_headdim) << "kv.shape[1] must match q.shape[2]";
+  TVM_FFI_ICHECK(weights.size(0) == seqlen_q && weights.size(1) == num_heads)
+      << "weights shape must be [seqlen_q, num_heads]";
+  TVM_FFI_ICHECK(q.stride(2) == 1 && q.stride(1) >= physical_headdim && q.stride(1) % 4 == 0 &&
+                   q.stride(0) == num_heads * q.stride(1))
+      << "q must have unit packed-element stride and an aligned padded head pitch";
+  TVM_FFI_ICHECK(kv.stride(1) == 1 && kv.stride(0) >= physical_headdim && kv.stride(0) % 4 == 0)
+      << "kv must have unit packed-element stride and an aligned padded row pitch";
+  TVM_FFI_ICHECK(weights.stride(1) == 1 && weights.stride(0) == num_heads)
+      << "weights must be contiguous [seqlen_q, num_heads]";
+  TVM_FFI_ICHECK(scale_q.size(0) == seqlen_q && scale_q.size(1) == num_heads &&
+                     scale_q.size(2) == kScaleStorageBytes)
+      << "scale_q must have shape [seqlen_q, num_heads, 4]";
+  TVM_FFI_ICHECK(scale_kv.size(0) == seqlen_kv && scale_kv.size(1) == kScaleStorageBytes)
+      << "scale_kv must have shape [seqlen_kv, 4]";
+
+  const bool is_q_scale_m_major = scale_q.stride(1) == 1;
+  const bool is_kv_scale_m_major = scale_kv.stride(0) == 1;
+  if (is_q_scale_m_major) {
+    TVM_FFI_ICHECK(scale_q.stride(0) == num_heads && scale_q.stride(2) == seqlen_q * num_heads)
+        << "M-major scale_q has invalid strides";
+    TVM_FFI_ICHECK((seqlen_q * num_heads) % 4 == 0)
+        << "M-major scale_q requires seqlen_q * num_heads divisible by 4";
+  } else {
+    TVM_FFI_ICHECK(scale_q.stride(2) == 1 && scale_q.stride(1) == kScaleStorageBytes &&
+                       scale_q.stride(0) == num_heads * kScaleStorageBytes)
+        << "K-major scale_q has invalid strides";
+  }
+  if (is_kv_scale_m_major) {
+    TVM_FFI_ICHECK(scale_kv.stride(1) == seqlen_kv) << "M-major scale_kv has invalid strides";
+    TVM_FFI_ICHECK(seqlen_kv % 4 == 0) << "M-major scale_kv requires seqlen_kv divisible by 4";
+  } else {
+    TVM_FFI_ICHECK(scale_kv.stride(1) == 1 && scale_kv.stride(0) == kScaleStorageBytes)
+        << "K-major scale_kv has invalid strides";
+  }
+  TVM_FFI_ICHECK(out.stride(1) == 1 && out.stride(0) >= out.size(1))
+      << "out must be contiguous at the last dimension with a valid row stride";
+
+  if constexpr (kIsCompressedLogits) {
+    TVM_FFI_ICHECK(!clean_logits) << "clean_logits is not supported with compressed logits";
+    TVM_FFI_ICHECK(out.size(1) > 0 && out.size(1) <= seqlen_kv)
+        << "compressed out.shape[1] must be in (0, seqlen_kv]";
+  } else {
+    TVM_FFI_ICHECK(out.size(1) == seqlen_kv) << "out.shape[1] must match kv.shape[0]";
+  }
+
+  auto          ceil_div      = [](int64_t a, int64_t b) -> int64_t { return (a + b - 1) / b; };
+  const int32_t max_seqlen_kv = static_cast<int32_t>(out.size(1));
+
+  auto stride_q      = make_stride(q.stride(1) * kQKVPackFactor, _1{});
+  auto stride_kv     = make_stride(kv.stride(0) * kQKVPackFactor, _1{});
+  auto stride_w      = make_stride(_1{}, seqlen_q * num_heads);
+  auto stride_logits = make_stride(out.stride(0), _1{});
+
+  const int64_t num_tile_q           = ceil_div(seqlen_q, int64_t(kTileQ));
+  const int     num_persistent_blocks = device_prop.multiProcessorCount;
+  TVM_FFI_ICHECK(num_persistent_blocks > 0) << "No available MUSA MPs";
+
+  uint32_t const* schedule_meta_ptr = nullptr;
+  if constexpr (kUseSchedule) {
+    TVM_FFI_ICHECK(schedule_meta.has_value()) << "scheduled MQA logits requires schedule_meta";
+    auto const& schedule_meta_tensor = schedule_meta.value();
+    CHECK_MUSA(schedule_meta_tensor);
+    CHECK_CONTIGUOUS(schedule_meta_tensor);
+    CHECK_INPUT_TYPE(schedule_meta_tensor, dl_int32);
+    CHECK_DEVICE(schedule_meta_tensor, q);
+    CHECK_DIM(1, schedule_meta_tensor);
+    TVM_FFI_ICHECK(schedule_meta_tensor.size(0) >=
+                   int64_t(mate::deep_gemm::mqa_logits_meta_span_word_offset(kNumMPs)) + 2 * num_tile_q)
+        << "schedule_meta is too small";
+    TVM_FFI_ICHECK(uint32_t(num_persistent_blocks) == kNumMPs)
+        << "scheduled MQA logits requires the grid to match num_mps";
+    schedule_meta_ptr = static_cast<uint32_t const*>(schedule_meta_tensor.data_ptr());
+  } else {
+    TVM_FFI_ICHECK(!schedule_meta.has_value()) << "schedule_meta requires scheduled MQA logits";
+  }
+
+  auto launch = [&](auto q_scale_major, auto kv_scale_major) {
+    constexpr bool kIsQScaleMajorM  = decltype(q_scale_major)::value;
+    constexpr bool kIsKVScaleMajorM = decltype(kv_scale_major)::value;
+    auto stride_sfq = [&]() {
+      if constexpr (kIsQScaleMajorM) {
+        return make_stride(_1{}, seqlen_q * num_heads);
+      } else {
+        return make_stride(Int<kScaleStorageBytes>{}, _1{});
+      }
+    }();
+    auto stride_sfkv = [&]() {
+      if constexpr (kIsKVScaleMajorM) {
+        return make_stride(_1{}, seqlen_kv);
+      } else {
+        return make_stride(Int<kScaleStorageBytes>{}, _1{});
+      }
+    }();
+
+    using Element = {{ qkv_element_type }};
+    using Kernel  = mate::deep_gemm::MP32MQALogitsBlockScale<Element,
+                                                              {{ element_w_literal }},
+                                                              {{ out_element_literal }},
+                                                              kNumHeads,
+                                                              kHeadDim,
+                                                              kTileKV,
+                                                              kTileQH,
+                                                              decltype(stride_q),
+                                                              decltype(stride_kv),
+                                                              decltype(stride_sfq),
+                                                              decltype(stride_sfkv),
+                                                              decltype(stride_w),
+                                                              decltype(stride_logits),
+                                                              kStagesQ,
+                                                              kStagesKV,
+                                                              4,
+                                                              kIsCompressedLogits,
+                                                              kScaleStorageBytes,
+                                                              kIsQScaleMajorM,
+                                                              kIsKVScaleMajorM,
+                                                              kUseSchedule,
+                                                              kNumMPs>;
+
+    typename Kernel::Arguments arguments{
+        .num_tile_q        = static_cast<int32_t>(num_tile_q),
+        .seqlen_kv         = static_cast<int32_t>(seqlen_kv),
+        .num_heads         = static_cast<int32_t>(num_heads),
+        .headdim           = kHeadDim,
+        .total_seqlen_q    = static_cast<int32_t>(seqlen_q),
+        .ptr_q             = static_cast<Element const*>(q.data_ptr()),
+        .stride_q          = stride_q,
+        .ptr_kv            = static_cast<Element const*>(kv.data_ptr()),
+        .stride_kv         = stride_kv,
+        .ptr_sfq           = static_cast<mutlass::float_ue8m0_t const*>(scale_q.data_ptr()),
+        .stride_sfq        = stride_sfq,
+        .ptr_sfkv          = static_cast<mutlass::float_ue8m0_t const*>(scale_kv.data_ptr()),
+        .stride_sfkv       = stride_sfkv,
+        .ptr_weights       = static_cast<{{ element_w_literal }} const*>(weights.data_ptr()),
+        .stride_weights    = stride_w,
+        .cu_seqlen_k_start = static_cast<int32_t const*>(cu_seqlen_k_start.data_ptr()),
+        .cu_seqlen_k_end   = static_cast<int32_t const*>(cu_seqlen_k_end.data_ptr()),
+        .schedule_meta     = schedule_meta_ptr,
+        .ptr_logits        = static_cast<{{ out_element_literal }}*>(out.data_ptr()),
+        .stride_logits     = stride_logits,
+        .max_seqlen_kv     = max_seqlen_kv,
+    };
+
+    auto params = Kernel::to_underlying_arguments(arguments);
+    mutlass::device_kernel<Kernel>
+        <<<static_cast<uint32_t>(num_persistent_blocks), Kernel::MaxThreadsPerBlock,
+           Kernel::SharedStorageSize, stream>>>(params);
+    MATE_CHECK_MUSA_KERNEL_LAUNCH();
+  };
+
+  if (is_q_scale_m_major) {
+    if (is_kv_scale_m_major) {
+      launch(std::true_type{}, std::true_type{});
+    } else {
+      launch(std::true_type{}, std::false_type{});
+    }
+  } else if (is_kv_scale_m_major) {
+    launch(std::false_type{}, std::true_type{});
+  } else {
+    launch(std::false_type{}, std::false_type{});
+  }
+
+  if constexpr (!kIsCompressedLogits) {
+    if (clean_logits) {
+      clean_mqa_logits_blockscale(out,
+                                  cu_seqlen_k_start,
+                                  cu_seqlen_k_end,
+                                  seqlen_q,
+                                  seqlen_kv,
+                                  static_cast<uint64_t>(out.stride(0)));
+    }
+  }
+}

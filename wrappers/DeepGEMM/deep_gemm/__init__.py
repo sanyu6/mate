@@ -14,6 +14,8 @@ from .interface import (
     einsum,
     # legacy aliases
     fp8_einsum,
+    fp8_fp4_paged_mqa_logits,
+    fp8_fp4_mqa_logits,
     fp8_fp4_gemm_nn,
     fp8_fp4_gemm_nt,
     fp8_fp4_gemm_tn,
@@ -26,6 +28,7 @@ from .interface import (
     fp8_gemm_nt_skip_head_mid,
     fp8_mqa_logits,
     fp8_paged_mqa_logits,
+    get_mqa_logits_metadata,
     get_paged_mqa_logits_metadata,
     k_grouped_fp8_gemm_nt_contiguous,
     k_grouped_fp8_gemm_tn_contiguous,
@@ -143,8 +146,11 @@ __all__ = [
     "fp8_einsum",
     "tf32_hc_prenorm_gemm",
     # MQA
+    "get_mqa_logits_metadata",
     "get_paged_mqa_logits_metadata",
     "fp8_paged_mqa_logits",
+    "fp8_fp4_paged_mqa_logits",
+    "fp8_fp4_mqa_logits",
     "fp8_mqa_logits",
     # legacy aliases
     "fp8_m_grouped_gemm_nt_masked",

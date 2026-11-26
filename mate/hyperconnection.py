@@ -91,7 +91,19 @@ def _normalize_prenorm_partials(
 
 
 def _default_split_k(num_tokens: int) -> int:
-    return 32 if num_tokens <= 64 else 16
+    # Decode stays split-heavy for grid parallelism. Prefill uses the split that fits the prefill
+    # box's resident CTAs into a single wave: 128x32x64 / 3-stage / 4-squad with
+    # MinBlocksPerMultiprocessor=2 fits 2 CTAs per MP on the 48-MP S6000, so the machine holds
+    # 96 CTAs at once. At M=3840 m_blocks is 30, so split=3 launches 90 CTAs and costs one wave,
+    # while split=4 (120) and split=6 (180) need two and pay every CTA's fixed cost (prologue,
+    # TME descriptors, pipeline fill/drain, epilogue) twice.
+    # Measured at M=3840 N=24 K=28672, complete data path, single-launch medians with batch medians
+    # in parentheses: split=3 95.94 (93.48) us, split=6 98.44 (96.27) us, split=4 114.28 (111.57) us,
+    # split=2 137.04 (135.34) us. The optimum moves with the tile and with m_blocks, not with a
+    # per-box constant - a shape whose m_blocks divides 96 (M=4096 -> 32 m_blocks -> 96 CTAs, one
+    # full wave) measures the same latency as M=3840 while doing 6.7% more tokens - so this constant
+    # has to be re-measured whenever the prefill tile changes.
+    return 32 if num_tokens <= 64 else 3
 
 
 @mate_api
@@ -116,7 +128,7 @@ def mhc_prenorm_gemm_sqrsum(
         Prenorm backend selector.
     split_k:
         Prenorm backend split-K factor. If omitted, uses ``32`` for decode-like
-        ``M <= 64`` and ``16`` otherwise.
+        ``M <= 64`` and ``3`` otherwise.
     return_partials:
         When true, return tensors with leading split dimension ``[S, M, ...]``.
     """

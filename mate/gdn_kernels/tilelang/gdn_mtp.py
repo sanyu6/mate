@@ -5,6 +5,7 @@ import functools
 import tilelang
 import tilelang.language as T
 import torch
+from mate.execution_context import skip_kernel_launch_if_dry_run
 
 __all__ = [
     "run_gated_delta_rule_mtp_vk_fp32",
@@ -637,17 +638,18 @@ def run_gated_delta_rule_mtp_vk_fp32(
         cache_intermediate_states=cache_intermediate_states,
         **kernel_kwargs,
     )
-    kernel_fn(
-        q,
-        k,
-        v,
-        A_log,
-        a,
-        dt_bias,
-        b,
-        float(scale),
-        state,
-        state_indices_arg,
-        intermediate_arg,
-        output,
-    )
+    if not skip_kernel_launch_if_dry_run():
+        kernel_fn(
+            q,
+            k,
+            v,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            float(scale),
+            state,
+            state_indices_arg,
+            intermediate_arg,
+            output,
+        )

@@ -126,7 +126,7 @@ struct MlaKernelTmeWarpSpecialized {
     MainloopPipelineQKLatent pipeline_qk_latent(pipeline_params_qk_latent,
                                                 reinterpret_cast<uint64_t>(&barrier_storage->PipelineQKLatent));
     PipelineQKLatentState    mainloop_pipe_qk_latent_producer_state =
-        mutlass::make_producer_start_state<MainloopPipelineQKLatent>();
+        mutlass::make_mp31_producer_start_state<MainloopPipelineQKLatent>();
     PipelineQKLatentState mainloop_pipe_qk_latent_consumer_state;
 
     PipelineQKRopeParams pipeline_params_qk_rope;
@@ -137,7 +137,7 @@ struct MlaKernelTmeWarpSpecialized {
     MainloopPipelineQKRope pipeline_qk_rope(pipeline_params_qk_rope,
                                             reinterpret_cast<uint64_t>(&barrier_storage->PipelineQKRope));
     PipelineQKRopeState    mainloop_pipe_qk_rope_producer_state =
-        mutlass::make_producer_start_state<MainloopPipelineQKRope>();
+        mutlass::make_mp31_producer_start_state<MainloopPipelineQKRope>();
     PipelineQKRopeState mainloop_pipe_qk_rope_consumer_state;
 
     NamedBarrier reuse_p(reinterpret_cast<uint64_t>(&barrier_storage->ReuseP));

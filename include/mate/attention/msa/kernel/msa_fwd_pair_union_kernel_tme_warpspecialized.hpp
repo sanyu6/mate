@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <mute/tensor.hpp>
 #include <mutlass/kernel_hardware_info.hpp>
 
@@ -23,14 +24,16 @@ struct MsaFwdPairUnionKernelTmeWarpSpecialized {
 
   using SharedStorage = typename CollectiveMainloop::SharedStorage;
 
-  using BarrierStorage                                 = typename CollectiveMainloop::BarrierStorage;
-  static constexpr int      SmemAlignmentBytes         = CollectiveMainloop::SmemAlignmentBytes;
-  static constexpr int      SharedStorageSize          = sizeof(SharedStorage);
-  static constexpr int      MaxThreadsPerBlock         = CollectiveMainloop::NumThreads;
-  static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
+  using BarrierStorage                    = typename CollectiveMainloop::BarrierStorage;
+  static constexpr int SmemAlignmentBytes = CollectiveMainloop::SmemAlignmentBytes;
+  static constexpr int SharedStorageSize  = sizeof(SharedStorage);
+  static constexpr int MaxThreadsPerBlock = CollectiveMainloop::NumThreads;
+  // Bound register retention while respecting each format's shared storage.
+  static constexpr uint32_t MinBlocksPerMultiprocessor =
+      CollectiveMainloop::IsMP32 ? std::min(5, CollectiveMainloop::SharedMemoryCapacity / SharedStorageSize) : 1;
   static_assert(sizeof(BarrierStorage) + mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount <=
                     mutlass::arch::AsyncBarrier::HardwareMaxNumAsyncTransactionBarriers,
-                "MSA pair-union async barrier id exceeds the MP31 hardware limit.");
+                "MSA pair-union async barrier id exceeds the hardware limit.");
 
   struct Arguments {
     ProblemSize                            problem_size;
@@ -107,7 +110,29 @@ struct MsaFwdPairUnionKernelTmeWarpSpecialized {
           continue;
         }
 
-        if (lane_idx == 0 && warp_idx_in_warp_squad == CollectiveMainloop::KVLoadWarpInProducer) {
+        if constexpr (CollectiveMainloop::IsMP32) {
+          if (warp_idx_in_warp_squad == CollectiveMainloop::KVLoadWarpInProducer) {
+            if (lane_idx == 0) {
+              mainloop.load_q(params.mainloop, pipeline, shared_storage, work_tile);
+            }
+            __syncwarp();
+            int union_count = CollectiveMainloop::build_query_union_cooperative(params.mainloop,
+                                                                                work_tile,
+                                                                                shared_storage.pair_union.blocks,
+                                                                                shared_storage.pair_union.masks,
+                                                                                lane_idx);
+            __syncwarp();
+            if (lane_idx == 0) {
+              shared_storage.pair_union.count = union_count;
+              mainloop.load_kv_union(params.mainloop,
+                                     pipeline,
+                                     shared_storage,
+                                     work_tile,
+                                     shared_storage.pair_union.blocks,
+                                     shared_storage.pair_union.count);
+            }
+          }
+        } else if (lane_idx == 0 && warp_idx_in_warp_squad == CollectiveMainloop::KVLoadWarpInProducer) {
           // Keep Q acquire, metadata construction, and the first K issue in
           // one producer warp.  This gives the next persistent work item a
           // natural lifetime fence: it cannot overwrite pair_union until the

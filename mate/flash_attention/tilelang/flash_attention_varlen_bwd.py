@@ -20,12 +20,55 @@ from ._flash_attention_bwd_post import (
     singleton_k_dv_ws,
     to_tilelang_dtype,
 )
-from ._flash_attention_bwd_split import flashattn_bwd_ws_split
-from ._flash_attention_bwd_split_dkdv import flashattn_bwd_ws_split_dkdv
-from ._flash_attention_bwd_split_dq import flashattn_bwd_ws_split_dq
-from ._flash_attention_bwd_unsplit import flashattn_bwd_ws_unsplit
-from ._flash_attention_bwd_unsplit_dkdv import flashattn_bwd_ws_unsplit_dkdv
-from ._flash_attention_bwd_unsplit_dq import flashattn_bwd_ws_unsplit_dq
+
+
+def _load_mp31_kernel(suffix):
+    # MP32 must reach architecture dispatch without importing MP31 kernels and
+    # their legacy TVM dialect. Python caches each module after its first use.
+    if suffix == "split":
+        from ._flash_attention_bwd_split import flashattn_bwd_ws_split
+
+        return flashattn_bwd_ws_split
+    if suffix == "split_dkdv":
+        from ._flash_attention_bwd_split_dkdv import flashattn_bwd_ws_split_dkdv
+
+        return flashattn_bwd_ws_split_dkdv
+    if suffix == "split_dq":
+        from ._flash_attention_bwd_split_dq import flashattn_bwd_ws_split_dq
+
+        return flashattn_bwd_ws_split_dq
+    if suffix == "unsplit":
+        from ._flash_attention_bwd_unsplit import flashattn_bwd_ws_unsplit
+
+        return flashattn_bwd_ws_unsplit
+    if suffix == "unsplit_dkdv":
+        from ._flash_attention_bwd_unsplit_dkdv import flashattn_bwd_ws_unsplit_dkdv
+
+        return flashattn_bwd_ws_unsplit_dkdv
+    if suffix == "unsplit_dq":
+        from ._flash_attention_bwd_unsplit_dq import flashattn_bwd_ws_unsplit_dq
+
+        return flashattn_bwd_ws_unsplit_dq
+    raise ValueError(f"unknown MP31 backward kernel suffix: {suffix}")
+
+
+def __getattr__(name):
+    # Preserve existing direct kernel imports, including the D128 alias.
+    suffix = name.removeprefix("flashattn_bwd_ws_")
+    if suffix == "unsplit_d128":
+        suffix = "unsplit"
+    if not name.startswith("flashattn_bwd_ws_") or suffix not in (
+        "split",
+        "split_dkdv",
+        "split_dq",
+        "unsplit",
+        "unsplit_dkdv",
+        "unsplit_dq",
+    ):
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    kernel = _load_mp31_kernel(suffix)
+    globals()[name] = kernel
+    return kernel
 
 
 _THREADS = 640
@@ -162,7 +205,7 @@ def _make_unified_bwd_kernel(
     enable_index_type_promotion=False,
 ):
     block_M, block_N = _unified_blocks(plan)
-    jit = flashattn_bwd_ws_split if plan == "split" else flashattn_bwd_ws_unsplit
+    jit = _load_mp31_kernel(plan)
     jit = _jit_for_index_type_promotion(jit, enable_index_type_promotion)
     jit_kwargs = dict(
         dim=dim,
@@ -204,11 +247,11 @@ def _make_separate_bwd_kernel(
 ):
     dkdv_block_M, dkdv_block_N, dq_block_M, dq_block_N = _separate_blocks(plan)
     if plan == "split_separate":
-        dkdv_jit = flashattn_bwd_ws_split_dkdv
-        dq_jit = flashattn_bwd_ws_split_dq
+        dkdv_jit = _load_mp31_kernel("split_dkdv")
+        dq_jit = _load_mp31_kernel("split_dq")
     else:
-        dkdv_jit = flashattn_bwd_ws_unsplit_dkdv
-        dq_jit = flashattn_bwd_ws_unsplit_dq
+        dkdv_jit = _load_mp31_kernel("unsplit_dkdv")
+        dq_jit = _load_mp31_kernel("unsplit_dq")
 
     dkdv_jit = _jit_for_index_type_promotion(dkdv_jit, enable_index_type_promotion)
     dq_jit = _jit_for_index_type_promotion(dq_jit, enable_index_type_promotion)
@@ -379,9 +422,6 @@ def flashattn_bwd_ws(
     return run
 
 
-flashattn_bwd_ws_unsplit_d128 = flashattn_bwd_ws_unsplit
-
-
 def _normalize_window_for_backward(is_causal, window_size, max_seqlen_q, max_seqlen_k):
     if window_size is None:
         window_size = (-1, -1)
@@ -447,6 +487,41 @@ def flashattn_varlen_bwd_interface(
     is_bhsd=False,
     deterministic=False,
 ):
+    from .mp32._flash_attention_fwd_common import _current_musa_cc
+
+    if q.device.type != "musa":
+        raise ValueError("TileLang FlashAttention backward requires MUSA tensors")
+
+    musa_cc = _current_musa_cc(q)
+    if musa_cc == 32:
+        from .mp32 import flashattn_varlen_bwd_interface as mp32_backward
+
+        return mp32_backward(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            softmax_lse,
+            max_seqlen_q,
+            max_seqlen_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            is_causal=is_causal,
+            window_size=window_size,
+            softcap=softcap,
+            smscale=smscale,
+            dtype=dtype,
+            is_bhsd=is_bhsd,
+            deterministic=deterministic,
+        )
+    if musa_cc != 31:
+        raise ValueError(
+            f"TileLang FlashAttention backward supports MP31 or MP32, got MP{musa_cc}"
+        )
+
     is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
     if is_varlen and (cu_seqlens_q is None or cu_seqlens_k is None):
         raise ValueError("cu_seqlens_q and cu_seqlens_k must be provided together")

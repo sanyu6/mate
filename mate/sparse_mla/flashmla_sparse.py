@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import os
 from typing import Callable, Optional, Tuple
 
 import torch
 
+from ..mate_runtime import (
+    MP31_ARCH,
+    get_musa_arch,
+)
+
 from .tilelang.sparse_mla_decode import sparse_mla_decode_fwd
-from .tilelang.sparse_mla_model1_fwd_pack import (
-    sparse_mla_fwd_interface_model1_pack,
+from .tilelang.mp31.sparse_mla_v4_fwd_pack import (
+    sparse_mla_fwd_interface_v4_pack,
 )
 from .tilelang.sparse_mla_prefill import sparse_mla_prefill_fwd
 
@@ -14,7 +20,7 @@ from .tilelang.sparse_mla_prefill import sparse_mla_prefill_fwd
 MetadataGetter = Callable[..., Tuple[torch.Tensor, torch.Tensor]]
 
 
-def _try_model1_seq_pack_sparse_prefill(
+def _try_v4_seq_pack_sparse_prefill(
     *,
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -24,7 +30,12 @@ def _try_model1_seq_pack_sparse_prefill(
     attn_sink: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor],
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Use private MODEL1 seq-pack kernels when the public shape is exact."""
+    """Use private V4 seq-pack kernels when the public shape is exact."""
+    if os.getenv("MATE_ENABLE_V4_SEQ_PACK", "0").lower() not in ("1", "true", "yes"):
+        return None
+    arch = get_musa_arch(q)
+    if arch not in (None, MP31_ARCH):
+        return None
     if d_v != 512 or topk_length is None:
         return None
     if q.ndim != 3 or kv.ndim != 3 or indices.ndim != 3:
@@ -74,7 +85,7 @@ def _try_model1_seq_pack_sparse_prefill(
 
     packed_indices = indices[token_pack - 1 :: token_pack].contiguous()
     packed_topk_length = topk_length[token_pack - 1 :: token_pack].contiguous()
-    return sparse_mla_fwd_interface_model1_pack(
+    return sparse_mla_fwd_interface_v4_pack(
         q=q,
         kv=kv,
         indices=packed_indices,
@@ -100,8 +111,8 @@ def flashmla_sparse_prefill(
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Single FlashMLA sparse-prefill dispatcher for MODEL1 and V3.2."""
-    pack_out = _try_model1_seq_pack_sparse_prefill(
+    """Single FlashMLA sparse-prefill dispatcher for V4 and V3.2."""
+    pack_out = _try_v4_seq_pack_sparse_prefill(
         q=q,
         kv=kv,
         indices=indices,
@@ -139,8 +150,10 @@ def flashmla_sparse_decode(
     tile_scheduler_metadata: Optional[torch.Tensor],
     num_splits: Optional[torch.Tensor],
     metadata_getter: MetadataGetter,
+    q_rope_positions: Optional[torch.Tensor] = None,
+    q_rope_cos_sin: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Single FlashMLA sparse-decode dispatcher for MODEL1 and V3.2."""
+    """Single FlashMLA sparse-decode dispatcher for V4 and V3.2."""
     return sparse_mla_decode_fwd(
         q=q,
         k_cache=k_cache,
@@ -155,4 +168,6 @@ def flashmla_sparse_decode(
         tile_scheduler_metadata=tile_scheduler_metadata,
         num_splits=num_splits,
         metadata_getter=metadata_getter,
+        q_rope_positions=q_rope_positions,
+        q_rope_cos_sin=q_rope_cos_sin,
     )

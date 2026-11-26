@@ -14,6 +14,9 @@ from urllib.parse import urlparse
 
 import requests  # type: ignore[import-untyped]
 
+from .arch import Arch, MP31_ARCH, MP32_ARCH
+
+
 DEFAULT_MUBIN_CACHE_DIR = Path.home() / ".cache" / "mate" / "mubin"
 MATE_MUBIN_DOWNLOAD_VERBOSE_ENV = "MATE_MUBIN_DOWNLOAD_VERBOSE"
 MATE_MUBIN_MODULES = ("gemm", "flash_attention", "flash_mla", "sage_attention")
@@ -62,26 +65,18 @@ class ArtifactRepository:
 class ArtifactPath:
     """Artifactory paths for MATE MUBIN artifact families."""
 
+    # Existing MP31 releases predate architecture-qualified URLs.  Keep these
+    # legacy pins until their payloads are explicitly republished under mp31;
+    # all newly published targets use <family>/<arch>/<commit>.
     GEMM: str = "gemm/fbd1a6df72047350033cb4c524dd8145b8f18698/"
-    FLASH_ATTENTION: str = "flash_attention/fbd1a6df72047350033cb4c524dd8145b8f18698/"
-    FLASH_MLA: str = "flash_mla/fbd1a6df72047350033cb4c524dd8145b8f18698/"
-    SAGE_ATTENTION: str = "sage_attention/fbd1a6df72047350033cb4c524dd8145b8f18698/"
+    FLASH_ATTENTION: str = "flash_attention/c70384e79ef8ba55f3f7ff12830ca1766d5db4c6/"
+    FLASH_MLA: str = "flash_mla/615267cf8e31889221722e80055be37e2b4c2b90/"
+    SAGE_ATTENTION: str = "sage_attention/107d06a04203907f26b03449c13754032593b7bb/"
 
     @classmethod
     @functools.cache
-    def for_module(cls, module: str) -> str:
-        if module == "gemm":
-            return cls.GEMM
-        if module == "flash_attention":
-            return cls.FLASH_ATTENTION
-        if module == "flash_mla":
-            return cls.FLASH_MLA
-        if module == "sage_attention":
-            return cls.SAGE_ATTENTION
-        valid = ", ".join(MATE_MUBIN_MODULES)
-        raise ValueError(
-            f"Unknown MATE MUBIN module '{module}'. Valid choices: {valid}"
-        )
+    def for_module(cls, module: str, arch: Arch = MP31_ARCH) -> str:
+        return get_artifact_target(module, arch).artifact_path
 
     @classmethod
     def iter_module_paths(cls):
@@ -95,28 +90,69 @@ class KernelMapHash:
     KERNEL_MAP_FILE: str = "kernel_map.json"
     GEMM: str = "ea051c7e23e3ea57eb77140c632097392ceae938ecd6ff3c41272b921e6c8844"
     FLASH_ATTENTION: str = (
-        "52b8827226245461715112125d2a59c5b6eda41bec3881c2c07500a627ae0307"
+        "b70e72e54411328c6cbd753f511d7763b3cf7b5d85a52c9cefdb1bc4bdbb5340"
     )
-    FLASH_MLA: str = "9d0fdf71fd6cd11dfa04d4ec15c57279d21c3e3f6e670597b4162c6a339c7d06"
+    FLASH_MLA: str = "875baaee8ec41c09a5ebd4efaed3f1dbc0945be1886e7ea7388d819822ab7a27"
     SAGE_ATTENTION: str = (
-        "50455bbe5328d5a1462dc87ac2b66dbe0ce5537f9d1a4d0a5e479fa265efbfdb"
+        "9369ecee41db0d483a53c5b668df32433cbf8f1a5d6b6c43a330562961685f20"
     )
 
     @classmethod
     @functools.cache
-    def for_module(cls, module: str) -> str:
-        if module == "gemm":
-            return cls.GEMM
-        if module == "flash_attention":
-            return cls.FLASH_ATTENTION
-        if module == "flash_mla":
-            return cls.FLASH_MLA
-        if module == "sage_attention":
-            return cls.SAGE_ATTENTION
-        valid = ", ".join(MATE_MUBIN_MODULES)
-        raise ValueError(
-            f"Unknown MATE MUBIN module '{module}'. Valid choices: {valid}"
+    def for_module(cls, module: str, arch: Arch = MP31_ARCH) -> str:
+        return get_artifact_target(module, arch).kernel_map_sha256
+
+
+@dataclass(frozen=True)
+class ArtifactTarget:
+    """Pinned MUBIN artifact selected by module and device architecture."""
+
+    module: str
+    arch: Arch
+    artifact_path: str
+    kernel_map_sha256: str
+
+    @property
+    def name(self) -> str:
+        return self.module if self.arch == MP31_ARCH else f"{self.module}/{self.arch}"
+
+
+_ARTIFACT_TARGETS_BY_KEY = {
+    (module, MP31_ARCH): ArtifactTarget(
+        module,
+        MP31_ARCH,
+        getattr(ArtifactPath, module.upper()),
+        getattr(KernelMapHash, module.upper()),
+    )
+    for module in MATE_MUBIN_MODULES
+}
+
+_ARTIFACT_TARGETS_BY_KEY[("gemm", MP32_ARCH)] = ArtifactTarget(
+    "gemm",
+    MP32_ARCH,
+    "gemm/mp32/3d43e788f83438a99aa61b341ade7412ca0c8ce8/",
+    "f1b8ae50224469feeb318e5d2b897a5088a89b09cedaa9c42f459c0993b81c88",
+)
+
+
+def get_artifact_target(module: str, arch: Arch = MP31_ARCH) -> ArtifactTarget:
+    try:
+        return _ARTIFACT_TARGETS_BY_KEY[(module, arch)]
+    except KeyError:
+        if module not in MATE_MUBIN_MODULES:
+            valid = ", ".join(MATE_MUBIN_MODULES)
+            raise ValueError(
+                f"Unknown MATE MUBIN module '{module}'. Valid choices: {valid}"
+            ) from None
+        supported = ", ".join(
+            str(target.arch)
+            for target in _ARTIFACT_TARGETS_BY_KEY.values()
+            if target.module == module
         )
+        raise ValueError(
+            f"MATE MUBIN module '{module}' does not support architecture "
+            f"'{arch}'. Supported architectures: {supported}"
+        ) from None
 
 
 @dataclass(frozen=True)
@@ -143,16 +179,22 @@ def get_packaged_mubin_dir():
 
 
 @functools.cache
-def resolve_mubin_module_dir(output_dir, module, artifact_path=None):
+def resolve_mubin_module_dir(output_dir, module, artifact_path=None, arch=MP31_ARCH):
     artifact_path = (
-        ArtifactPath.for_module(module) if artifact_path is None else artifact_path
+        ArtifactPath.for_module(module, arch)
+        if artifact_path is None
+        else artifact_path
     )
     return Path(output_dir) / str(artifact_path).strip("/")
 
 
-def resolve_mubin_artifact_root_from_module_dir(module, module_dir, artifact_path=None):
+def resolve_mubin_artifact_root_from_module_dir(
+    module, module_dir, artifact_path=None, arch=MP31_ARCH
+):
     artifact_path = (
-        ArtifactPath.for_module(module) if artifact_path is None else artifact_path
+        ArtifactPath.for_module(module, arch)
+        if artifact_path is None
+        else artifact_path
     )
     root = Path(module_dir)
     for _part in Path(str(artifact_path).strip("/")).parts:
@@ -292,6 +334,7 @@ def download_mubin_module_artifacts(
     repository=None,
     artifact_path=None,
     kernel_map_sha256=None,
+    arch=MP31_ARCH,
 ):
     downloaded = download_mubin_module_metadata(
         module,
@@ -299,10 +342,14 @@ def download_mubin_module_artifacts(
         repository=repository,
         artifact_path=artifact_path,
         kernel_map_sha256=kernel_map_sha256,
+        arch=arch,
     )
-    module_dir = resolve_mubin_module_dir(output_dir, module, artifact_path)
+    module_dir = resolve_mubin_module_dir(output_dir, module, artifact_path, arch)
     for entry in load_mubin_module_kernel_map(
-        module, module_dir, kernel_map_sha256=kernel_map_sha256
+        module,
+        module_dir,
+        kernel_map_sha256=kernel_map_sha256,
+        arch=arch,
     ):
         downloaded.append(
             ensure_mubin_kernel_artifact(
@@ -312,6 +359,7 @@ def download_mubin_module_artifacts(
                 repository=repository,
                 artifact_path=artifact_path,
                 kernel_map_sha256=kernel_map_sha256,
+                arch=arch,
             )
         )
     return downloaded
@@ -323,29 +371,28 @@ def download_mubin_module_metadata(
     repository=None,
     artifact_path=None,
     kernel_map_sha256=None,
+    arch=MP31_ARCH,
 ):
     repository = ArtifactRepository.resolve(repository)
-    artifact_path = (
-        ArtifactPath.for_module(module) if artifact_path is None else artifact_path
-    )
+    target = get_artifact_target(module, arch)
+    artifact_path = target.artifact_path if artifact_path is None else artifact_path
     expected_hash = (
-        KernelMapHash.for_module(module)
-        if kernel_map_sha256 is None
-        else kernel_map_sha256
+        target.kernel_map_sha256 if kernel_map_sha256 is None else kernel_map_sha256
     )
-    module_dir = resolve_mubin_module_dir(output_dir, module, artifact_path)
+    module_dir = resolve_mubin_module_dir(output_dir, module, artifact_path, arch)
     destination = module_dir / KernelMapHash.KERNEL_MAP_FILE
     source = repository.url(
         f"{str(artifact_path).strip('/')}/{KernelMapHash.KERNEL_MAP_FILE}"
     )
     if not download_file(source, destination):
-        raise RuntimeError(f"Failed to download kernel map for MATE MUBIN {module}")
+        raise RuntimeError(
+            f"Failed to download kernel map for MATE MUBIN {target.name}"
+        )
     verify_mubin_module_metadata.cache_clear()
     if (
-        not os.getenv("MATE_MUBIN_VERIFY_DISABLED")
-        and sha256_file(destination) != expected_hash
-    ):
-        raise RuntimeError(f"Kernel map hash mismatch for MATE MUBIN {module}")
+        arch == MP32_ARCH or not os.getenv("MATE_MUBIN_VERIFY_DISABLED")
+    ) and sha256_file(destination) != expected_hash:
+        raise RuntimeError(f"Kernel map hash mismatch for MATE MUBIN {target.name}")
     return [destination]
 
 
@@ -355,6 +402,7 @@ def download_mubin_module_runtime_artifacts(
     repository=None,
     artifact_path=None,
     kernel_map_sha256=None,
+    arch=MP31_ARCH,
 ):
     """Compatibility alias for metadata-only module bootstrap downloads."""
     return download_mubin_module_metadata(
@@ -363,42 +411,52 @@ def download_mubin_module_runtime_artifacts(
         repository=repository,
         artifact_path=artifact_path,
         kernel_map_sha256=kernel_map_sha256,
+        arch=arch,
     )
 
 
 @functools.cache
-def verify_mubin_module_metadata(module, module_dir, kernel_map_sha256=None):
+def verify_mubin_module_metadata(
+    module, module_dir, kernel_map_sha256=None, arch=MP31_ARCH
+):
     module_dir = Path(module_dir)
     expected_hash = (
-        KernelMapHash.for_module(module)
+        KernelMapHash.for_module(module, arch)
         if kernel_map_sha256 is None
         else kernel_map_sha256
     )
     kernel_map_path = module_dir / KernelMapHash.KERNEL_MAP_FILE
     if not kernel_map_path.is_file():
         return False
-    if (
-        not os.getenv("MATE_MUBIN_VERIFY_DISABLED")
+    return not (
+        (arch == MP32_ARCH or not os.getenv("MATE_MUBIN_VERIFY_DISABLED"))
         and sha256_file(kernel_map_path) != expected_hash
-    ):
-        return False
-    return True
+    )
 
 
-def load_mubin_module_kernel_map(module, module_dir, kernel_map_sha256=None):
-    if not verify_mubin_module_metadata(module, module_dir, kernel_map_sha256):
-        raise RuntimeError(f"MATE MUBIN kernel map for {module} failed verification")
+def load_mubin_module_kernel_map(
+    module, module_dir, kernel_map_sha256=None, arch=MP31_ARCH
+):
+    if not verify_mubin_module_metadata(module, module_dir, kernel_map_sha256, arch):
+        raise RuntimeError(
+            f"MATE MUBIN kernel map for {module}/{arch} failed verification"
+        )
     return load_kernel_map(Path(module_dir) / KernelMapHash.KERNEL_MAP_FILE)
 
 
-def verify_mubin_module_artifacts(module, module_dir, kernel_map_sha256=None):
+def verify_mubin_module_artifacts(
+    module, module_dir, kernel_map_sha256=None, arch=MP31_ARCH
+):
     try:
         entries = load_mubin_module_kernel_map(
-            module, module_dir, kernel_map_sha256=kernel_map_sha256
+            module,
+            module_dir,
+            kernel_map_sha256=kernel_map_sha256,
+            arch=arch,
         )
     except RuntimeError:
         return False
-    verify_disabled = os.getenv("MATE_MUBIN_VERIFY_DISABLED")
+    verify_disabled = arch != MP32_ARCH and os.getenv("MATE_MUBIN_VERIFY_DISABLED")
     for entry in entries:
         path = Path(module_dir) / "mubin" / entry.file_name
         if not path.is_file():
@@ -408,13 +466,34 @@ def verify_mubin_module_artifacts(module, module_dir, kernel_map_sha256=None):
     return True
 
 
-def verify_mubin_module_runtime_artifacts(module, module_dir, kernel_map_sha256=None):
+def verify_mubin_module_runtime_artifacts(
+    module, module_dir, kernel_map_sha256=None, arch=MP31_ARCH
+):
     """Compatibility alias for metadata-only module verification."""
     return verify_mubin_module_metadata(
         module,
         module_dir,
         kernel_map_sha256=kernel_map_sha256,
+        arch=arch,
     )
+
+
+def _require_packaged_mubin_metadata(
+    target: ArtifactTarget,
+    module_dir: Path,
+    kernel_map_sha256: str,
+) -> None:
+    kernel_map_path = module_dir / KernelMapHash.KERNEL_MAP_FILE
+    if not kernel_map_path.is_file():
+        raise RuntimeError(
+            f"Installed mate-mubin package is missing {target.name} metadata: "
+            f"{kernel_map_path}"
+        )
+    if sha256_file(kernel_map_path) != kernel_map_sha256:
+        raise RuntimeError(
+            f"Installed mate-mubin package contains corrupt {target.name} "
+            f"metadata: {kernel_map_path}"
+        )
 
 
 def ensure_mubin_kernel_artifact(
@@ -424,46 +503,63 @@ def ensure_mubin_kernel_artifact(
     repository=None,
     artifact_path=None,
     kernel_map_sha256=None,
+    arch=MP31_ARCH,
 ):
-    artifact_path = (
-        ArtifactPath.for_module(module) if artifact_path is None else artifact_path
+    target = get_artifact_target(module, arch)
+    artifact_path = target.artifact_path if artifact_path is None else artifact_path
+    expected_map_hash = (
+        target.kernel_map_sha256 if kernel_map_sha256 is None else kernel_map_sha256
     )
     module_dir = Path(module_dir)
     artifact_rel = resolve_mubin_artifact_path(entry.file_name)
     destination = module_dir / artifact_rel
     packaged_mubin_dir = get_packaged_mubin_dir()
-    if (
+    is_packaged_module = (
         packaged_mubin_dir is not None
         and module_dir.resolve().is_relative_to(packaged_mubin_dir.resolve())
-        and destination.is_file()
-    ):
+    )
+    if is_packaged_module and arch == MP31_ARCH and destination.is_file():
+        return destination
+    if is_packaged_module and arch == MP32_ARCH:
+        _require_packaged_mubin_metadata(target, module_dir, expected_map_hash)
+        if not destination.is_file():
+            raise RuntimeError(
+                f"Installed mate-mubin package is missing {target.name} artifact: "
+                f"{entry.file_name}"
+            )
+        if sha256_file(destination) != entry.file_hash:
+            raise RuntimeError(
+                f"Installed mate-mubin package contains corrupt {target.name} "
+                f"artifact: {entry.file_name}"
+            )
         return destination
 
     mubin_root = resolve_mubin_artifact_root_from_module_dir(
-        module, module_dir, artifact_path
+        module, module_dir, artifact_path, arch
     )
-    if not verify_mubin_module_metadata(module, module_dir, kernel_map_sha256):
+    if not verify_mubin_module_metadata(module, module_dir, expected_map_hash, arch):
         if os.getenv("MATE_MUBIN_NO_DOWNLOAD"):
             raise RuntimeError(
-                f"MATE MUBIN metadata for {module} is not available locally"
+                f"MATE MUBIN metadata for {target.name} is not available locally"
             )
         download_mubin_module_metadata(
             module,
             mubin_root,
             repository=repository,
             artifact_path=artifact_path,
-            kernel_map_sha256=kernel_map_sha256,
+            kernel_map_sha256=expected_map_hash,
+            arch=arch,
         )
 
-    verify_disabled = os.getenv("MATE_MUBIN_VERIFY_DISABLED")
+    verify_disabled = arch != MP32_ARCH and os.getenv("MATE_MUBIN_VERIFY_DISABLED")
     verbose = _env_flag_enabled(MATE_MUBIN_DOWNLOAD_VERBOSE_ENV)
     if destination.is_file():
         if verify_disabled or sha256_file(destination) == entry.file_hash:
             if verbose:
-                print(f"Using local MATE MUBIN kernel for {module}: {destination}")
+                print(f"Using local MATE MUBIN kernel for {target.name}: {destination}")
             return destination
         if verbose:
-            print(f"Refreshing MATE MUBIN kernel for {module}: {destination}")
+            print(f"Refreshing MATE MUBIN kernel for {target.name}: {destination}")
 
     if os.getenv("MATE_MUBIN_NO_DOWNLOAD"):
         raise RuntimeError(
@@ -471,7 +567,7 @@ def ensure_mubin_kernel_artifact(
         )
 
     if verbose:
-        print(f"Downloading MATE MUBIN kernel for {module}: {entry.file_name}")
+        print(f"Downloading MATE MUBIN kernel for {target.name}: {entry.file_name}")
     repository = ArtifactRepository.resolve(repository)
     source_path = f"{str(artifact_path).strip('/')}/{artifact_rel.as_posix()}"
     if not download_file(repository.url(source_path), destination):
@@ -482,37 +578,57 @@ def ensure_mubin_kernel_artifact(
 
 
 @functools.cache
-def ensure_mubin_module_artifacts(module, cache_dir=None, repository=None):
+def ensure_mubin_module_artifacts(
+    module, cache_dir=None, repository=None, arch=MP31_ARCH
+):
     """Ensure module metadata; kernels are downloaded lazily."""
 
     verbose = _env_flag_enabled(MATE_MUBIN_DOWNLOAD_VERBOSE_ENV)
+    target = get_artifact_target(module, arch)
     packaged_mubin_dir = get_packaged_mubin_dir()
     if packaged_mubin_dir is not None:
         packaged_mubin_dir = packaged_mubin_dir.resolve()
-        module_dir = resolve_mubin_module_dir(packaged_mubin_dir, module)
+        module_dir = resolve_mubin_module_dir(
+            packaged_mubin_dir, module, target.artifact_path, arch
+        )
+        if arch == MP32_ARCH:
+            _require_packaged_mubin_metadata(
+                target, module_dir, target.kernel_map_sha256
+            )
         if verbose:
-            print(f"Using installed mate-mubin artifacts for {module}: {module_dir}")
+            print(
+                f"Using installed mate-mubin artifacts for {target.name}: {module_dir}"
+            )
         return module_dir
 
     cache_root = resolve_mubin_output_dir(cache_dir)
-    module_dir = resolve_mubin_module_dir(cache_root, module)
-    if verify_mubin_module_metadata(module, module_dir):
+    module_dir = resolve_mubin_module_dir(
+        cache_root, module, target.artifact_path, arch
+    )
+    if verify_mubin_module_metadata(module, module_dir, target.kernel_map_sha256, arch):
         if verbose:
-            print(f"Using local MATE MUBIN metadata for {module}: {module_dir}")
+            print(f"Using local MATE MUBIN metadata for {target.name}: {module_dir}")
         return module_dir
 
     if os.getenv("MATE_MUBIN_NO_DOWNLOAD"):
         if verbose:
-            print(f"MATE MUBIN artifacts for {module} are not available locally")
+            print(f"MATE MUBIN artifacts for {target.name} are not available locally")
         raise RuntimeError(
-            f"MATE MUBIN artifacts for {module} are not available locally"
+            f"MATE MUBIN artifacts for {target.name} are not available locally"
         )
 
     if verbose:
-        print(f"Downloading MATE MUBIN metadata for {module} into {cache_root}")
-    download_mubin_module_metadata(module, cache_root, repository=repository)
+        print(f"Downloading MATE MUBIN metadata for {target.name} into {cache_root}")
+    download_mubin_module_metadata(
+        module,
+        cache_root,
+        repository=repository,
+        artifact_path=target.artifact_path,
+        kernel_map_sha256=target.kernel_map_sha256,
+        arch=arch,
+    )
     if verbose:
-        print(f"Using downloaded MATE MUBIN metadata for {module}: {module_dir}")
+        print(f"Using downloaded MATE MUBIN metadata for {target.name}: {module_dir}")
     return module_dir
 
 

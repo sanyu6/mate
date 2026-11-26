@@ -13,7 +13,7 @@ namespace mate::attention::msa {
 // {q_work_begin, q_work_length}.  Partition ownership is derived by the main
 // scheduler from the one-dimensional CTA slot, so this kernel does not need to
 // know about the KV layout, element type, or MMA pipeline.
-template <class TileShape_, int HeadRatio_, bool ParallelKTiles_, bool IsVarlen_, bool IsCausal_>
+template <class TileShape_, int HeadRatio_, bool ParallelKTiles_, bool IsVarlen_, bool IsCausal_, int CtasPerMp_ = 3>
 struct MsaMaxScoreMetadataKernel {
   using TileShape = TileShape_;
 
@@ -42,7 +42,7 @@ struct MsaMaxScoreMetadataKernel {
     const int     work_per_batch    = q_tiles * num_kv_heads;
     const int     batch_idx         = q_work_idx / work_per_batch;
     const int     rem               = q_work_idx - batch_idx * work_per_batch;
-    const int     q_tile_idx        = rem / num_kv_heads;
+    const int     q_tile_idx        = rem % q_tiles;
     const int     q_len             = IsVarlen ? cu_seqlens_q[batch_idx + 1] - cu_seqlens_q[batch_idx] : max_seqlen_q;
     const int     kv_len            = IsVarlen ? cu_seqlens_k[batch_idx + 1] - cu_seqlens_k[batch_idx] : max_seqlen_k;
     const int     q_local_begin     = q_tile_idx * q_tokens_per_tile;
@@ -84,7 +84,7 @@ struct MsaMaxScoreMetadataKernel {
     }
 
     const int     k_tiles       = (max_seqlen_k + TileKV - 1) / TileKV;
-    constexpr int ctas_per_mp   = ParallelKTiles ? 3 : 1;
+    constexpr int ctas_per_mp   = ParallelKTiles ? CtasPerMp_ : 1;
     const int     target_ctas   = num_mps * ctas_per_mp;
     const int     q_works       = q_work_count > 0 ? q_work_count : 1;
     const int     k_partitions0 = (target_ctas + q_works / 2) / q_works;

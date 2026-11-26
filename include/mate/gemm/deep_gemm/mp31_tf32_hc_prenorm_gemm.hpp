@@ -5,9 +5,8 @@
 
 #include <mute/tensor.hpp>
 #include <mutlass/gemm/collective/collective_builder.hpp>
-#include <mutlass/pipeline/mp31_pipeline.hpp>
+#include <mutlass/pipeline/pipeline.hpp>
 
-#include "../../attention/fmha/pipeline_ws.hpp"
 #include "../../common/mma_mp31_sqmma.hpp"
 
 namespace mutlass {
@@ -168,8 +167,8 @@ struct Mp31Tf32HcPrenormGemm {
   static constexpr int      SmemAlignmentBytes         = 256;
 
   static constexpr uint32_t BarRatio = 4;
-  using PipelineMain                 = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<kStages, BarRatio>;
-  using PipelineCast                 = mutlass::Mp31PipelineAsyncWarpSpecialized<kStages, BarRatio>;
+  using PipelineMain                 = mutlass::Mp31PipelineTmeAsync<kStages, BarRatio>;
+  using PipelineCast                 = mutlass::Mp31PipelineAsync<kStages, BarRatio>;
   using PipelineState                = typename PipelineMain::PipelineState;
   using PipelineCastState            = typename PipelineCast::PipelineState;
 
@@ -314,9 +313,9 @@ struct Mp31Tf32HcPrenormGemm {
     Tensor mB        = params.tme_b.get_tme_tensor(make_shape(params.n, params.k));
     Tensor gB_full   = local_tile(mB, make_shape(Int<BlockN>{}, Int<BlockK>{}), make_coord(_, _));
 
-    PipelineState     pipe_write = mutlass::make_producer_start_state_warpspecialized<PipelineMain>();
+    PipelineState     pipe_write = mutlass::make_mp31_producer_start_state<PipelineMain>();
     PipelineState     pipe_read;
-    PipelineCastState pipe_cast_write = mutlass::make_producer_start_state_warpspecialized<PipelineCast>();
+    PipelineCastState pipe_cast_write = mutlass::make_mp31_producer_start_state<PipelineCast>();
     PipelineCastState pipe_cast_read;
 
     __syncthreads();

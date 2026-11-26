@@ -153,6 +153,8 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    q_rope_positions: Optional[torch.Tensor] = None,
+    q_rope_cos_sin: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     sched_meta = tile_scheduler_metadata
     if not isinstance(sched_meta, FlashMLASchedMeta):
@@ -232,6 +234,8 @@ def flash_mla_with_kvcache(
         extra_indices_in_kvcache=extra_indices_in_kvcache,
         topk_length=topk_length,
         extra_topk_length=extra_topk_length,
+        q_rope_positions=q_rope_positions,
+        q_rope_cos_sin=q_rope_cos_sin,
     )
 
 

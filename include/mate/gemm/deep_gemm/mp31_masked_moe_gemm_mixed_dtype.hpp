@@ -4,16 +4,16 @@
 #include <mutlass/bfloat16.h>
 #include <mutlass/float8.h>
 #include <mutlass/mutlass.h>
+#include <mutlass/numeric_conversion.h>
 
 #include <cstdint>
 #include <mute/algorithm/clear.hpp>
 #include <mute/atom/copy_atom.hpp>
 #include <mute/tensor.hpp>
 #include <mutlass/gemm/collective/collective_builder.hpp>
+#include <mutlass/pipeline/pipeline.hpp>
 
-#include "mate/attention/fmha/pipeline_ws.hpp"
 #include "mate/common/mma_mp31_sqmma.hpp"
-#include "mate/common/numeric_conversion.hpp"
 #include "mate/gemm/deep_gemm/gemm_type.hpp"
 #include "mate/gemm/deep_gemm/mp31_scheduler.hpp"
 
@@ -105,12 +105,12 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
   static constexpr TME::CacheHint TmeScaleBInnerHint = TME::CacheHint::CACHE_NORMAL;
   static constexpr TME::CacheHint TmeScaleBOuterHint = TME::CacheHint::CACHE_PERSIST;
 
-  using TME_A = decltype(make_tme_copy<TmeAInnerHint, TmeAOuterHint>(
+  using TME_A = decltype(make_tme_copy<void, TmeAInnerHint, TmeAOuterHint>(
       MP31_TME_LOAD{},
       make_tensor(make_gmem_ptr(static_cast<ElementA const*>(nullptr)), repeat_like(StrideA{}, int64_t(0)), StrideA{}),
       take<0, 2>(SmemLayoutA{})));
 
-  using TME_B = decltype(make_tme_copy<TmeBInnerHint, TmeBOuterHint, uint8_t>(
+  using TME_B = decltype(make_tme_copy<uint8_t, TmeBInnerHint, TmeBOuterHint>(
       MP31_TME_LOAD{},
       make_tensor(make_gmem_ptr<ElementB>(nullptr), repeat_like(StrideB{}, int64_t(0)), StrideB{}),
       take<0, 2>(SmemLayoutB{}),
@@ -134,14 +134,13 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
                 "The MMA thread layout must cover both consumer warp squads");
 
   static constexpr int MaxBarriersPerStage = 2;
-  using PipelineBarrierRatio =
-      mutlass::Mp31PipelineWarpSpecializedBarrierRatio<MaxBarriersPerStage, 0, Stages, Stages, Stages>;
+  using PipelineBarrierRatio = mutlass::Mp31PipelineBarrierRatio<MaxBarriersPerStage, 0, Stages, Stages, Stages>;
   static constexpr int BarriersPerStage = PipelineBarrierRatio::value;
   static_assert(BarriersPerStage > 0, "A, B, cast, and Scale-B pipelines exceed the MP31 async-barrier budget");
 
-  using PipelineLoadA       = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<Stages, BarriersPerStage>;
-  using PipelineLoadB       = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<Stages, BarriersPerStage>;
-  using PipelineCastA       = mutlass::Mp31PipelineAsyncWarpSpecialized<Stages, BarriersPerStage>;
+  using PipelineLoadA       = mutlass::Mp31PipelineTmeAsync<Stages, BarriersPerStage>;
+  using PipelineLoadB       = mutlass::Mp31PipelineTmeAsync<Stages, BarriersPerStage>;
+  using PipelineCastA       = mutlass::Mp31PipelineAsync<Stages, BarriersPerStage>;
   using PipelineLoadAParams = typename PipelineLoadA::Params;
   using PipelineLoadBParams = typename PipelineLoadB::Params;
   using PipelineCastAParams = typename PipelineCastA::Params;
@@ -159,7 +158,7 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
                                                                     Stride<_1, Int<BlockM>, Int<BlockM * TmeScaleAKBlocks>>>,
                                                              Layout<Shape<Int<BlockM>, Int<TmeScaleAKBlocks>, Int<Stages>>,
                                                                     Stride<Int<TmeScaleAKBlocks>, _1, Int<BlockM * TmeScaleAKBlocks>>>>;
-  using TME_ScaleA                           = decltype(make_tme_copy<TmeScaleAInnerHint, TmeScaleAOuterHint>(
+  using TME_ScaleA                           = decltype(make_tme_copy<void, TmeScaleAInnerHint, TmeScaleAOuterHint>(
       MP31_TME_LOAD{},
       make_tensor(make_gmem_ptr(static_cast<ElementScaleA const*>(nullptr)),
                   make_shape(int64_t{}, int64_t{}, int64_t{}),
@@ -168,7 +167,7 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
       make_shape(Int<BlockM>{}, Int<TmeScaleAKBlocks>{})));
   using SmemLayoutScaleB                     = Layout<Shape<Int<BlockN>, Int<TmeScaleKBlocks>, Int<Stages>>,
                                                       Stride<Int<TmeScaleKBlocks>, _1, Int<BlockN * TmeScaleKBlocks>>>;
-  using TME_ScaleB                           = decltype(make_tme_copy<TmeScaleBInnerHint, TmeScaleBOuterHint>(
+  using TME_ScaleB                           = decltype(make_tme_copy<void, TmeScaleBInnerHint, TmeScaleBOuterHint>(
       MP31_TME_LOAD{},
       make_tensor(make_gmem_ptr(static_cast<ElementScaleB const*>(nullptr)),
                   make_shape(int64_t{}, int64_t{}, int64_t{}),
@@ -255,23 +254,23 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
     const int scale_k_blocks   = k_blocks * ScaleBlocksPerTile;
 
     auto  gA    = make_tensor(make_gmem_ptr(args.ptr_a), make_shape(args.m, args.k, args.num_groups), args.stride_a);
-    TME_A tme_a = make_tme_copy<TmeAInnerHint, TmeAOuterHint>(MP31_TME_LOAD{}, gA, take<0, 2>(SmemLayoutA{}));
+    TME_A tme_a = make_tme_copy<void, TmeAInnerHint, TmeAOuterHint>(MP31_TME_LOAD{}, gA, take<0, 2>(SmemLayoutA{}));
 
     auto  gB    = make_tensor(make_gmem_ptr<ElementB>(static_cast<void const*>(args.ptr_b)),
                           make_shape(args.n, args.k, args.num_groups),
                           args.stride_b);
-    TME_B tme_b = make_tme_copy<TmeBInnerHint, TmeBOuterHint, uint8_t>(
+    TME_B tme_b = make_tme_copy<uint8_t, TmeBInnerHint, TmeBOuterHint>(
         MP31_TME_LOAD{}, gB, take<0, 2>(SmemLayoutB{}), make_shape(Int<BlockN>{}, Int<BlockK>{}));
 
     auto scale_a_layout = make_layout(make_shape(args.m, scale_a_k_blocks, args.num_groups), args.stride_scale_a);
     RobustDescriptor desc_scale_a = make_robust_desc(args.ptr_scale_a, static_cast<size_t>(cosize(scale_a_layout)));
     auto             gScaleA      = make_tensor(make_gmem_ptr(args.ptr_scale_a), scale_a_layout);
-    TME_ScaleA       tme_scale_a  = make_tme_copy<TmeScaleAInnerHint, TmeScaleAOuterHint>(
+    TME_ScaleA       tme_scale_a  = make_tme_copy<void, TmeScaleAInnerHint, TmeScaleAOuterHint>(
         MP31_TME_LOAD{}, gScaleA, take<0, 2>(SmemLayoutScaleA{}), make_shape(Int<BlockM>{}, Int<TmeScaleAKBlocks>{}));
 
     auto       scale_b_layout = make_layout(make_shape(args.n, scale_k_blocks, args.num_groups), args.stride_scale_b);
     auto       gScaleB        = make_tensor(make_gmem_ptr(args.ptr_scale_b), scale_b_layout);
-    TME_ScaleB tme_scale_b    = make_tme_copy<TmeScaleBInnerHint, TmeScaleBOuterHint>(
+    TME_ScaleB tme_scale_b    = make_tme_copy<void, TmeScaleBInnerHint, TmeScaleBOuterHint>(
         MP31_TME_LOAD{}, gScaleB, take<0, 2>(SmemLayoutScaleB{}), make_shape(Int<BlockN>{}, Int<TmeScaleKBlocks>{}));
 
     return Params{
@@ -749,9 +748,9 @@ struct Mp31MixedDtypeMaskedMoeGEMMS4FP8 {
     const int  consumer_thread_idx =
         (squad_idx - FirstConsumerSquad) * int(NumThreadsPerWarpSquad) + thread_idx_in_squad;
 
-    PipelineLoadAState pipe_a_write      = mutlass::make_producer_start_state_warpspecialized<PipelineLoadA>();
-    PipelineLoadBState pipe_b_write      = mutlass::make_producer_start_state_warpspecialized<PipelineLoadB>();
-    PipelineCastAState pipe_cast_a_write = mutlass::make_producer_start_state_warpspecialized<PipelineCastA>();
+    PipelineLoadAState pipe_a_write      = mutlass::make_mp31_producer_start_state<PipelineLoadA>();
+    PipelineLoadBState pipe_b_write      = mutlass::make_mp31_producer_start_state<PipelineLoadB>();
+    PipelineCastAState pipe_cast_a_write = mutlass::make_mp31_producer_start_state<PipelineCastA>();
 
     Scheduler scheduler(static_cast<uint32_t>(params.m),
                         static_cast<uint32_t>(params.n),

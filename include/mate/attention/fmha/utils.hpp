@@ -10,6 +10,40 @@ namespace mate::attention::fmha {
 
 using namespace mute;
 
+// AppendKV reuses MMA consumer threads to copy KNew/VNew into the KV cache. A valid
+// tiled copy requires the rows covered by participating threads to divide TileRows.
+// Select the largest prefix of whole consumer groups satisfying this constraint, and
+// expose matching group/thread counts so the copy and its pipeline barriers agree.
+template <int TileRows_, int MaxThreadGroups_, int ThreadsPerGroup_, int ThreadsPerRow_>
+struct AppendKVCopyPolicy {
+  static constexpr int TileRows        = TileRows_;
+  static constexpr int MaxThreadGroups = MaxThreadGroups_;
+  static constexpr int ThreadsPerGroup = ThreadsPerGroup_;
+  static constexpr int ThreadsPerRow   = ThreadsPerRow_;
+
+  static_assert(TileRows > 0);
+  static_assert(MaxThreadGroups > 0);
+  static_assert(ThreadsPerGroup > 0);
+  static_assert(ThreadsPerRow > 0);
+
+  static constexpr int select_thread_groups() {
+    for (int groups = MaxThreadGroups; groups > 0; --groups) {
+      int const threads = groups * ThreadsPerGroup;
+      if (threads % ThreadsPerRow == 0 && TileRows % (threads / ThreadsPerRow) == 0) {
+        return groups;
+      }
+    }
+    return 0;
+  }
+
+  static constexpr int NumThreadGroups = select_thread_groups();
+  static_assert(NumThreadGroups > 0, "No valid thread group count for the AppendKV copy layout");
+
+  static constexpr int NumThreads = NumThreadGroups * ThreadsPerGroup;
+  static constexpr int NumRows    = NumThreads / ThreadsPerRow;
+  static_assert(TileRows % NumRows == 0, "AppendKV copy rows must divide the tile row extent");
+};
+
 template <class Threshold, class Source, class Reference>
 MUTE_HOST_DEVICE constexpr auto layout_separate(Threshold const& thr, Source const& src, Reference const& ref) {
   auto lt = filter(transform_layout(src, ref, [&](auto const& s, auto const& r) {
@@ -74,11 +108,16 @@ MUTE_DEVICE void convert_type(Tensor<EngineSrc, Layout> const& src, Tensor<Engin
   using DstType = typename EngineDst::value_type;
 
   static constexpr int FragmentSize = [&] {
+#if defined(MATE_FMHA_WORKAROUND_BST_OVERLAP)
+    // Older MCC versions can assign partially overlapping registers to BST operands.
+    return 1;
+#else
     if constexpr (FragmentSize_ > 0) {
       return FragmentSize_;
     } else {
       return sizeof(SrcType) > sizeof(DstType) ? sizeof(SrcType) / sizeof(DstType) : sizeof(DstType) / sizeof(SrcType);
     }
+#endif
   }();
 
   static_assert(MUTE_STATIC_V(size(src)) % FragmentSize == 0, "Fragment size does not vectorize properly");

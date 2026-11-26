@@ -3,9 +3,14 @@ from typing import Optional, Tuple, Union
 import torch
 
 from mate.api_logging import mate_api
+from mate.arch import MP32_ARCH
 from mate.gdn_kernels.tilelang.gdn_kkt_solve import kkt_solve
 from mate.gdn_kernels.tilelang.gdn_l2norm import gdn_l2norm_
-from mate.gdn_kernels.tilelang.gdn_prefill import fused_chunk_gdn_prefill
+from mate.gdn_kernels.tilelang.mp31.gdn_prefill import fused_chunk_gdn_prefill
+from mate.gdn_kernels.tilelang.mp32.gdn_prefill import (
+    fused_chunk_gdn_prefill as fused_chunk_gdn_prefill_mp32,
+)
+from mate.mate_runtime import get_arch
 
 
 @mate_api
@@ -24,7 +29,12 @@ def chunk_gated_delta_rule(
     is_log_space: bool = True,
     output: Optional[torch.Tensor] = None,
     output_state: Optional[torch.Tensor] = None,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    checkpoint_every_n_tokens: int = 0,
+) -> Union[
+    torch.Tensor,
+    Tuple[torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor],
+]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
     This implements the gated delta rule linear attention mechanism for efficient
@@ -64,8 +74,10 @@ def chunk_gated_delta_rule(
             Cumulative sequence lengths of shape ``[num_seqs + 1]``, int64.
             Required for variable-length sequences (varlen mode).
         use_qk_l2norm_in_kernel (bool):
-            Whether to L2-normalize Q and K in-place with the TileLang
-            normalization kernel before KKT/prefill. Default: ``False``.
+            Whether to L2-normalize Q and K. On MP31 this runs the TileLang
+            normalization kernel in-place before KKT/prefill; on MP32 it is folded
+            into the fused prefill kernel and Q/K are left untouched.
+            Default: ``False``.
         is_log_space (bool):
             Whether ``g`` is already in log space. Default: ``True``.
         output (Optional[torch.Tensor]):
@@ -76,6 +88,13 @@ def chunk_gated_delta_rule(
             Pre-allocated output state tensor of shape
             ``[num_seqs, num_sab_heads, head_size, head_size]``, float32.
             Required if ``output_final_state=True``. Default: ``None``.
+        checkpoint_every_n_tokens (int):
+            Also store the state every ``N`` tokens, following the cuDNN frontend
+            GDN op. ``0`` disables it; otherwise it must be a positive multiple of
+            ``chunk_size``. Each sequence stores the state *before* its tokens
+            ``0, N, 2N, ...`` (the first row is the initial state; the final state
+            is not repeated), ``ceil(seq_len / N)`` rows per sequence packed back to
+            back. MP32 only. Default: ``0``.
 
     Returns:
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -83,6 +102,15 @@ def chunk_gated_delta_rule(
               ``[total_seq_len, num_o_heads, head_size]``.
             - If ``output_final_state=True``: Returns tuple of (output, final_state) where
               final_state has shape ``[num_seqs, num_sab_heads, head_size, head_size]``.
+            - If ``checkpoint_every_n_tokens > 0``: Returns
+              ``(output, final_state, state_checkpoints)`` (``final_state`` is None
+              unless ``output_final_state=True``). ``state_checkpoints`` has the
+              q/k/v dtype and shape ``[rows, num_sab_heads, head_size, head_size]``
+              (k-last, like ``final_state``) with
+              ``rows = max(total_seq_len // N + num_seqs, 1)`` for varlen inputs
+              (an upper bound, so ``cu_seqlens`` is never read on the host; trailing
+              rows are left unwritten) and ``batch_size * ceil(seq_len / N)``
+              otherwise.
 
     Note:
         - Supports:
@@ -152,15 +180,51 @@ def chunk_gated_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    if use_qk_l2norm_in_kernel:
-        gdn_l2norm_(q)
-        gdn_l2norm_(k)
+    if checkpoint_every_n_tokens and get_arch(q.device) != MP32_ARCH:
+        raise NotImplementedError(
+            "checkpoint_every_n_tokens is only implemented by the MP32 kernel."
+        )
 
-    A = kkt_solve(
-        k=k,
-        b=beta,
-        cu_seqlens=cu_seqlens,
-    )
+    if get_arch(q.device) == MP32_ARCH:
+        # kkt_solve and the q/k L2 normalization are fused into the MP32 kernel.
+        o, state_checkpoints, final_state = fused_chunk_gdn_prefill_mp32(
+            q=q,
+            k=k,
+            v=v,
+            a=None,
+            g=g,
+            b=beta,
+            output=output,
+            output_state=output_state,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            output_o=True,
+            cu_seqlens=cu_seqlens,
+            is_log_space=is_log_space,
+            l2norm_eps=1e-6 if use_qk_l2norm_in_kernel else None,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        )
+        o = o.to(q.dtype)
+        if squeeze_varlen_output:
+            o = o.squeeze(0)
+        if checkpoint_every_n_tokens:
+            return o, final_state, state_checkpoints
+        return o, final_state
+
+    # An input without tokens launches nothing: the prefill entry below only passes
+    # the initial state through (decided from the shape, no host read of cu_seqlens).
+    A = None
+    if k.shape[1] > 0:
+        if use_qk_l2norm_in_kernel:
+            gdn_l2norm_(q)
+            gdn_l2norm_(k)
+
+        A = kkt_solve(
+            k=k,
+            b=beta,
+            cu_seqlens=cu_seqlens,
+        )
 
     o, _, final_state = fused_chunk_gdn_prefill(
         q=q,

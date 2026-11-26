@@ -7,7 +7,13 @@
 
 #include "mate/attention/fmha/fmha.hpp"
 #include "mate/attention/fmha/fmha_fwd_kernel.hpp"
+{% if cc == 31 %}
 #include "mate/attention/fmha/mp31_fmha_fwd_tme_warpspecialized.hpp"
+{% elif cc == 32 %}
+#include "mate/attention/fmha/mp32_fmha_fwd_tme_warpspecialized.hpp"
+{% else %}
+#error "Unsupported FMHA compute capability"
+{% endif %}
 #include "mate/attention/fmha/epilogue_fwd.hpp"
 #include "mate/attention/fmha/tile_scheduler.hpp"
 #include "mate/attention/fmha/metadata.hpp"
@@ -58,9 +64,13 @@ ffi::Array<ffi::Any> {{ func_name }} (
   int const cp_rank,
   ffi::Optional<ffi::TensorView> cp_tot_seqused_k,
   bool const dry_run
+  {% if has_max_logits %},
+  ffi::TensorView max_logits
+  {% endif %}
 ) {
   // FMHA config
   constexpr bool HasQv = {{ 'true' if has_qv else 'false' }};
+  constexpr bool HasMaxLogits = {{ 'true' if has_max_logits else 'false' }};
   constexpr bool OnlyQv = {{ 'true' if only_qv else 'false' }};
   constexpr bool HasCuseqlensQ = {{ 'true' if has_cu_seqlens_q else 'false' }};
   constexpr bool HasCuseqlensK = {{ 'true' if has_cu_seqlens_k else 'false' }};
@@ -99,6 +109,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
   constexpr bool HasMetadata = {{ 'true' if has_metadata else 'false' }};
   constexpr bool EnableCP = {{ 'true' if enable_cp else 'false' }};
   constexpr bool HasAttentionChunk = {{ 'true' if has_attention_chunk else 'false' }};
+  constexpr bool IsMmaPvRS = {{ 'true' if mma_pv_rs else 'false' }};
 
   // If no metadata, fallback to SingleTileScheduler without split.
   constexpr bool IsSplit = HasMetadata;
@@ -115,6 +126,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
 
   using TileShape = Shape<Int<TileM>, Int<TileN>, Int<HeadDimQK>>;
 
+  {% if cc == 31 %}
   using CollectiveMainloop =
     mate::attention::fmha::Mp31FmhaFwdTmeWarpSpecialized<Element,
                                                          ElementAccumulator,
@@ -153,6 +165,46 @@ ffi::Array<ffi::Any> {{ func_name }} (
                                                          HasAttentionChunk,
                                                          NumPVConsumers,
                                                          TileHeadDim>;
+  {% elif cc == 32 %}
+  using CollectiveMainloop =
+    mate::attention::fmha::Mp32FmhaFwdTmeWarpSpecialized<Element,
+                                                         ElementAccumulator,
+                                                         TileShape,
+                                                         StagesK,
+                                                         StagesV,
+                                                         HeadDimVO,
+                                                         NumQKConsumers,
+                                                         HasCuseqlensQ,
+                                                         HasCuseqlensK,
+                                                         HasCuseqlensKNew,
+                                                         HasKvBatchIdx,
+                                                         HasSequsedQ,
+                                                         HasSequsedK,
+                                                         HasLeftpadK,
+                                                         HasQDescale,
+                                                         HasKDescale,
+                                                         HasVDescale,
+                                                         PagedKV,
+                                                         UseLsuLoadK,
+                                                         UseLsuLoadV,
+                                                         IsCausal,
+                                                         IsLocal,
+                                                         HasLearnableSink,
+                                                         HasSoftcap,
+                                                         IsAppendKV,
+                                                         HasQv,
+                                                         OnlyQv,
+                                                         HeadRatio,
+                                                         IsPackGQA,
+                                                         IsSplit /*Split*/,
+                                                         IsRotary,
+                                                         IsRotaryInterleaved,
+                                                         HasSeqlensRotary,
+                                                         EnableCP,
+                                                         HasAttentionChunk,
+                                                         IsMmaPvRS,
+                                                         NumPVConsumers>;
+  {% endif %}
   using CollectiveEpilogue =
     mate::attention::fmha::CollectiveEpilogueFwd<ElementOut,
                                                  CollectiveMainloop::TileShapePDVFull,
@@ -161,7 +213,8 @@ ffi::Array<ffi::Any> {{ func_name }} (
                                                  IsPackGQA,
                                                  CollectiveMainloop::NumMmaThreads,
                                                  IsEvenHeadDim,
-                                                 HeadRatio>;
+                                                 HeadRatio,
+                                                 HasMaxLogits>;
 
   using TileScheduler = std::conditional_t<HasMetadata,
     mate::attention::fmha::StaticPersistentTileScheduler<IsSplit>,
@@ -349,9 +402,13 @@ ffi::Array<ffi::Any> {{ func_name }} (
         params.num_splits,
         HasCuseqlensQ ? total_q : seqlen_q
     }), DLDataType{kDLFloat, 32, 1}, q.device());
+  {% if has_max_logits %}
+  ffi::Tensor max_logits_accum = ffi::Tensor::FromEnvAlloc(
+    TVMFFIEnvTensorAlloc, lse_accum.shape(), DLDataType{kDLFloat, 32, 1}, q.device());
+  {% endif %}
 
   if (dry_run) {
-    return ffi::Array<ffi::Any>{ffi::Array<ffi::Tensor>{o_accum, lse_accum}, params.num_splits};
+    return ffi::Array<ffi::Any>{ffi::Array<ffi::Tensor>{o_accum, lse_accum{% if has_max_logits %}, max_logits_accum{% endif %}}, params.num_splits};
   }
 
   metadata_ptr = HasMetadata ? static_cast<int32_t*>(metadata.value().data_ptr()) : nullptr;
@@ -491,6 +548,10 @@ ffi::Array<ffi::Any> {{ func_name }} (
     .stride_LSE = {_1{}, params.lse_head_stride, HasCuseqlensQ ? 0 : params.lse_batch_stride, 0},
     .ptr_LSE_partial = static_cast<ElementPartial*>(params.softmax_lseaccum_ptr),
     .stride_LSE_partial = {_1{}, params.lseaccum_head_stride, HasCuseqlensQ ? 0 : params.lseaccum_batch_stride, params.lseaccum_split_stride},
+    {% if has_max_logits %}
+    .ptr_max_logits = static_cast<float*>(max_logits.data_ptr()),
+    .ptr_max_logits_partial = static_cast<float*>(max_logits_accum.data_ptr()),
+    {% endif %}
 
     .nheads_kv = params.h_k,
     .cu_seqlens = static_cast<uint32_t const*>(params.cu_seqlens_q),
@@ -529,5 +590,5 @@ ffi::Array<ffi::Any> {{ func_name }} (
   mutlass::device_kernel<Kernel><<<grid_dim, Kernel::MaxThreadsPerBlock, Kernel::SharedStorageSize, stream>>>(kernel_params);
   MATE_CHECK_MUSA_KERNEL_LAUNCH();
 
-  return ffi::Array<ffi::Any>{ffi::Array<ffi::Tensor>{o_accum, lse_accum}, params.num_splits};
+  return ffi::Array<ffi::Any>{ffi::Array<ffi::Tensor>{o_accum, lse_accum{% if has_max_logits %}, max_logits_accum{% endif %}}, params.num_splits};
 }

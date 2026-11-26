@@ -21,7 +21,13 @@ def render_mubin_launcher(family: str, **context) -> str:
 
 @functools.cache
 def render_gemm_mubin_launcher(asm_id, kernel_name: str) -> str:
+    from .common import MP32_ARCH
     from .gemm.types import MoeGemmMode, TensorMajor, TensorQuantMode
+
+    if (asm_id.a_type == "fp4_e2m1" and asm_id.major_a != TensorMajor.K) or (
+        asm_id.b_pack_bits == 4 and asm_id.major_b != TensorMajor.K
+    ):
+        raise ValueError("packed FP4 requires K-major storage")
 
     group_mode = {
         MoeGemmMode.NO_GROUP: "MoeGemmMode::NoGroup",
@@ -41,23 +47,29 @@ def render_gemm_mubin_launcher(asm_id, kernel_name: str) -> str:
     return render_mubin_launcher(
         "gemm",
         func_name=kernel_name,
+        a_type=asm_id.a_type,
         b_type=asm_id.b_type,
+        d_type=asm_id.d_type,
         b_pack_bits=asm_id.b_pack_bits,
         num_thread=block.num_thread,
         tile_m=block.tile_m,
         tile_n=block.tile_n,
         tile_k=block.tile_k,
+        quant_tile=asm_id.quant_tile,
         blk_per_mp=block.blk_per_mp,
         num_squad_m=block.num_squad_m,
         num_squad_n=block.num_squad_n,
         macro_tile_x=block.macro_tile_x,
         switch_swizzle=bool(block.switch_swizzle),
+        enable_persistence=asm_id.enable_persistence,
         major_a=major[asm_id.major_a],
         major_b=major[asm_id.major_b],
         quant_mode_a=quant_mode[asm_id.quant_mode_a],
         quant_mode_b=quant_mode[asm_id.quant_mode_b],
         group_mode=group_mode,
         fixed_scale_layout_a=asm_id.fixed_scale_layout_a,
+        fixed_scale_layout_b=asm_id.fixed_scale_layout_b,
+        is_mp32=asm_id.arch == MP32_ARCH,
     )
 
 

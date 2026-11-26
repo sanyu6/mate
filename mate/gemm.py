@@ -3,9 +3,13 @@ from enum import Enum
 from typing import Literal, Optional, Tuple, Union, cast
 
 import torch
+from mate.execution_context import (
+    call_or_return_if_dry_run,
+    skip_kernel_launch_if_dry_run,
+)
 
-from mate.api_logging import mate_api
 from mate._backend import resolve_backend
+from mate.api_logging import mate_api
 from mate.jit.gemm.deep_gemm.gemm import (
     GEMM_TYPE_M_GROUPED_CONTIGUOUS,
     GEMM_TYPE_M_GROUPED_MASKED,
@@ -16,20 +20,27 @@ from mate.jit.gemm.masked_moe_gemm_mixed_dtype import (
     masked_moe_gemm_mixed_dtype_mutlass,
 )
 from mate.jit.gemm_ops import get_gemm_ops_module
+from mate.jit.mubin.common import (
+    MP32_ARCH,
+    _resolve_grouped_fp8_recipe,
+)
 from mate.jit.mubin.gemm import (
     groupwise_gemm_8bit_fp8output_mubin,
     m_grouped_contig_gemm_16bit_mubin,
     m_grouped_contig_gemm_8bit_mubin,
     masked_moe_gemm_16bit_mubin,
     masked_moe_gemm_8bit_mubin,
+    masked_moe_gemm_mxfp_mubin,
     masked_moe_gemm_w4a8_mubin,
     ragged_k_moe_gemm_16bit_mubin,
     ragged_k_moe_gemm_8bit_mubin,
+    ragged_k_moe_gemm_mxfp_mubin,
     ragged_moe_gemm_16bit_mubin,
     ragged_moe_gemm_8bit_mubin,
+    ragged_moe_gemm_mxfp_mubin,
     ragged_moe_gemm_w4a8_mubin,
 )
-from mate.mate_runtime import resolve_num_mps
+from mate.mate_runtime import get_arch, resolve_num_mps
 from mate.utils import ceil_div
 
 
@@ -49,6 +60,16 @@ def _resolve_gemm_mixed_dtype(
             raise ValueError(f"mixed_dtype must be one of {allowed}") from exc
 
     return mixed_dtype
+
+
+def _reject_unsupported_mp32_grouped_gemm(device: torch.device, operation: str) -> None:
+    """Reject grouped paths absent from the delivered MP32 artifact set."""
+
+    if get_arch(device) == MP32_ARCH:
+        raise NotImplementedError(
+            f"{operation} is not available on MP32; no matching MUBIN "
+            "artifact has been delivered"
+        )
 
 
 def _resolve_moe_gemm_quant_recipe(
@@ -191,7 +212,9 @@ def ragged_m_moe_gemm_16bit(
                 config_m=input_a.shape[0],
                 alignment_m=alignment_m,
             )
-            mod.get_function(dispatch_name)(
+            call_or_return_if_dry_run(
+                mod.get_function(dispatch_name), dry_run_result=None
+            )(
                 input_a,
                 input_b,
                 out,
@@ -218,7 +241,9 @@ def ragged_m_moe_gemm_16bit(
                 config_m=input_a.shape[0],
                 alignment_m=alignment_m,
             )
-            mod.get_function(dispatch_name)(
+            call_or_return_if_dry_run(
+                mod.get_function(dispatch_name), dry_run_result=None
+            )(
                 input_a,
                 input_b,
                 out,
@@ -301,6 +326,8 @@ def masked_moe_gemm_16bit(
         Literal["auto", "mubin", "mutlass"],
         resolve_backend(backend, supported=("mubin", "mutlass"), default="auto"),
     )
+    if backend != "mutlass":
+        _reject_unsupported_mp32_grouped_gemm(a.device, "masked grouped BF16 GEMM")
 
     if not enable_overlap:
         signal = None
@@ -327,7 +354,7 @@ def masked_moe_gemm_16bit(
             gemm_type=GEMM_TYPE_M_GROUPED_MASKED,
             config_m=expect_tokens,
         )
-        mod.get_function(dispatch_name)(
+        call_or_return_if_dry_run(mod.get_function(dispatch_name), dry_run_result=None)(
             a,
             b,
             out,
@@ -377,10 +404,16 @@ def ragged_m_moe_gemm_8bit(
         Tuple containing (fp8_tensor, scale_tensor) for input A.
         **fp8_tensor** has shape ``(total_tokens, hidden_size)`` and should be of fp8 (e4m3/e5m2) type.
         **scale_tensor** has shape ``(total_tokens, hidden_size // scale_granularity_m)`` and should be of fp32 type.
+        On MP32, E4M3/E5M2 values and UINT8 UE8M0 scales shaped
+        ``(total_tokens, ceil(hidden_size / 32))`` with strides
+        ``(1, total_tokens)`` are supported.
     input_b : Tuple[Tensor, Tensor]
         Tuple containing (fp8_tensor, scale_tensor) for input B.
         **fp8_tensor** has shape ``(num_expert, out_hidden_size, hidden_size)`` and should be of fp8 (e4m3/e5m2) type.
         **scale_tensor** has shape ``(num_expert, out_hidden_size // scale_granularity_n, hidden_size // scale_granularity_k)`` and should be of fp32 type.
+        On MP32, the UINT8 UE8M0 shape is
+        ``(num_expert, out_hidden_size, ceil(hidden_size / 32))`` with strides
+        ``(out_hidden_size * ceil(hidden_size / 32), 1, out_hidden_size)``.
     ragged_tokens_info : Tensor
         Metadata tensor whose meaning depends on ``gemm_mode``.
         For ``per_token``, it has shape ``(total_tokens,)`` and stores the
@@ -401,10 +434,11 @@ def ragged_m_moe_gemm_8bit(
         Indicating different meaning of ragged_tokens_info.
     scale_granularity_mnk : Optional[Tuple[int, int, int]]
         Quantization granularity for total_tokens, out_hidden_size, hidden_size (m, n, k) dimensions respectively.
-        Default is ``(1, 128, 128)``.
+        Defaults to ``(1, 128, 128)`` on MP31 and ``(1, 1, 32)`` on MP32.
+        MP32 accepts only ``(1, 1, 32)`` with UINT8 UE8M0 scales.
     alignment_m : Optional[int]
         Alignment requirement for total_tokens (m) dimension. Must be 128 or 256.
-        Default is 128.
+        Defaults to 128; supports 128 or 256 on MP31 and MP32.
     num_mp : Optional[int]
         Suggest mp number.
         If None, will be get from device info.
@@ -416,8 +450,12 @@ def ragged_m_moe_gemm_8bit(
 
     """
 
-    if scale_granularity_mnk is None:
-        scale_granularity_mnk = (1, 128, 128)
+    arch = get_arch(input_a[0].device)
+    if arch == MP32_ARCH and gemm_mode != "per_token":
+        raise NotImplementedError(
+            "MP32 grouped FP8 GEMM supports only gemm_mode='per_token'"
+        )
+    scale_granularity_mnk = _resolve_grouped_fp8_recipe(scale_granularity_mnk, arch)
 
     if alignment_m is None:
         alignment_m = 128
@@ -431,6 +469,21 @@ def ragged_m_moe_gemm_8bit(
             backend = "mutlass"
         elif backend != "mutlass":
             raise ValueError('N-major B requires backend="mutlass"')
+    if arch == MP32_ARCH and backend == "mutlass":
+        raise ValueError('MP32 grouped FP8 GEMM requires backend="mubin"')
+    if arch == MP32_ARCH:
+        if major_a_mode not in (None, "K") or major_b_mode not in (None, "K"):
+            raise ValueError("MP32 M-grouped MXFP supports only NT layout")
+        return ragged_m_moe_gemm_mxfp(
+            input_a,
+            input_b,
+            ragged_tokens_info,
+            out,
+            recipe=scale_granularity_mnk,
+            num_mp=num_mp,
+            alignment_m=alignment_m,
+            backend=backend,
+        )
 
     if gemm_mode == "per_token":
         if backend == "mutlass":
@@ -443,7 +496,9 @@ def ragged_m_moe_gemm_8bit(
                 alignment_m=alignment_m,
                 major_b_mode=major_b_mode or "K",
             )
-            mod.get_function(dispatch_name)(
+            call_or_return_if_dry_run(
+                mod.get_function(dispatch_name), dry_run_result=None
+            )(
                 a_fp8,
                 scale_a,
                 b_fp8,
@@ -473,7 +528,9 @@ def ragged_m_moe_gemm_8bit(
                 config_m=a_fp8.shape[0],
                 alignment_m=alignment_m,
             )
-            mod.get_function(dispatch_name)(
+            call_or_return_if_dry_run(
+                mod.get_function(dispatch_name), dry_run_result=None
+            )(
                 a_fp8,
                 scale_a,
                 b_fp8,
@@ -525,10 +582,17 @@ def masked_moe_gemm_8bit(
         Tuple containing (fp8_tensor, scale_tensor) for input A.
         **fp8_tensor** has shape ``(num_expert, max_tokens, hidden_size)`` and should be of fp8 (e4m3/e5m2) type.
         **scale_tensor** has shape ``(num_expert, max_tokens, hidden_size // scale_granularity_k)`` and should be of fp32 type.
+        On MP32, E4M3/E5M2 values and UINT8 UE8M0 scales with logical shape
+        ``(num_expert, max_tokens, ceil(hidden_size / 32))`` are supported.
+        The scale tensor must use the fixed-M layout with strides
+        ``(max_tokens * ceil(hidden_size / 32), 1, max_tokens)``.
     input_b : Tuple[Tensor, Tensor]
         Tuple containing (fp8_tensor, scale_tensor) for input B.
         **fp8_tensor** has shape ``(num_expert, out_hidden_size, hidden_size)`` and should be of fp8 (e4m3/e5m2) type.
         **scale_tensor** has shape ``(num_expert, out_hidden_size // scale_granularity_n, hidden_size // scale_granularity_k)`` and should be of fp32 type.
+        On MP32, the UINT8 UE8M0 shape is
+        ``(num_expert, out_hidden_size, ceil(hidden_size / 32))`` with strides
+        ``(out_hidden_size * ceil(hidden_size / 32), 1, out_hidden_size)``.
     masked_tokens_info : Tensor
         Tensor indicating the actual number of tokens for each expert, with shape ``(num_expert,)``.
         Values represent token counts for each expert.
@@ -537,7 +601,8 @@ def masked_moe_gemm_8bit(
         Should be of fp16 or bf16 type. If None, a new tensor will be created.
     scale_granularity_mnk : Optional[Tuple[int, int, int]]
         Quantization granularity for max_tokens, out_hidden_size, hidden_size (m, n, k) dimensions respectively.
-        Default is ``(1, 128, 128)``.
+        Defaults to ``(1, 128, 128)`` on MP31 and ``(1, 1, 32)`` on MP32.
+        MP32 accepts only ``(1, 1, 32)`` with UINT8 UE8M0 scales.
     expect_tokens : Optional[int]
         Expected number of tokens. If None, defaults to 0.
     enable_overlap : Optional[bool]
@@ -559,13 +624,27 @@ def masked_moe_gemm_8bit(
             - threshold int
 
     """
-    if scale_granularity_mnk is None:
-        scale_granularity_mnk = (1, 128, 128)
+    arch = get_arch(input_a[0].device)
+    scale_granularity_mnk = _resolve_grouped_fp8_recipe(scale_granularity_mnk, arch)
 
     backend = cast(
         Literal["auto", "mubin", "mutlass"],
         resolve_backend(backend, supported=("mubin", "mutlass"), default="auto"),
     )
+    if arch == MP32_ARCH:
+        if backend == "mutlass":
+            raise ValueError('MP32 grouped FP8 GEMM requires backend="mubin"')
+        if enable_overlap:
+            raise ValueError("MP32 masked grouped FP8 GEMM does not support overlap")
+        return masked_moe_gemm_mxfp(
+            input_a,
+            input_b,
+            masked_tokens_info,
+            out,
+            expect_tokens=0 if expect_tokens is None else expect_tokens,
+            recipe=scale_granularity_mnk,
+            backend=backend,
+        )
 
     if expect_tokens is None:
         expect_tokens = 0
@@ -598,7 +677,7 @@ def masked_moe_gemm_8bit(
             gemm_type=GEMM_TYPE_M_GROUPED_MASKED,
             config_m=expect_tokens,
         )
-        mod.get_function(dispatch_name)(
+        call_or_return_if_dry_run(mod.get_function(dispatch_name), dry_run_result=None)(
             a_fp8,
             scale_a,
             b_fp8,
@@ -621,6 +700,352 @@ def masked_moe_gemm_8bit(
     )
 
     return (out, signal, res[0], res[1]) if enable_overlap else out
+
+
+@functools.cache
+def _resolve_mxfp_recipes(
+    recipe: tuple[int, int, int] | None,
+    recipe_a: tuple[int, int] | None,
+    recipe_b: tuple[int, int] | None,
+) -> None:
+    """Validate the two canonical spellings of qtile-32 MX scaling."""
+
+    if recipe is not None:
+        if (
+            not isinstance(recipe, tuple)
+            or len(recipe) != 3
+            or any(type(item) is not int for item in recipe)
+            or recipe != (1, 1, 32)
+        ):
+            raise ValueError("MXFP recipe must be (1, 1, 32)")
+        if recipe_a is not None or recipe_b is not None:
+            raise ValueError("recipe cannot be combined with recipe_a/recipe_b")
+        return
+    if recipe_a is None and recipe_b is None:
+        return
+    if (
+        not isinstance(recipe_a, tuple)
+        or not isinstance(recipe_b, tuple)
+        or len(recipe_a) != 2
+        or len(recipe_b) != 2
+        or any(type(item) is not int for item in (*recipe_a, *recipe_b))
+        or recipe_a != (1, 32)
+        or recipe_b != (1, 32)
+    ):
+        raise ValueError("MXFP recipe_a and recipe_b must both be (1, 32)")
+
+
+@mate_api
+def transform_mxfp_sf(
+    sf: torch.Tensor,
+    mn: int,
+    k: int,
+    recipe: tuple[int, int] = (1, 32),
+) -> torch.Tensor:
+    """Convert scale factors to the native MP32 MXFP format.
+
+    ``mn`` and ``k`` are logical operand dimensions; for packed FP4, ``k``
+    counts FP4 values before packing. ``recipe=(gran_mn, gran_k)`` describes
+    the input scale coverage:
+
+    * ``(1,32)``: one scale per MN element and 32 K values.
+    * ``(1,128)``: each scale is repeated across four output K groups.
+    * ``(128,128)``: additionally broadcast each scale across 128 MN elements.
+
+    With ``R=ceil(mn/gran_mn)`` and ``S=ceil(k/gran_k)``, ``sf`` accepts:
+
+    * ``torch.float32``: logical scales shaped ``[R,S]`` or ``[G,R,S]``.
+      Values must already represent UE8M0 powers of two. Conversion extracts
+      exponent bits without rounding or requantizing the GEMM operands.
+    * ``torch.uint8``: UE8M0 exponent codes shaped ``[R,S]`` or ``[G,R,S]``.
+    * ``torch.int32``: four UE8M0 codes packed along K per integer, shaped
+      ``[R,ceil(S/4)]`` or ``[G,R,ceil(S/4)]``. The first K scale occupies
+      the least significant byte; unused bytes in the last word are ignored.
+
+    All three dtypes support K-major (last-axis stride 1) and MN-major
+    (MN-axis stride 1) storage, including physical padding, storage offsets
+    and other positive-stride views on a MUSA device. Both layouts keep the
+    logical MN axis before the K-scale axis. A leading group dimension is
+    preserved: ragged A typically uses 2D scales; masked A and grouped B use
+    3D scales. Scale values are trusted caller input, as for MXFP GEMM;
+    valid UE8M0 codes must not contain ``0xFF``.
+
+    The result is UINT8 on the same device. With ``Q=ceil(k/32)``, its shape
+    is ``[mn,Q]`` or ``[G,mn,Q]`` and its strides are ``[1,mn]`` or
+    ``[mn*Q,1,mn]``, without MN padding. A native UINT8 input with recipe
+    ``(1,32)`` and these exact strides is returned unchanged. Pass the
+    converted scales to GEMM with its default recipe or ``(1,1,32)``,
+    regardless of the input recipe used here.
+
+    Conversion uses TileLang, loaded only when needed. Hardware-swizzled
+    scale storage, K-grouped scales with independent per-expert packing,
+    and PSUM gap layouts are not supported.
+    """
+    if sf.device.type != "musa":
+        raise ValueError("transform_mxfp_sf requires a MUSA tensor")
+    if sf.ndim not in (2, 3):
+        raise ValueError("sf must have shape [MN,Q] or [G,MN,Q]")
+    if type(mn) is not int or type(k) is not int or mn < 0 or k < 0:
+        raise ValueError("mn and k must be non-negative integers")
+    if (
+        not isinstance(recipe, tuple)
+        or len(recipe) != 2
+        or any(type(value) is not int for value in recipe)
+        or recipe not in ((1, 32), (1, 128), (128, 128))
+    ):
+        raise ValueError("recipe must be (1,32), (1,128) or (128,128)")
+    if sf.dtype == torch.uint8 and recipe == (1, 32):
+        q = ceil_div(k, 32)
+        strides = (mn * q, 1, mn) if sf.ndim == 3 else (1, mn)
+        if sf.shape[-2:] == (mn, q) and sf.stride() == strides:
+            return sf
+
+    if sf.dtype not in (torch.float32, torch.int32, torch.uint8):
+        raise TypeError("sf must have dtype float32, int32 or uint8")
+    gran_mn, gran_k = recipe
+    packing = 4 if sf.dtype == torch.int32 else 1
+    expected_shape = (ceil_div(mn, gran_mn), ceil_div(k, gran_k * packing))
+    if tuple(sf.shape[-2:]) != expected_shape:
+        raise ValueError(
+            f"sf must have trailing shape {expected_shape}, got {tuple(sf.shape)}"
+        )
+    if sf.numel() and any(stride <= 0 for stride in sf.stride()):
+        raise ValueError("sf must have positive strides")
+
+    from mate.gemm_kernels.tilelang.transform_mxfp_sf import run_transform_mxfp_sf
+
+    return run_transform_mxfp_sf(sf, mn, k, recipe)
+
+
+@mate_api
+def ragged_m_moe_gemm_mxfp(
+    input_a: Tuple[torch.Tensor, torch.Tensor],
+    input_b: Tuple[torch.Tensor, torch.Tensor],
+    ragged_tokens_info: torch.Tensor,
+    out: torch.Tensor,
+    recipe: Optional[Tuple[int, int, int]] = None,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
+    disable_ue8m0_cast: bool = True,
+    num_mp: Optional[int] = None,
+    alignment_m: int = 128,
+    backend: Literal["auto", "mubin", "mutlass"] = "auto",
+) -> torch.Tensor:
+    """Run an M-ragged grouped GEMM for supported MX formats.
+
+    MP32 supports all four E4M3/E5M2 A/B combinations and E2M1 x E2M1,
+    with one UE8M0 scale per 32 logical values. FP8 values use
+    ``torch.float8_e4m3fn`` or ``torch.float8_e5m2`` independently for A/B. E2M1 values
+    are packed two per ``torch.int8`` byte: the first value occupies the low
+    nibble, the second the high nibble. Packed A/B shapes are ``[M,K/2]``
+    and ``[G,N,K/2]``.
+
+    All supported formats take native ``torch.uint8`` UE8M0 scales. With
+    ``Q=ceil(K/32)``, A has shape ``[M,Q]`` and strides ``[1,M]``; B has
+    shape ``[G,N,Q]`` and strides ``[N*Q,1,N]``. Scales must be MN-major,
+    contiguous in M/N without padding. No scale dtype conversion or repacking
+    is performed; FP32, INT32 and K-major scales are rejected. Scale bytes are trusted
+    caller input and must not contain the UE8M0 NaN code ``0xFF``. The
+    output is BF16. M is the total padded row count. Each expert segment and M
+    must be aligned to ``alignment_m``: 128 rows by default, or explicitly 256 rows.
+    Use ``recipe=(1,1,32)`` or ``recipe_a=recipe_b=(1,32)``; omitting both
+    selects the same granularity. E4M3 A x packed E2M1 B uses the MUTLASS RS backend; E5M2 A x FP4,
+    FP4 x FP8 and FP6 are currently rejected. The RS path requires N a multiple
+    of 4, K a multiple of 8, contiguous A/B/out and int32 metadata.
+    On the RS path, zero G/M/N returns without launching; zero K clears the
+    entire output.
+    Each tile must contain one expert or -1 padding; padding output is unspecified.
+    Scale values and expert IDs are caller-guaranteed.
+
+    Auto selects MUTLASS for E4M3 x E2M1 and MUBIN for other supported pairs.
+    Explicit backends must support the operand pair.
+
+    Kernels use persistent CTAs. ``num_mp`` bounds the CTA count; ``None``
+    uses the device's MP count. Each CTA can process multiple output tiles.
+    """
+
+    _resolve_mxfp_recipes(recipe, recipe_a, recipe_b)
+    if not disable_ue8m0_cast:
+        raise ValueError("disable_ue8m0_cast=False is not supported by Mate MXFP")
+    a, scale_a = input_a
+    b, scale_b = input_b
+    if get_arch(a.device) != MP32_ARCH:
+        raise NotImplementedError("MXFP grouped GEMM requires MP32")
+
+    fp8_types = (torch.float8_e4m3fn, torch.float8_e5m2)
+    selected: Literal["mubin", "mutlass"]
+    if a.dtype == torch.float8_e4m3fn and b.dtype == torch.int8:
+        selected = "mutlass"
+    elif a.dtype in fp8_types and b.dtype in fp8_types:
+        selected = "mubin"
+    elif a.dtype == torch.int8 and b.dtype == torch.int8:
+        selected = "mubin"
+    else:
+        raise NotImplementedError(
+            f"Unsupported MP32 MXFP operand pair: {a.dtype} x {b.dtype}"
+        )
+
+    resolve_backend(backend, supported=(selected,))
+    if backend == "auto":
+        backend = selected
+    if backend == "mutlass":
+        # These dimensions are needed to select the JIT configuration.
+        if a.ndim != 2 or b.ndim != 3:
+            raise ValueError("Expected rank-2 A and rank-3 B")
+        m, n = a.size(-2), b.size(-2)
+        if alignment_m not in (128, 256) or m % alignment_m:
+            raise ValueError(
+                "Contiguous M must be divisible by alignment_m (128 or 256)"
+            )
+        num_mps = resolve_num_mps(a.device, num_mp)
+        dispatch_name, mod = get_deep_gemm_gemm_module(
+            kind="fp8_fp4",
+            gemm_type=GEMM_TYPE_M_GROUPED_CONTIGUOUS,
+            config_m=m,
+            config_n=n,
+            alignment_m=alignment_m,
+        )
+        # Adapt native MN-major scales to the FFI view without copying.
+        mod.get_function(dispatch_name)(
+            a,
+            scale_a.transpose(-1, -2),
+            b,
+            scale_b.transpose(-1, -2),
+            out,
+            ragged_tokens_info,
+            num_mps,
+        )
+    elif backend == "mubin":
+        ragged_moe_gemm_mxfp_mubin(
+            input_a, input_b, ragged_tokens_info, out, alignment_m, num_mp
+        )
+    return out
+
+
+@mate_api
+def masked_moe_gemm_mxfp(
+    input_a: Tuple[torch.Tensor, torch.Tensor],
+    input_b: Tuple[torch.Tensor, torch.Tensor],
+    masked_tokens_info: torch.Tensor,
+    out: torch.Tensor,
+    expect_tokens: int,
+    recipe: Optional[Tuple[int, int, int]] = None,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
+    disable_ue8m0_cast: bool = True,
+    num_mp: Optional[int] = None,
+    backend: Literal["auto", "mubin", "mutlass"] = "auto",
+) -> torch.Tensor:
+    """Run an M-masked grouped GEMM for supported MX formats.
+
+    MP32 supports all four E4M3/E5M2 A/B combinations and E2M1 x E2M1.
+    Scale storage follows
+    :func:`ragged_m_moe_gemm_mxfp`, with logical A scales shaped
+    ``[G,M,Q]`` and B scales shaped ``[G,N,Q]``, where ``Q=ceil(K/32)``.
+    All supported formats use native UINT8 UE8M0 scales. A strides are ``[M*Q,1,M]``;
+    B strides are ``[N*Q,1,N]``. Output is BF16. Masked overlap is not supported.
+    E4M3 A x packed E2M1 B uses MUTLASS with the same native scale contract.
+    For A shaped ``[G,M,K]``, M is the allocated row capacity per expert.
+    This RS path requires M/N multiples of 4, K a multiple of 8,
+    contiguous A/B/out and int32 metadata. Valid token counts
+    ``masked_tokens_info[g]`` need no alignment; callers guarantee
+    ``0 <= masked_tokens_info[g] <= M`` and positive ``expect_tokens``.
+    Invalid rows are untouched for nonzero K. On the RS path, zero G/M/N returns
+    without launching; zero K clears the entire output.
+    """
+
+    _resolve_mxfp_recipes(recipe, recipe_a, recipe_b)
+    if not disable_ue8m0_cast:
+        raise ValueError("disable_ue8m0_cast=False is not supported by Mate MXFP")
+    a, scale_a = input_a
+    b, scale_b = input_b
+    if get_arch(a.device) != MP32_ARCH:
+        raise NotImplementedError("MXFP grouped GEMM requires MP32")
+
+    fp8_types = (torch.float8_e4m3fn, torch.float8_e5m2)
+    selected: Literal["mubin", "mutlass"]
+    if a.dtype == torch.float8_e4m3fn and b.dtype == torch.int8:
+        selected = "mutlass"
+    elif a.dtype in fp8_types and b.dtype in fp8_types:
+        selected = "mubin"
+    elif a.dtype == torch.int8 and b.dtype == torch.int8:
+        selected = "mubin"
+    else:
+        raise NotImplementedError(
+            f"Unsupported MP32 MXFP operand pair: {a.dtype} x {b.dtype}"
+        )
+
+    resolve_backend(backend, supported=(selected,))
+    if backend == "auto":
+        backend = selected
+    if backend == "mutlass":
+        # These dimensions are needed to select the JIT configuration.
+        if a.ndim != 3 or b.ndim != 3:
+            raise ValueError("Expected rank-3 A and rank-3 B")
+        m, n = a.size(-2), b.size(-2)
+        if expect_tokens <= 0:
+            raise ValueError("expect_tokens must be positive")
+        num_mps = resolve_num_mps(a.device, num_mp)
+        dispatch_name, mod = get_deep_gemm_gemm_module(
+            kind="fp8_fp4",
+            gemm_type=GEMM_TYPE_M_GROUPED_MASKED,
+            config_m=min(m, expect_tokens),
+            config_n=n,
+        )
+        # Adapt native MN-major scales to the FFI view without copying.
+        mod.get_function(dispatch_name)(
+            a,
+            scale_a.transpose(-1, -2),
+            b,
+            scale_b.transpose(-1, -2),
+            out,
+            masked_tokens_info,
+            num_mps,
+        )
+    elif backend == "mubin":
+        masked_moe_gemm_mxfp_mubin(
+            input_a, input_b, masked_tokens_info, out, expect_tokens, num_mp
+        )
+    return out
+
+
+@mate_api
+def ragged_k_moe_gemm_mxfp(
+    input_a: Tuple[torch.Tensor, torch.Tensor],
+    input_b: Tuple[torch.Tensor, torch.Tensor],
+    ragged_tokens_info: torch.Tensor,
+    out: torch.Tensor,
+    recipe: Optional[Tuple[int, int, int]] = None,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
+    disable_ue8m0_cast: bool = True,
+    num_mp: Optional[int] = None,
+    ks_cpu: Optional[list[int]] = None,
+    backend: Literal["auto", "mubin"] = "auto",
+) -> torch.Tensor:
+    """Accumulate a K-grouped MXFP GEMM into caller-provided output.
+
+    MP32 supports E4M3/E5M2 independently for A and B, with A ``[sum(ks),M]``
+    and B ``[sum(ks),N]`` in TN layout. Scales are MN-major UINT8 E8M0
+    tensors ``[sum(k/32),M]`` and ``[sum(k/32),N]``. ``ks_cpu`` must
+    contain positive multiples of 32 matching the INT32 device metadata.
+    ``out`` has shape ``[G,M,N]`` and dtype BF16 or FP32; each group computes
+    ``out[g] += A[g].T @ B[g]``. All tensors must be contiguous, with M/N
+    as the contiguous dimension of each scale tensor.
+
+    The default recipe is ``(1,1,32)``. ``recipe_a=recipe_b=(1,32)`` is
+    also accepted. Inputs involving FP4 or FP6 await matching K-group kernels.
+    Kernels use persistent CTAs, with ``num_mp`` bounding the CTA count
+    (the device's MP count by default).
+    """
+    _resolve_mxfp_recipes(recipe, recipe_a, recipe_b)
+    if not disable_ue8m0_cast:
+        raise ValueError("disable_ue8m0_cast=False is not supported by Mate MXFP")
+    resolve_backend(backend, supported=("mubin",))
+    ragged_k_moe_gemm_mxfp_mubin(
+        input_a, input_b, ragged_tokens_info, (1, 1, 32), out, num_mp, ks_cpu
+    )
+    return out
 
 
 @mate_api
@@ -908,6 +1333,8 @@ def masked_moe_gemm_mixed_dtype(
             a_quant_recipe,
         )
 
+    _reject_unsupported_mp32_grouped_gemm(input_a[0].device, "masked grouped W4A8 GEMM")
+
     if a_quant_recipe != (1, -1):
         raise NotImplementedError(
             f'a_quant_recipe={a_quant_recipe}, backend="mubin" is not supported'
@@ -953,6 +1380,7 @@ def ragged_k_moe_gemm_8bit(
     major_b_mode: Optional[Literal["N", "K"]] = "N",
     scale_granularity_mnk: Optional[Tuple[int, int, int]] = None,
     num_mp: Optional[int] = None,
+    ks_cpu: Optional[list[int]] = None,
 ):
     """
     Perform 8-bit GEMM operation for MoE (Mixture of Experts) with token of each expert.
@@ -966,10 +1394,14 @@ def ragged_k_moe_gemm_8bit(
         Tuple containing (fp8_tensor, scale_tensor) for input A.
         **fp8_tensor** has shape ``(k, m)`` and should be of fp8 (e4m3/e5m2) type.
         **scale_tensor** has shape ``(k // scale_granularity_k, m)`` and should be of fp32 type.
+        On MP32, E4M3/E5M2 values and UINT8 UE8M0 scales shaped
+        ``(sum(ceil(k_group / 32)), m)`` are supported.
     input_b : Tuple[Tensor, Tensor]
         Tuple containing (fp8_tensor, scale_tensor) for input B.
         **fp8_tensor** has shape ``(k, n)`` and should be of fp8 (e4m3/e5m2) type.
         **scale_tensor** has shape ``(k // scale_granularity_k, n)`` and should be of fp32 type.
+        On MP32, the UINT8 UE8M0 shape is
+        ``(sum(ceil(k_group / 32)), n)``.
     ragged_tokens_info : Tensor
         Tensor indicating the actual number of tokens for each expert, with shape ``(num_expert,)``.
         Values represent token counts for each expert.
@@ -985,10 +1417,13 @@ def ragged_k_moe_gemm_8bit(
         Major mode of B, defult to `N`.
     scale_granularity_mnk : Optional[Tuple[int, int, int]]
         Quantization granularity for max_tokens, out_hidden_size, hidden_size (m, n, k) dimensions respectively.
-        Kgroupgemm only support 1D1D scale, should be ``(1, 1, 128)``.
+        Only 1D1D scaling is supported: ``(1, 1, 128)`` on MP31 and
+        ``(1, 1, 32)`` on MP32. Omission selects the architecture default.
     num_mp : Optional[int]
         Suggest mp number.
         If None, will be get from device info.
+    ks_cpu : Optional[list[int]]
+        Host-side per-expert K lengths required by the MP32 MUBIN launcher.
 
     Returns
     -------
@@ -996,12 +1431,10 @@ def ragged_k_moe_gemm_8bit(
     Representing D = D + A * B for each expert
 
     """
-    if scale_granularity_mnk is None:
-        scale_granularity_mnk = (1, 1, 128)
-    else:
-        assert scale_granularity_mnk == (1, 1, 128), (
-            "k_grouped_contig_gemm_8bit only support 1D1D gemm"
-        )
+    arch = get_arch(input_a[0].device)
+    scale_granularity_mnk = _resolve_grouped_fp8_recipe(
+        scale_granularity_mnk, arch, k_grouped=True
+    )
 
     if major_a_mode is None:
         major_a_mode = "M"
@@ -1011,6 +1444,17 @@ def ragged_k_moe_gemm_8bit(
     assert major_a_mode == "M" and major_b_mode == "N", (
         "k_grouped_contig_gemm_8bit only support TN layout"
     )
+
+    if arch == MP32_ARCH:
+        return ragged_k_moe_gemm_mxfp(
+            input_a,
+            input_b,
+            ragged_tokens_info,
+            out,
+            recipe=scale_granularity_mnk,
+            num_mp=num_mp,
+            ks_cpu=ks_cpu,
+        )
 
     ragged_k_moe_gemm_8bit_mubin(
         input_a,
@@ -1176,7 +1620,9 @@ def _run_bmm_mudnn(
         scale_a = scale_b = None
         recipe_a = recipe_b = (-1, -1)
         fixed_scale_layout = False
-    _get_bmm_module().get_function("bmm")(
+    call_or_return_if_dry_run(
+        _get_bmm_module().get_function("bmm"), dry_run_result=None
+    )(
         a,
         b,
         out,
@@ -1236,6 +1682,8 @@ def _run_bmm_mutlass(
         config_m=a.size(1),
     )
     func = mod.get_function(dispatch_name)
+    if skip_kernel_launch_if_dry_run():
+        return
     num_mps = resolve_num_mps(a.device)
     for batch_index in range(a.size(0)):
         if kind == "bf16":
@@ -1406,6 +1854,11 @@ def bmm(
         )
         if backend == "auto":
             backend = "mudnn"
+
+    if scale_out is not None:
+        _reject_unsupported_mp32_grouped_gemm(
+            a.device, "groupwise GEMM with FP8 output"
+        )
 
     batch = a.size(0)
     m = a.size(2) if trans_a else a.size(1)

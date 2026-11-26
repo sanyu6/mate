@@ -1,0 +1,4 @@
+interface:
+  display_name: "MATE JIT Dump"
+  short_description: "Dump and replay one MATE JIT call at a time"
+  default_prompt: "Use $mate-jit-dump to dump selected MATE pytest cases and replay one artifact at a time."

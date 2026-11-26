@@ -1,0 +1,4 @@
+interface:
+  display_name: "MATE Operator Migration"
+  short_description: "Migrate operators to callable Op classes"
+  default_prompt: "Use $mate-op-dev to migrate the requested MATE operator to the appropriate Op, expose a callable Op class with internal inputs, and preserve existing behavior."

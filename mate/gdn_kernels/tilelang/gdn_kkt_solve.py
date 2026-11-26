@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+from mate.execution_context import skip_kernel_launch_if_dry_run
 import tilelang
 import tilelang.language as T
 
@@ -349,9 +350,10 @@ def kkt_solve(
         accum_dtype="float32",
         is_varlen=is_varlen,
     )
-    if is_varlen:
-        tilelang_kkt_solve_kernel(k, b, cu_seqlens, a)
-    else:
-        tilelang_kkt_solve_kernel(k, b, a, num_chunks)
+    if not skip_kernel_launch_if_dry_run():
+        if is_varlen:
+            tilelang_kkt_solve_kernel(k, b, cu_seqlens, a)
+        else:
+            tilelang_kkt_solve_kernel(k, b, a, num_chunks)
 
     return a

@@ -5,7 +5,14 @@ import torch
 
 from mate.api_logging import mate_api
 from mate.jit.mla_ops import get_mla_ops_module
-from mate.jit.mubin.flash_mla import flash_mla_asm_mubin
+from mate.mate_runtime import (
+    MP31_ARCH,
+    require_musa_arch,
+)
+from mate.jit.mubin.flash_mla import (
+    flash_mla_asm_mubin,
+    is_flash_mla_asm_mubin_supported,
+)
 from mate.jit.runtime import ffi_to_torch
 from mate.mate_runtime import get_physical_num_mps
 from mate.utils import ceil_div
@@ -13,8 +20,8 @@ from .sparse_mla.flashmla_sparse import (
     flashmla_sparse_decode,
     flashmla_sparse_prefill,
 )
-from .sparse_mla.tilelang.sparse_mla_model1_fwd_pack import (
-    sparse_mla_fwd_interface_model1_pack,
+from .sparse_mla.tilelang.mp31.sparse_mla_v4_fwd_pack import (
+    sparse_mla_fwd_interface_v4_pack,
 )
 from .execution_context import skip_kernel_launch_if_dry_run
 
@@ -166,7 +173,7 @@ def get_mla_metadata(
         Optional sparse extra-KV topk. This mirrors FlashMLA sparse decode
         metadata semantics without folding extra work into `topk`.
     topk_length: Optional[Tensor]
-        Optional per-batch sparse workload lengths for MODEL1 scheduled decode metadata.
+        Optional per-batch sparse workload lengths for V4 scheduled decode metadata.
         If extra_topk_length is provided, both lengths are summed in the C++ metadata kernel.
 
     Returns
@@ -259,14 +266,19 @@ def flash_mla_sparse_fwd_pack8(
     compress_ratio: int = 1,
     pack_metadata: Optional[object] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Experimental MODEL1 H=8 pack_s=8 bf16 sparse-prefill entrypoint.
+    """Experimental V4 H=8 pack_s=8 bf16 sparse-prefill entrypoint.
 
     This API is intentionally separate from the generic sparse prefill wrapper so
     callers can opt into the H8 pack experiment without changing generic sparse
     prefill semantics.
     """
     assert d_v == 512, "pack8 sparse prefill only supports d_v == 512"
-    return sparse_mla_fwd_interface_model1_pack(
+    require_musa_arch(
+        q,
+        (MP31_ARCH,),
+        "V4 sparse prefill pack8",
+    )
+    return sparse_mla_fwd_interface_v4_pack(
         q=q,
         kv=kv,
         indices=indices,
@@ -302,6 +314,8 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    q_rope_positions: Optional[torch.Tensor] = None,
+    q_rope_cos_sin: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Mla forward with kv cache
@@ -375,27 +389,32 @@ def flash_mla_with_kvcache(
                 tile_scheduler_metadata=tile_scheduler_metadata,
                 num_splits=num_splits,
                 metadata_getter=get_mla_metadata,
+                q_rope_positions=q_rope_positions,
+                q_rope_cos_sin=q_rope_cos_sin,
             )
         else:
             assert False, "Unsupported DSA backend"
 
-    assert attn_sink is None, "attn_sink is only supported for sparse MODEL1 decode"
-    assert extra_k_cache is None, (
-        "extra_k_cache is only supported for sparse MODEL1 decode"
-    )
+    assert attn_sink is None, "attn_sink is only supported for sparse V4 decode"
+    assert extra_k_cache is None, "extra_k_cache is only supported for sparse V4 decode"
     assert extra_indices_in_kvcache is None, (
-        "extra_indices_in_kvcache is only supported for sparse MODEL1 decode"
+        "extra_indices_in_kvcache is only supported for sparse V4 decode"
     )
-    assert topk_length is None, "topk_length is only supported for sparse MODEL1 decode"
+    assert topk_length is None, "topk_length is only supported for sparse V4 decode"
     assert extra_topk_length is None, (
-        "extra_topk_length is only supported for sparse MODEL1 decode"
+        "extra_topk_length is only supported for sparse V4 decode"
     )
 
     assert head_dim_v == 512
+    require_musa_arch(
+        q,
+        (MP31_ARCH,),
+        "dense MLA decode",
+    )
 
     q_nope = q[:, :, :, :head_dim_v]
     q_pe = q[:, :, :, head_dim_v:]
-    should_run_with_asm = q.shape[-2] == 128
+    should_run_with_asm = q.shape[-2] == 128 and is_flash_mla_asm_mubin_supported(q)
 
     q_nope = _prepare_mla_query_input(q_nope, require_seq_dense=not should_run_with_asm)
     q_pe = _prepare_mla_query_input(q_pe, require_seq_dense=not should_run_with_asm)

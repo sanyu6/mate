@@ -1,0 +1,50 @@
+#include <limits>
+#include "mate/mega_moe/prefill/fp4_fp4/ss_grouped_gemm.hpp"
+#include "op_utils.hpp"
+
+void {{ func_name }}(ffi::TensorView out, ffi::TensorView a, ffi::TensorView sa,
+                     ffi::TensorView b, ffi::TensorView sb, int num_mps) {
+  CHECK_INPUT_AND_TYPE(out, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(a, dl_uint8);
+  CHECK_INPUT_AND_TYPE(sa, dl_uint8);
+  CHECK_INPUT_AND_TYPE(b, dl_uint8);
+  CHECK_INPUT_AND_TYPE(sb, dl_uint8);
+  CHECK_DEVICE(out, a); CHECK_DEVICE(out, sa); CHECK_DEVICE(out, b); CHECK_DEVICE(out, sb);
+  CHECK_DIM(3, out); CHECK_DIM(3, a); CHECK_DIM(3, sa); CHECK_DIM(3, b); CHECK_DIM(3, sb);
+  ffi::MUSADeviceGuard guard(out.device().device_id);
+  check_mp32(out.device(), "fp4_fp4_grouped_gemm");
+  using Impl = ::mega_moe::prefill::mp32::fp4_fp4::SsGroupedGemm<{{ tile_m }}, {{ tile_n }}>;
+  const int64_t groups = a.size(0), m = a.size(1), packed_k = a.size(2), n = b.size(1);
+  TVM_FFI_ICHECK_GT(groups, 0); TVM_FFI_ICHECK_GT(m, 0);
+  TVM_FFI_ICHECK_GT(n, 0); TVM_FFI_ICHECK_GT(packed_k, 0);
+  TVM_FFI_ICHECK_LE(groups, std::numeric_limits<int>::max());
+  TVM_FFI_ICHECK_LE(m, std::numeric_limits<int>::max());
+  TVM_FFI_ICHECK_LE(n, std::numeric_limits<int>::max());
+  TVM_FFI_ICHECK_LE(packed_k, std::numeric_limits<int>::max() / Impl::kValuesPerByte);
+  const int64_t k = packed_k * Impl::kValuesPerByte;
+  TVM_FFI_ICHECK_EQ(k % Impl::kBlockK, 0);
+  TVM_FFI_ICHECK_EQ(n % Impl::kOutputAlignment, 0);
+  expect_shape(b, {groups, n, packed_k}, "b");
+  expect_shape(sa, {groups, k / Impl::kScaleBlock, m}, "sa");
+  expect_shape(sb, {groups, k / Impl::kScaleBlock, n}, "sb");
+  expect_shape(out, {groups, m, n}, "out");
+  musaDeviceProp properties{};
+  MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&properties, out.device().device_id));
+  TVM_FFI_ICHECK_GT(num_mps, 0);
+  TVM_FFI_ICHECK_LE(num_mps, properties.multiProcessorCount);
+  for (auto tensor : {out, a, sa, b, sb}) {
+    TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16, 0)
+        << "FP4 grouped tensors must have 16-byte aligned storage";
+  }
+  auto args = Impl::arguments(a.data_ptr(), sa.data_ptr(), b.data_ptr(), sb.data_ptr(),
+                             out.data_ptr(), int(groups), int(m), int(n), int(k),
+                             out.device().device_id, num_mps);
+  TVM_FFI_ICHECK(Impl::Kernel::can_implement(args)) << "unsupported native FP4 SS configuration";
+  auto params = Impl::Kernel::to_underlying_arguments(args, nullptr);
+  auto kernel = ::mega_moe::prefill::mp32::fp4_fp4::grouped_gemm_kernel<Impl>;
+  MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(kernel, musaFuncAttributeMaxDynamicSharedMemorySize,
+                                              Impl::Kernel::SharedStorageSize));
+  kernel<<<Impl::Kernel::get_grid_shape(params), Impl::Kernel::get_block_shape(),
+           Impl::Kernel::SharedStorageSize, get_stream(out.device())>>>(params);
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}

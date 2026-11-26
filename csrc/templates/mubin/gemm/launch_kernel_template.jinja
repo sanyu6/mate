@@ -4,9 +4,13 @@
 {% set is_k_contig = group_mode == "MoeGemmMode::KContig" %}
 {% set is_ragged_psum = group_mode == "MoeGemmMode::RaggedPSumLayout" %}
 {% set is_no_group = group_mode == "MoeGemmMode::NoGroup" %}
-{% set is_packed4 = b_pack_bits == 4 %}
-{% set is_fp4 = b_type == "fp4_e2m1" %}
-{% set quant_tile = 32 if is_fp4 else 128 %}
+{% set is_packed_a = a_type == "fp4_e2m1" %}
+{% set is_packed_b = b_pack_bits == 4 %}
+{% set is_pure_fp4 = is_packed_a and b_type == "fp4_e2m1" %}
+{% set is_w4a8_fp4 = not is_packed_a and b_type == "fp4_e2m1" %}
+{% set is_mp32_fp8 = is_mp32 and not is_packed_a and not is_packed_b %}
+{% set uses_mxfp_scales = is_pure_fp4 or is_mp32_fp8 %}
+{% set fp8_dl_types = {"fp8_e4m3": "dl_float8_e4m3fn", "fp8_e5m2": "dl_float8_e5m2"} %}
 {% set has_quant = quant_mode_a != "TensorQuantMode::NO_QUANT" %}
 {% set k_major_a = major_a == "TensorMajor::K" %}
 {% set k_major_b = major_b == "TensorMajor::K" %}
@@ -173,27 +177,42 @@ struct GemmParams {
 
 {% macro emit_quantized_validation() %}
 {# Check A dtype. #}
+{% if is_packed_a %}
+  TVM_FFI_ICHECK(dtype_equal(type_a, dl_int8)) << "packed a must be int8";
+{% elif is_mp32_fp8 %}
+  TVM_FFI_ICHECK(dtype_equal(type_a, {{ fp8_dl_types[a_type] }}))
+      << "a dtype must match the compiled {{ a_type }} launcher";
+{% else %}
   TVM_FFI_ICHECK(is_fp8_dtype(type_a)) << "a must be fp8";
+{% endif %}
 
-{% if is_fp4 %}
+{% if is_w4a8_fp4 %}
   TVM_FFI_ICHECK(dtype_equal(type_a, dl_float8_e4m3fn)) << "FP4FP8 a must be float8_e4m3fn";
 {% endif %} {# Check A dtype END #}
 
 {# Check B dtype. #}
-{% if is_packed4 %}
+{% if is_packed_b %}
   TVM_FFI_ICHECK(dtype_equal(type_b, dl_int8)) << "packed b must be int8";
+{% elif is_mp32_fp8 %}
+  TVM_FFI_ICHECK(dtype_equal(type_b, {{ fp8_dl_types[b_type] }}))
+      << "b dtype must match the compiled {{ b_type }} launcher";
 {% else %}
   TVM_FFI_ICHECK(is_fp8_dtype(type_b)) << "b must be fp8";
 {% endif %} {# Check B dtype END #}
 
 {# Check D dtype. #}
-{% if is_k_contig %}
+{% if is_mp32 %}
+  TVM_FFI_ICHECK(dtype_equal(type_d, {{ "dl_float32" if d_type == "float" else "dl_bfloat16" }}))
+      << "out dtype must match the compiled {{ d_type }} launcher";
+{% elif is_pure_fp4 %}
+  TVM_FFI_ICHECK(dtype_equal(type_d, dl_bfloat16)) << "standard MXFP4 out must be bfloat16";
+{% elif is_k_contig %}
   TVM_FFI_ICHECK(dtype_equal(type_d, dl_float32)) << "out must be float32";
 {% elif is_no_group %}
   TVM_FFI_ICHECK(dtype_equal(type_d, dl_float8_e4m3fn)) << "out must be float8_e4m3fn";
 {% else %}
 
-{% if is_fp4 %}
+{% if is_w4a8_fp4 %}
   TVM_FFI_ICHECK(dtype_equal(type_d, dl_bfloat16)) << "FP4FP8 out must be bfloat16";
 {% else %}
   TVM_FFI_ICHECK(is_bf16_or_fp16_dtype(type_d)) << "out must be bf16 or fp16";
@@ -206,7 +225,9 @@ struct GemmParams {
   CHECK_HAS_VALUE_WITH_MSG(scale_b, "scale_b must be provided");
   CHECK_DEVICE(a, scale_a.value());
   CHECK_DEVICE(a, scale_b.value());
+{% if not uses_mxfp_scales %}
   CHECK_INPUT_TYPE(scale_a.value(), dl_float32);
+{% endif %}
 
 {# Check scale tensor ranks. #}
 {% if is_masked %}
@@ -214,19 +235,44 @@ struct GemmParams {
   CHECK_DIM(3, scale_b.value());
   TVM_FFI_ICHECK_EQ(scale_a.value().size(0), num_expert) << "scale_a.size(0) must match num_expert";
   TVM_FFI_ICHECK_EQ(scale_a.value().size(1), max_m) << "scale_a.size(1) must match max_m";
+{% if uses_mxfp_scales %}
+  TVM_FFI_ICHECK_EQ(scale_a.value().size(2), mutlass::ceil_div(k, kQuantTile))
+      << "scale_a.size(2) must match ceil(k/quant_tile)";
+{% endif %}
   TVM_FFI_ICHECK_EQ(scale_b.value().size(0), num_expert) << "scale_b.size(0) must match num_expert";
+{% if uses_mxfp_scales %}
+  TVM_FFI_ICHECK_EQ(scale_b.value().size(1), n) << "scale_b.size(1) must match n";
+  TVM_FFI_ICHECK_EQ(scale_b.value().size(2), mutlass::ceil_div(k, kQuantTile))
+      << "scale_b.size(2) must match ceil(k/quant_tile)";
+{% endif %}
 {% elif is_ragged or is_ragged_psum %}
   CHECK_DIM(2, scale_a.value());
   CHECK_DIM(3, scale_b.value());
+{% if uses_mxfp_scales %}
+  TVM_FFI_ICHECK_EQ(scale_a.value().size(1), mutlass::ceil_div(k, kQuantTile))
+      << "scale_a.size(1) must match ceil(k/quant_tile)";
+{% endif %}
   TVM_FFI_ICHECK_EQ(scale_a.value().size(0), m) << "scale_a.size(0) must match m";
   TVM_FFI_ICHECK_EQ(scale_b.value().size(0), num_expert) << "scale_b.size(0) must match num_expert";
+{% if uses_mxfp_scales %}
+  TVM_FFI_ICHECK_EQ(scale_b.value().size(1), n) << "scale_b.size(1) must match n";
+  TVM_FFI_ICHECK_EQ(scale_b.value().size(2), mutlass::ceil_div(k, kQuantTile))
+      << "scale_b.size(2) must match ceil(k/quant_tile)";
+{% endif %}
 {% else %}
   CHECK_DIM(2, scale_a.value());
   CHECK_DIM(2, scale_b.value());
+{% if uses_mxfp_scales %}
+  TVM_FFI_ICHECK_EQ(scale_a.value().size(1), m) << "scale_a.size(1) must match m";
+  TVM_FFI_ICHECK_EQ(scale_b.value().size(1), n) << "scale_b.size(1) must match n";
+{% endif %}
 {% endif %} {# Check scale tensor ranks END #}
 
 {# Check B scale format. #}
-{% if is_fp4 %}
+{% if uses_mxfp_scales %}
+  CHECK_INPUT_TYPE(scale_a.value(), dl_uint8);
+  CHECK_INPUT_TYPE(scale_b.value(), dl_uint8);
+{% elif is_w4a8_fp4 %}
   CHECK_INPUT_TYPE(scale_b.value(), dl_uint8);
   CHECK_HAS_VALUE_WITH_MSG(scale_b1, "scale_b1 must be provided for FP4FP8");
   CHECK_DEVICE(a, scale_b1.value());
@@ -236,17 +282,32 @@ struct GemmParams {
       << "scale_b1 must be contiguous";
   TVM_FFI_ICHECK_EQ(scale_b1.value().size(0), num_expert) << "scale_b1.size(0) must match num_expert";
   TVM_FFI_ICHECK_EQ(scale_b1.value().size(1), n) << "scale_b1.size(1) must match n";
-{% elif is_packed4 %}
+{% elif is_packed_b %}
   CHECK_INPUT_TYPE(scale_b.value(), dl_bfloat16);
 {% else %}
   CHECK_INPUT_TYPE(scale_b.value(), dl_float32);
 {% endif %} {# Check B scale format END #}
 
+{% if not (uses_mxfp_scales and (is_ragged or is_masked)) %}
   TVM_FFI_ICHECK(scale_b.value().numel() == 0 || scale_b.value().IsContiguous())
       << "scale_b must be contiguous";
+{% endif %}
 
-{# Check A scale layout. #}
-{% if is_masked and fixed_scale_layout_a %}
+{# Check scale layouts. #}
+{% if uses_mxfp_scales and (is_ragged or is_masked) %}
+  // Exact native strides also apply to singleton Q dimensions: no SF padding.
+  TVM_FFI_ICHECK_EQ(scale_b.value().stride(1), 1) << "scale_b must be MN-major";
+  TVM_FFI_ICHECK_EQ(scale_b.value().stride(2), n) << "scale_b must be MN-major without padding";
+  TVM_FFI_ICHECK_EQ(scale_b.value().stride(0), n * scale_b.value().size(2))
+      << "scale_b has unexpected expert stride";
+  TVM_FFI_ICHECK_EQ(scale_a.value().stride(-2), 1) << "scale_a must be MN-major";
+  TVM_FFI_ICHECK_EQ(scale_a.value().stride(-1), {{ "max_m" if is_masked else "m" }})
+      << "scale_a must be MN-major without padding";
+{% if is_masked %}
+  TVM_FFI_ICHECK_EQ(scale_a.value().stride(0), max_m * scale_a.value().size(2))
+      << "scale_a has unexpected expert stride";
+{% endif %}
+{% elif is_masked and fixed_scale_layout_a and not is_pure_fp4 %}
   if (scale_a.value().numel() != 0) {
     TVM_FFI_ICHECK_EQ(scale_a.value().stride(-2), 1) << "fixed-layout scale_a must be contiguous in m";
     TVM_FFI_ICHECK_EQ(scale_a.value().stride(-1), max_m)
@@ -257,13 +318,19 @@ struct GemmParams {
 {% else %}
   TVM_FFI_ICHECK(scale_a.value().numel() == 0 || scale_a.value().IsContiguous())
       << "scale_a must be contiguous";
-{% endif %} {# Check A scale layout END #}
+{% endif %} {# Check scale layouts END #}
 
 {# Derive scale metadata. #}
   const int64_t scale_a_nr_elem = scale_a.value().numel();
   const int64_t scale_b_nr_elem = scale_b.value().numel();
 
-{% if is_masked %}
+{% if uses_mxfp_scales and (is_ragged or is_masked) %}
+  const int64_t scale_a_m = scale_a.value().size(-2);
+  const int64_t scale_a_k = scale_a.value().size(-1);
+{% elif uses_mxfp_scales %}
+  const int64_t scale_a_m = scale_a.value().size(-1);
+  const int64_t scale_a_k = scale_a.value().size(-2);
+{% elif is_masked %}
   const int64_t scale_a_m = {{ "scale_a.value().size(1)" if fixed_scale_layout_a else "scale_a.value().size(0) * scale_a.value().size(1)" }};
   const int64_t scale_a_k = scale_a.value().size(2);
 {% elif fixed_scale_layout_a %}
@@ -274,8 +341,13 @@ struct GemmParams {
   const int64_t scale_a_k = scale_a.value().size(-1);
 {% endif %}
 
-  const int64_t scale_b_n = kMajorB ? scale_b.value().size(-2) : scale_b.value().size(-1);
-  const int64_t scale_b_k = kMajorB ? scale_b.value().size(-1) : scale_b.value().size(-2);
+{% if uses_mxfp_scales and (is_ragged or is_masked) %}
+  const int64_t scale_b_n = scale_b.value().size(-2);
+  const int64_t scale_b_k = scale_b.value().size(-1);
+{% else %}
+  const int64_t scale_b_n = {{ "scale_b.value().size(-1)" if uses_mxfp_scales else "(kMajorB ? scale_b.value().size(-2) : scale_b.value().size(-1))" }};
+  const int64_t scale_b_k = {{ "scale_b.value().size(-2)" if uses_mxfp_scales else "(kMajorB ? scale_b.value().size(-1) : scale_b.value().size(-2))" }};
+{% endif %}
 {# Derive scale metadata END #}
 
 {# Check scale metadata. #}
@@ -284,6 +356,12 @@ struct GemmParams {
   TVM_FFI_ICHECK_EQ(scale_b_n, n) << "scale_b must have logical n matching b";
   TVM_FFI_ICHECK_EQ(scale_a_k, scale_b_k)
       << "scale_a and scale_b must have matching grouped k extents";
+{% if is_mp32 %}
+  TVM_FFI_ICHECK_EQ(k % kQuantTile, 0) << "K-group total k must be a multiple of 32";
+  TVM_FFI_ICHECK_EQ(scale_a_k, k / kQuantTile) << "K-group scales must have total k/32 rows";
+  TVM_FFI_ICHECK_EQ(scale_a.value().stride(-1), 1) << "scale_a must be MN-major";
+  TVM_FFI_ICHECK_EQ(scale_b.value().stride(-1), 1) << "scale_b must be MN-major";
+{% endif %}
 {% else %}
 {% if is_no_group %}
   TVM_FFI_ICHECK_EQ(scale_a_m, m) << "scale_a must have logical m matching a";
@@ -309,7 +387,12 @@ void run_{{ func_name }}(const std::string& object_path,
                          std::optional<ffi::TensorView> token_info,
                          std::optional<ffi::TensorView> signal,
                          std::optional<ffi::TensorView> output_scale = std::nullopt,
-                         std::optional<int64_t> num_target_mp = std::nullopt) {
+                         std::optional<int64_t> num_target_mp = std::nullopt
+{% if is_mp32 and is_k_contig %}
+                         , std::optional<ffi::TensorView> input_c = std::nullopt,
+                         bool zero_output = false
+{% endif %}
+                         ) {
   DLDevice device = a.device();
   auto type_a = a.dtype();
   auto type_b = b.dtype();
@@ -332,7 +415,6 @@ void run_{{ func_name }}(const std::string& object_path,
   const int64_t num_expert = a.size(0);
   const int64_t max_m = kMajorA ? a.size(1) : a.size(2);
   const int64_t m = num_expert * max_m;
-  const int64_t k = kMajorA ? a.size(2) : a.size(1);
   const int64_t n = kMajorB ? b.size(1) : b.size(2);
   TVM_FFI_ICHECK_EQ(b.size(0), num_expert) << "b.size(0) must match num_expert";
   TVM_FFI_ICHECK_EQ(out.size(0), num_expert) << "out.size(0) must match num_expert";
@@ -343,7 +425,6 @@ void run_{{ func_name }}(const std::string& object_path,
   CHECK_DIM(2, b);
   CHECK_DIM(3, out);
   const int64_t m = kMajorA ? a.size(0) : a.size(1);
-  const int64_t k = kMajorA ? a.size(1) : a.size(0);
   const int64_t n = kMajorB ? b.size(0) : b.size(1);
   const int64_t num_expert = out.size(0);
   TVM_FFI_ICHECK_EQ(out.size(0), num_expert) << "out.size(0) must match num_expert";
@@ -354,7 +435,6 @@ void run_{{ func_name }}(const std::string& object_path,
   CHECK_DIM(2, b);
   CHECK_DIM(2, out);
   const int64_t m = kMajorA ? a.size(0) : a.size(1);
-  const int64_t k = kMajorA ? a.size(1) : a.size(0);
   const int64_t n = kMajorB ? b.size(0) : b.size(1);
   constexpr int64_t num_expert = 1;
   TVM_FFI_ICHECK_EQ(out.size(0), m) << "out.size(0) must match m";
@@ -364,12 +444,25 @@ void run_{{ func_name }}(const std::string& object_path,
   CHECK_DIM(3, b);
   CHECK_DIM(2, out);
   const int64_t m = kMajorA ? a.size(0) : a.size(1);
-  const int64_t k = kMajorA ? a.size(1) : a.size(0);
   const int64_t num_expert = b.size(0);
   const int64_t n = kMajorB ? b.size(1) : b.size(2);
   TVM_FFI_ICHECK_EQ(out.size(0), m) << "out.size(0) must match m";
   TVM_FFI_ICHECK_EQ(out.size(1), n) << "out.size(1) must match n";
 {% endif %} {# Check tensor shapes END #}
+
+{% if is_mp32 and is_k_contig %}
+  TVM_FFI_ICHECK(!zero_output || !input_c.has_value()) << "cannot combine input_c with zero_output";
+  if (input_c.has_value()) {
+    const auto c = input_c.value();
+    CHECK_DEVICE(a, c);
+    CHECK_DIM(3, c);
+    CHECK_CONTIGUOUS(c);
+    TVM_FFI_ICHECK(dtype_equal(c.dtype(), type_d)) << "c and out must have the same dtype";
+    for (int i = 0; i < 3; ++i) {
+      TVM_FFI_ICHECK_EQ(c.size(i), out.size(i)) << "c and out must have the same shape";
+    }
+  }
+{% endif %}
 
 {# Check token info. #}
 {% if not is_no_group %}
@@ -386,20 +479,40 @@ void run_{{ func_name }}(const std::string& object_path,
 {% endif %}
 {% endif %} {# Check token info END #}
 
-  const int64_t b_storage_k = kMajorB ? b.size(-1) : b.size(-2);
+  const int64_t k = kMajorA ? a.size(-1) * {{ 2 if is_packed_a else 1 }} : a.size(-2);
+  const int64_t b_logical_k = kMajorB ? b.size(-1) * {{ 2 if is_packed_b else 1 }} : b.size(-2);
+
+{% if is_pure_fp4 %}
+  TVM_FFI_ICHECK_GT(num_expert, 0) << "MXFP4 num_expert must be positive";
+  TVM_FFI_ICHECK_GT(m, 0) << "MXFP4 m must be positive";
+  TVM_FFI_ICHECK_GT(n, 0) << "MXFP4 n must be positive";
+  TVM_FFI_ICHECK_GT(k, 0) << "MXFP4 k must be positive";
+  TVM_FFI_ICHECK_EQ(k % kQuantTile, 0) << "standard MXFP4 logical k must be aligned to quant_tile";
+{% endif %}
+{% if uses_mxfp_scales and is_ragged %}
+  TVM_FFI_ICHECK_EQ(m % {{ tile_m }}, 0) << "M-group m must be aligned to tile_m";
+{% endif %}
 
 {# Check B storage layout. #}
-{% if is_packed4 %}
-  TVM_FFI_ICHECK_EQ(b_storage_k * 2, k) << "packed b must have logical k matching a";
+{% if is_packed_b %}
+  TVM_FFI_ICHECK_EQ(b_logical_k, k) << "packed b must have logical k matching a";
   CHECK_CONTIGUOUS(b);
 {% else %}
-  TVM_FFI_ICHECK_EQ(b_storage_k, k) << "b must have logical k matching a";
+  TVM_FFI_ICHECK_EQ(b_logical_k, k) << "b must have logical k matching a";
+{% if is_mp32 %}
+  CHECK_CONTIGUOUS(b);
+{% else %}
   TVM_FFI_ICHECK(b.size(-1) <= 1 || b.stride(-1) == 1)
       << "b must be contiguous at the last dimension";
+{% endif %}
 {% endif %} {# Check B storage layout END #}
 
+{% if is_mp32 or is_packed_a %}
+  CHECK_CONTIGUOUS(a);
+{% else %}
   TVM_FFI_ICHECK(a.size(-1) <= 1 || a.stride(-1) == 1)
       << "a must be contiguous at the last dimension";
+{% endif %}
 
 {# Check dtypes and scales. #}
 {% if has_quant %}
@@ -451,11 +564,19 @@ void run_{{ func_name }}(const std::string& object_path,
 
   musaDeviceProp device_properties{};
   MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&device_properties, device.device_id));
+{% if is_mp32 %}
+  TVM_FFI_ICHECK(device_properties.major == 3 && device_properties.minor == 2)
+      << "run_{{ func_name }} requires exactly MP32";
+{% else %}
   TVM_FFI_ICHECK(device_properties.major > 3 ||
                  (device_properties.major == 3 && device_properties.minor >= 1))
       << "run_{{ func_name }} requires MP31 or above";
+{% endif %}
   const int64_t total_mp_count = device_properties.multiProcessorCount;
   const int64_t target_mp_count = num_target_mp.value_or(total_mp_count);
+{% if is_mp32 and enable_persistence %}
+  TVM_FFI_ICHECK_GT(target_mp_count, 0) << "num_mp must be positive";
+{% endif %}
   ffi::MUSADeviceGuard device_guard(device.device_id);
   musaStream_t stream = get_stream(device);
 
@@ -522,14 +643,14 @@ void run_{{ func_name }}(const std::string& object_path,
   int64_t tme_b_stride0;
   int64_t tme_b_stride1;
 
-  tme_a_dim0 = {{ "k" if k_major_a else "m" }};
+  tme_a_dim0 = {{ "k / 2" if is_packed_a else ("k" if k_major_a else "m") }};
   tme_a_dim1 = {{ "m" if k_major_a else "k" }};
   tme_a_stride0 = {{ "stride_m_a" if k_major_a else "stride_k_a" }};
   tme_a_dim2 = batch;
   tme_a_stride1 = stride_batch_a;
 
 {# Configure B descriptor layout. #}
-{% if is_packed4 %}
+{% if is_packed_b %}
   tme_b_dim0 = k / 2;
   tme_b_dim1 = n;
   tme_b_stride0 = stride_n_b;
@@ -549,12 +670,7 @@ void run_{{ func_name }}(const std::string& object_path,
   TmeDesc tensor_desc_b(mute::make_tuple(tme_b_dim0, tme_b_dim1, tme_b_dim2),
                         mute::make_tuple(tme_b_stride0, tme_b_stride1),
                         p_b,
-{# Configure B descriptor dtype. #}
-{% if is_packed4 %}
-                        MU_TENSOR_DESCRIPTOR_DATA_TYPE_INT8);
-{% else %}
                         dl_dtype_to_tme_type(type_b));
-{% endif %} {# Configure B descriptor dtype END #}
   TmeDesc tensor_desc_c(mute::make_tuple(static_cast<size_t>(n), static_cast<size_t>(m), static_cast<size_t>(batch)),
                         mute::make_tuple(stride_m_out, stride_batch_out),
                         p_d,
@@ -622,6 +738,9 @@ void run_{{ func_name }}(const std::string& object_path,
 
 {# Configure masked synchronization. #}
 {% if is_masked %}
+{% if is_pure_fp4 or is_mp32_fp8 %}
+  TVM_FFI_ICHECK(!signal.has_value()) << "standard MXFP4/MP32 masked GEMM does not support overlap";
+{% endif %}
   params.sync_out_flag_ptr = signal.has_value() ? static_cast<int32_t*>(signal.value().data_ptr()) : nullptr;
   params.mask_blky_per_group = gridy_in_group;
 {% endif %} {# Configure masked synchronization END #}
@@ -642,7 +761,7 @@ void run_{{ func_name }}(const std::string& object_path,
   params.ldd = n;
   params.ldc = n;
   params.total_tile = grid_x * grid_y * grid_z;
-  params.mask_m_max = m / num_expert;
+  params.mask_m_max = {{ "0" if is_mp32 and not is_masked else "m / num_expert" }};
   params.macro_bidx_max = swizzle_dim0 / kMacroTileX * kMacroTileX;
   params.macro_bid_max = swizzle_dim0 / kMacroTileX * kMacroTileX * swizzle_dim1;
   params.batch_stride_d = stride_batch_out;
@@ -676,13 +795,13 @@ void run_{{ func_name }}(const std::string& object_path,
   params.fast_macro_tile_size_mul = fast_macro_tile_size.multiplier;
   params.fast_macro_tile_size_sft = fast_macro_tile_size.shift_right;
 
-  params.tile_a_dim0 = {{ "kTileK / dl_dtype_size(type_a)" if k_major_a else "kTileM / kNumSquadM" }};
+  params.tile_a_dim0 = {{ "kTileK" if is_pure_fp4 else ("kTileK / dl_dtype_size(type_a)" if k_major_a else "kTileM / kNumSquadM") }};
   params.tile_a_dim1 = {{ "kTileM / kNumSquadM" if k_major_a else "kTileK / dl_dtype_size(type_a)" }};
   params.tile_a_dim2 = 1;
 
 {# Configure B tile layout. #}
-{% if is_packed4 %}
-  params.tile_b_dim0 = kTileK / 2;
+{% if is_packed_b %}
+  params.tile_b_dim0 = {{ "kTileK" if is_pure_fp4 else "kTileK / 2" }};
   params.tile_b_dim1 = kTileN / kNumSquadN;
 {% else %}
   params.tile_b_dim0 = {{ "kTileK / dl_dtype_size(type_b)" if k_major_b else "kTileN / kNumSquadN" }};
@@ -702,17 +821,23 @@ void run_{{ func_name }}(const std::string& object_path,
   launch_config.blockDimX = kNumThread;
   launch_config.blockDimY = 1;
   launch_config.blockDimZ = 1;
+{% if enable_persistence %}
   int launch_block_count = static_cast<int>(std::min<int64_t>(target_mp_count, params.total_tile));
   launch_config.gridDimX = launch_block_count;
   launch_config.gridDimY = 1;
   launch_config.gridDimZ = 1;
+{% else %}
+  launch_config.gridDimX = grid_x;
+  launch_config.gridDimY = grid_y;
+  launch_config.gridDimZ = grid_z;
+{% endif %}
   launch_config.hStream = reinterpret_cast<MUstream>(stream);
   launch_config.sharedMemBytes = 0;
   launch_config.attrs = NULL;
   launch_config.numAttrs = 0;
 
 {# Adjust masked launch grid. #}
-{% if is_masked %}
+{% if is_masked and enable_persistence %}
   int64_t max_blk_cnt =
       target_mp_count == total_mp_count ? total_mp_count * kBlkPerMp : target_mp_count;
   launch_config.gridDimX = static_cast<int>(std::min<int64_t>(max_blk_cnt, params.total_tile));
@@ -824,7 +949,18 @@ void run_{{ func_name }}(const std::string& object_path,
                            &params.tile_x1_dim1,
                            &params.tile_x1_dim2};
 
+{% if is_mp32 and is_k_contig %}
+  // Initialize only after validation and object loading have succeeded.
+  const size_t output_bytes = static_cast<size_t>(out.numel()) * dl_dtype_size(type_d);
+  if (zero_output) {
+    MATE_MUSA_RUNTIME_CHECK(musaMemsetAsync(p_d, 0, output_bytes, stream));
+  } else if (input_c.has_value() && input_c.value().data_ptr() != p_d) {
+    MATE_MUSA_RUNTIME_CHECK(musaMemcpyAsync(p_d, input_c.value().data_ptr(), output_bytes,
+                                          musaMemcpyDeviceToDevice, stream));
+  }
+{% endif %}
   MATE_MUSA_DRIVER_CHECK(muLaunchKernelEx(&launch_config, asm_func, kernel_params, nullptr));
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_{{ func_name }}, run_{{ func_name }});

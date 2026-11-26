@@ -13,8 +13,9 @@ using Element       = {{ element }};
 using ElementOutput = {{ element_output }};
 
 static constexpr bool kIsCausal = {{ "true" if causal else "false" }};
-// Both local GQA ratios use physical M16 SQMMA. Ratio-8 prefill dispatches
-// to the two-query pair-union kernel; decode and ratio-16 use one query/CTA.
+static constexpr int kMmaArch = {{ mma_arch }};
+// Ratio-8 prefill packs two queries into M16 on MP31 and four into M32 on
+// MP32. The decode path uses one query per work item.
 static constexpr int  kHeadRatio = {{ head_ratio }};
 static constexpr int  kHeadDim   = {{ head_dim }};
 static constexpr int  kTileKV    = {{ tile_kv }};
@@ -32,12 +33,16 @@ using Builder = msa::MsaFwdBuilder<
     Element,
     ElementOutput,
     HeadRatio,
+    msa::MmaArch<kMmaArch>,
     msa::IsCausal<std::integral_constant<bool, kIsCausal>>>;
 using KernelRatio8  = typename Builder<8>::Kernel;
 using KernelRatio16 = typename Builder<16>::Kernel;
 using KernelRatio8PairUnion = typename msa::MsaFwdPairUnionBuilder<
     Element,
     ElementOutput,
+{% if mma_arch == 320 %}
+    msa::MmaArch<kMmaArch>,
+{% endif %}
     msa::IsCausal<std::integral_constant<bool, kIsCausal>>>::Kernel;
 
 }  // namespace
@@ -217,8 +222,17 @@ void {{ func_name }}(
     auto kernel = mutlass::device_kernel<Kernel>;
     MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(
         kernel, musaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(Kernel::SharedStorageSize)));
+    dim3 grid = Kernel::get_grid_shape(params);
+{% if mma_arch == 320 %}
+    int resident_ctas = 0;
+    MATE_MUSA_RUNTIME_CHECK(musaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &resident_ctas, kernel, Kernel::MaxThreadsPerBlock, Kernel::SharedStorageSize));
+    TVM_FFI_ICHECK_GT(resident_ctas, 0);
+    grid.x = static_cast<uint32_t>(
+        std::max(1, std::min(params.scheduler.total_works, params.hw_info.sm_count * resident_ctas)));
+{% endif %}
     musaStream_t stream = get_stream(q.device());
-    kernel<<<Kernel::get_grid_shape(params), Kernel::MaxThreadsPerBlock, Kernel::SharedStorageSize, stream>>>(params);
+    kernel<<<grid, Kernel::MaxThreadsPerBlock, Kernel::SharedStorageSize, stream>>>(params);
     MATE_CHECK_MUSA_KERNEL_LAUNCH();
   };
 

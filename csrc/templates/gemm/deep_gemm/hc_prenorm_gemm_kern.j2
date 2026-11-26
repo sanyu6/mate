@@ -4,7 +4,11 @@
 #include <mutlass/kernel_hardware_info.h>
 #include <tvm/ffi/extra/musa/device_guard.h>
 
+{% if arch == "mp32" %}
+#include "mate/gemm/deep_gemm/mp32_tf32_hc_prenorm_gemm.hpp"
+{% else %}
 #include "mate/gemm/deep_gemm/mp31_tf32_hc_prenorm_gemm.hpp"
+{% endif %}
 #include "op_utils.hpp"
 
 using namespace mute;
@@ -55,17 +59,30 @@ void {{ func_name }}(
 
   using TileShape                      = Shape<Int<{{ tile_m }}>, Int<{{ tile_n }}>, Int<{{ tile_k }}>>;
   constexpr uint32_t kStages           = {{ stages }};
+{% if arch == "mp32" %}
   constexpr uint32_t kNumMmaWarpSquads = {{ num_mma_warp_squads }};
+{% else %}
+  constexpr uint32_t kNumMmaWarpSquads = {{ num_mma_warp_squads + 1 }};
+{% endif %}
 
   musaStream_t stream = static_cast<musaStream_t>(
       TVMFFIEnvGetStream(a.device().device_type, a.device().device_id));
 
   auto stride_a       = make_stride(a.stride(0), a.stride(1));
   auto stride_b       = make_stride(b.stride(0), b.stride(1));
-  auto stride_d       = make_stride(M * N, d.stride(d.ndim() - 2), d.stride(d.ndim() - 1));
+{% if arch == "mp32" %}
+  // The MP32 TME store addresses D as a rank-3 (m, n, num_splits) view of the [S][M][N] allocation.
+  auto stride_d = make_stride(d.stride(d.ndim() - 2), d.stride(d.ndim() - 1), M * N);
+{% else %}
+  auto stride_d = make_stride(M * N, d.stride(d.ndim() - 2), d.stride(d.ndim() - 1));
+{% endif %}
   auto stride_sqr_sum = make_stride(M, sqr_sum.stride(sqr_sum.ndim() - 1));
 
+{% if arch == "mp32" %}
+  using Kernel = mate::deep_gemm::Mp32Tf32HcPrenormGemm<
+{% else %}
   using Kernel = mate::deep_gemm::Mp31Tf32HcPrenormGemm<
+{% endif %}
       ElementA, ElementB, ElementD,
       decltype(stride_a), decltype(stride_b), decltype(stride_d),
       decltype(stride_sqr_sum),
@@ -90,4 +107,5 @@ void {{ func_name }}(
   dim3 grid   = Kernel::get_grid_shape(params);
   mutlass::device_kernel<Kernel><<<grid, Kernel::MaxThreadsPerBlock,
                                    Kernel::SharedStorageSize, stream>>>(params);
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
 }

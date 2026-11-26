@@ -1,4 +1,4 @@
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import functools
 import hashlib
 import json
@@ -7,11 +7,18 @@ from pathlib import Path
 
 import torch
 
-from mate.artifacts import ensure_mubin_kernel_artifact, load_kernel_map
+from mate.artifacts import (
+    ArtifactPath,
+    KernelMapHash,
+    ensure_mubin_kernel_artifact,
+    load_kernel_map,
+)
 from mate.utils import ceil_div
 
 from ..common import (
+    Arch,
     MP31_ARCH,
+    MP32_ARCH,
     get_asm_dtype_from_torch_dtype,
 )
 from .types import (
@@ -23,7 +30,6 @@ from .types import (
     TensorMajor,
     TensorQuantMode,
 )
-
 
 RAGGED_BLOCK_BY_ALIGNMENT_M = {
     128: GemmKernelBlock(num_thread=256, tile_m=128, num_buffer=4, num_squad_m=1),
@@ -57,6 +63,36 @@ PACKED_4BIT_BLOCK_BY_SELECT_M = {
         num_squad_n=4,
     ),
 }
+
+
+# Standard MXFP4 profiles are deliberately kept separate from the MP31 W4A8
+# table and target MP32.  As in Mate-ASM, ``tile_k`` is a byte budget.  For
+# pure FP4 the 128-byte profile covers 256 logical K elements, while the
+# launcher passes the 128-byte physical TME tile dimensions for both packed
+# operands.
+MP32_GROUPED_BLOCK = GemmKernelBlock(
+    num_thread=512,
+    tile_m=256,
+    tile_n=256,
+    tile_k=128,
+    num_buffer=4,
+    blk_per_mp=1,
+    num_squad_m=2,
+    num_squad_n=2,
+    macro_tile_x=2,
+    switch_swizzle=1,
+)
+
+MP32_RAGGED_BLOCK_BY_ALIGNMENT_M = {
+    128: replace(MP32_GROUPED_BLOCK, num_thread=256, tile_m=128, num_squad_m=1),
+    256: MP32_GROUPED_BLOCK,
+}
+
+
+def _get_mp32_ragged_block(alignment_m: int) -> GemmKernelBlock:
+    if alignment_m not in MP32_RAGGED_BLOCK_BY_ALIGNMENT_M:
+        raise ValueError("alignment_m must be 128 or 256")
+    return MP32_RAGGED_BLOCK_BY_ALIGNMENT_M[alignment_m]
 
 
 RAGGED_EXPERT_LAYOUT_BLOCK_CANDIDATES = [
@@ -116,9 +152,12 @@ def get_gemm_mubin_id_hash(asm_id: GemmMubinId) -> str:
 
 
 class MoeGemmMubinDispatcher:
-    def __init__(self, kernel_map_path: Path):
+    def __init__(self, kernel_map_path: Path, arch: Arch):
+        if arch not in (MP31_ARCH, MP32_ARCH):
+            raise ValueError(f"Unsupported GEMM architecture: {arch}")
         self.kernel_map_path = Path(kernel_map_path)
         self.module_dir = self.kernel_map_path.parent
+        self.arch = arch
         self._kernel_hash_map = {
             entry.dispatch_hash: entry
             for entry in load_kernel_map(self.kernel_map_path)
@@ -360,6 +399,96 @@ class MoeGemmMubinDispatcher:
             enable_persistence=True,
         )
 
+    def get_mp32_ragged_asm_id(self, **kwargs) -> GemmMubinId:
+        block = _get_mp32_ragged_block(kwargs.pop("alignment_m"))
+        return self._get_mp32_fp8_asm_id(
+            MoeGemmMode.RAGGED, kernel_block=block, **kwargs
+        )
+
+    def get_mp32_masked_asm_id(self, **kwargs) -> GemmMubinId:
+        return self._get_mp32_fp8_asm_id(MoeGemmMode.MASKED, **kwargs)
+
+    def get_mp32_k_contig_asm_id(self, **kwargs) -> GemmMubinId:
+        return self._get_mp32_fp8_asm_id(MoeGemmMode.K_CONTIG, **kwargs)
+
+    def _get_mp32_fp8_asm_id(
+        self,
+        group_mode: MoeGemmMode,
+        *,
+        kernel_block: GemmKernelBlock = MP32_GROUPED_BLOCK,
+        **kwargs,
+    ) -> GemmMubinId:
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+        if kwargs["type_a"] not in fp8_dtypes or kwargs["type_b"] not in fp8_dtypes:
+            raise ValueError("MP32 grouped GEMM requires E4M3 or E5M2 A and B")
+        output_types = (
+            (torch.bfloat16, torch.float32)
+            if group_mode == MoeGemmMode.K_CONTIG
+            else (torch.bfloat16,)
+        )
+        if kwargs["type_d"] not in output_types:
+            raise ValueError(
+                "MP32 grouped GEMM output dtype is unsupported for this mode"
+            )
+        if kwargs["quant_tile"] != 32:
+            raise ValueError("MP32 grouped GEMM requires quant_tile=32")
+        major = TensorMajor.MN if group_mode == MoeGemmMode.K_CONTIG else TensorMajor.K
+        return GemmMubinId(
+            arch=MP32_ARCH,
+            a_type=get_asm_dtype_from_torch_dtype(kwargs["type_a"]),
+            b_type=get_asm_dtype_from_torch_dtype(kwargs["type_b"]),
+            d_type=get_asm_dtype_from_torch_dtype(kwargs["type_d"]),
+            dtype_bias_scale=AsmDType.FP8_E8M0.value,
+            group_mode=group_mode,
+            quant_mode_a=TensorQuantMode.GROUP,
+            quant_mode_b=TensorQuantMode.GROUP,
+            quant_tile=32,
+            kernel_block=kernel_block,
+            major_a=major,
+            major_b=major,
+            fixed_scale_layout_a=True,
+            fixed_scale_layout_b=True,
+            enable_tme_split=True,
+            enable_persistence=True,
+            mx_scale=MxScaleMode.E8M0,
+        )
+
+    def _get_mp32_mxfp4_asm_id(
+        self,
+        group_mode: MoeGemmMode,
+        kernel_block: GemmKernelBlock = MP32_GROUPED_BLOCK,
+    ) -> GemmMubinId:
+        if group_mode not in (MoeGemmMode.RAGGED, MoeGemmMode.MASKED):
+            raise ValueError(f"Unsupported MP32 MXFP4 group mode: {group_mode}")
+        return GemmMubinId(
+            arch=MP32_ARCH,
+            a_type=AsmDType.FP4_E2M1.value,
+            b_type=AsmDType.FP4_E2M1.value,
+            d_type=get_asm_dtype_from_torch_dtype(torch.bfloat16),
+            dtype_bias_scale=AsmDType.FP8_E8M0.value,
+            group_mode=group_mode,
+            quant_mode_a=TensorQuantMode.GROUP,
+            quant_mode_b=TensorQuantMode.GROUP,
+            quant_tile=32,
+            kernel_block=kernel_block,
+            major_a=TensorMajor.K,
+            major_b=TensorMajor.K,
+            fixed_scale_layout_a=True,
+            fixed_scale_layout_b=True,
+            enable_tme_split=True,
+            enable_persistence=True,
+            b_pack_bits=4,
+            mx_scale=MxScaleMode.E8M0,
+        )
+
+    def get_mp32_mxfp4_ragged_asm_id(self, alignment_m: int = 128) -> GemmMubinId:
+        return self._get_mp32_mxfp4_asm_id(
+            MoeGemmMode.RAGGED, _get_mp32_ragged_block(alignment_m)
+        )
+
+    def get_mp32_mxfp4_masked_asm_id(self) -> GemmMubinId:
+        return self._get_mp32_mxfp4_asm_id(MoeGemmMode.MASKED)
+
     def get_ragged_expert_layout_asm_id(
         self,
         *,
@@ -421,21 +550,30 @@ class MoeGemmMubinDispatcher:
             enable_persistence=True,
         )
 
-    @functools.cache
+    @functools.cache  # noqa: B019 - dispatcher instances are process-global caches
     def resolve_kernel_entry(self, asm_id: GemmMubinId):
+        if asm_id.arch != self.arch:
+            raise ValueError("GEMM dispatch architecture does not match kernel map")
         asm_id_hash = get_gemm_mubin_id_hash(asm_id)
         entry = self._kernel_hash_map.get(asm_id_hash)
         if entry is None:
             raise ValueError(f"No MoE GEMM mubin kernel found for hash {asm_id_hash}")
         return entry
 
-    @functools.cache
+    @functools.cache  # noqa: B019 - dispatcher instances are process-global caches
     def resolve_kernel_artifact(self, asm_id: GemmMubinId):
         entry = self.resolve_kernel_entry(asm_id)
-        path = ensure_mubin_kernel_artifact("gemm", self.module_dir, entry)
+        path = ensure_mubin_kernel_artifact(
+            "gemm",
+            self.module_dir,
+            entry,
+            artifact_path=ArtifactPath.for_module("gemm", self.arch),
+            kernel_map_sha256=KernelMapHash.for_module("gemm", self.arch),
+            arch=self.arch,
+        )
         return entry, path
 
 
 @functools.cache
-def get_moe_gemm_mubin_dispatcher(kernel_map_path: Path):
-    return MoeGemmMubinDispatcher(kernel_map_path)
+def get_moe_gemm_mubin_dispatcher(kernel_map_path: Path, arch: Arch):
+    return MoeGemmMubinDispatcher(kernel_map_path, arch)
